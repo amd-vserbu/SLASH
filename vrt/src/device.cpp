@@ -259,8 +259,12 @@ Device::Device(const std::string& bdf, const std::string& vrtbinPath, bool progr
             uint32_t val;
             while (true) {
                 val = anyKernel.read(0x0);
-                if (val != 0xffffffffu && (val & kApIdle) != 0u) {
+                if (val == 0x4) {
+                // if (val != 0xffffffffu && (val & kApIdle) != 0u) {
                     break;
+                } else {
+                    utils::Logger::log(utils::LogLevel::INFO, __PRETTY_FUNCTION__,
+                                        "Kernel not ready after PDI write: AP control reads 0x{:08X}", val);
                 }
                 if (elapsed >= kTimeoutMs) {
                     throw std::runtime_error(
