@@ -29,11 +29,13 @@
 
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <thread>
 #include <vrtd/bar.hpp>
 
 #include <vrt/utils/filesystem_cache.hpp>
@@ -241,6 +243,32 @@ Device::Device(const std::string& bdf, const std::string& vrtbinPath, bool progr
             programDevice();
         }
         parseSystemMap();
+        if (program && !kernels.empty()) {
+            // After a partial PDI write the FPGA fabric needs additional time to finish
+            // partial reconfiguration. The DMA write completing does not mean the PR region
+            // is accessible — on some machines PCIe reads return 0xffffffff for hundreds of
+            // milliseconds while the FPGA reconfigures internally. Poll the AP control
+            // register of the first kernel (offset 0x0, standard AXI4-Lite HLS convention)
+            // until it returns a value other than 0xffffffff, then proceed.
+            constexpr int kPollIntervalMs = 10;
+            constexpr int kTimeoutMs = 10000;
+            int elapsed = 0;
+            auto& anyKernel = kernels.begin()->second;
+            while (anyKernel.read(0x0) == 0xffffffffu) {
+                if (elapsed >= kTimeoutMs) {
+                    throw std::runtime_error(
+                        "Device did not become accessible within " +
+                        std::to_string(kTimeoutMs) +
+                        " ms after partial reconfiguration");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+                elapsed += kPollIntervalMs;
+            }
+            if (elapsed > 0) {
+                utils::Logger::log(utils::LogLevel::INFO, __PRETTY_FUNCTION__,
+                                   "Device became accessible {} ms after PDI write", elapsed);
+            }
+        }
         if (vrtdDevice.has_value()) {
             if (clockFreq > CLOCK_MAX_FREQ) {
                 utils::Logger::log(utils::LogLevel::WARN, __PRETTY_FUNCTION__,
