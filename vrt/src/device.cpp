@@ -244,6 +244,8 @@ Device::Device(const std::string& bdf, const std::string& vrtbinPath, bool progr
         }
         parseSystemMap();
         if (program && !kernels.empty()) {
+            sleep(1); // wait for device to be ready after programming before accessing BAR
+
             // After a partial PDI write the FPGA fabric needs additional time to finish
             // partial reconfiguration. The DMA write completing does not mean the PR region
             // is ready — the AXI decoupler isolates the kernel during reconfiguration, so
@@ -264,7 +266,7 @@ Device::Device(const std::string& bdf, const std::string& vrtbinPath, bool progr
                     break;
                 } else {
                     utils::Logger::log(utils::LogLevel::INFO, __PRETTY_FUNCTION__,
-                                        "Kernel not ready after PDI write: AP control reads 0x{}", val);
+                                        "Kernel not ready after PDI write: AP control reads {}", val);
                 }
                 if (elapsed >= kTimeoutMs) {
                     throw std::runtime_error(
