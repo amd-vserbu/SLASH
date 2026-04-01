@@ -381,7 +381,28 @@ static uint16_t device_refresh_pf2_after_design_write(struct device *d)
         }
     }
 
+    /*
+     * The /dev/slash_ctlN suffix is assigned by an incrementing kernel counter
+     * and changes after each hotplug remove+rescan.  d->path still holds the
+     * path from daemon startup (e.g. /dev/slash_ctl0); that node no longer
+     * exists.  Resolve the new path via the stable sysfs name
+     * /sys/class/misc/slash_ctl_<bdf>/uevent and update d->path in-place so
+     * that subsequent GET_BAR_FD and devices_discover_and_open deduplication
+     * both see the current path.
+     */
+    _cleanup_(cleanup_free) char *new_ctl_path = NULL;
+    if (find_slash_ctl_dev_path_by_bdf(pf2_bdf, &new_ctl_path) != 0 || new_ctl_path == NULL) {
+        LOG(LOG_ERR, "device_refresh_pf2: cannot find slash_ctl device for %s in sysfs", pf2_bdf);
+        return VRTD_RET_INTERNAL_ERROR;
+    }
+
+    LOG(LOG_INFO, "device_refresh_pf2: new slash_ctl path for %s is %s", pf2_bdf, new_ctl_path);
+
     slash_ctldev_close(d->ctl);
+    free(d->path);
+    d->path = new_ctl_path;
+    new_ctl_path = NULL; /* ownership transferred — prevent cleanup_free from freeing */
+
     d->ctl = slash_ctldev_open(d->path);
     if (d->ctl == NULL) {
         LOG(LOG_ERR, "device_refresh_pf2: failed to reopen ctl device %s: %m", d->path);
