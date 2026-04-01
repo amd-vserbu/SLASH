@@ -29,7 +29,11 @@
 
 #include "slash_pcie.h"
 
+#include <linux/aer.h>
+#include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/module.h>
+#include <linux/pci.h>
 #include <linux/printk.h>
 
 #include "slash.h"
@@ -99,6 +103,91 @@ static int slash_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id
     /* Bus mastering is required for the device to perform DMA. */
     pci_set_master(pdev);
     dev_dbg(&pdev->dev, "slash: bus mastering enabled\n");
+
+    /*
+     * Wait for the AXI user-logic fabric behind PF2's BAR0 to finish
+     * initialising before completing the probe.
+     *
+     * After a full SBR reset the FPGA reloads its base bitstream and retrains
+     * the PCIe link from scratch.  A subsequent DESIGN_WRITE (PDI partial
+     * reconfiguration) then re-programs the PR region.  Config space and link
+     * training complete before the AXI slave in the PR fabric is ready.
+     * If any userspace process (vrtd or the application) performs an MMIO
+     * read to BAR0 while the AXI slave is still initialising, the PCIe
+     * endpoint generates a Completion Timeout (or UR).  On a root-port
+     * topology this propagates as ERR_FATAL and tears down the entire
+     * downstream link, killing PF0 and PF1 too.  On a switch topology the
+     * switch absorbs the error, so the application's retry loop works.
+     *
+     * The fix: probe BAR0 from kernel context with AER Completion Timeout,
+     * Unsupported Request, and Completer Abort masked at the upstream
+     * bridge.  Masking at the bridge prevents ERR_FATAL escalation even if
+     * the AXI slave does not respond.  Once the read returns a value other
+     * than 0xFFFFFFFF the fabric is confirmed ready and we complete the probe.
+     * If the fabric is not ready within the timeout, return -ETIMEDOUT so the
+     * driver does not bind.  The userspace rescan-retry loop in reset_with_ami()
+     * will trigger another pci_rescan_bus(), which re-invokes this probe.
+     */
+    {
+#define PF2_AXI_PROBE_MASK \
+    (PCI_ERR_UNC_COMP_TIME | PCI_ERR_UNC_UNSUP | PCI_ERR_UNC_COMP_ABORT)
+#define PF2_AXI_POLL_INTERVAL_MS  100
+#define PF2_AXI_POLL_TIMEOUT_MS   10000
+
+        struct pci_dev *bridge = pdev->bus->self;
+        int aer_cap = bridge ? pci_find_ext_capability(bridge, PCI_EXT_CAP_ID_ERR) : 0;
+        u32 saved_aer_mask = 0;
+
+        if (aer_cap) {
+            pci_read_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK, &saved_aer_mask);
+            pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+                                   saved_aer_mask | PF2_AXI_PROBE_MASK);
+            dev_dbg(&pdev->dev,
+                    "slash: AER masked on %s (saved=0x%08x, set=0x%08x)\n",
+                    pci_name(bridge), saved_aer_mask,
+                    saved_aer_mask | PF2_AXI_PROBE_MASK);
+        } else {
+            dev_warn(&pdev->dev,
+                     "slash: no AER capability on upstream bridge — "
+                     "BAR0 probe without error masking\n");
+        }
+
+        void __iomem *bar0 = pci_iomap(pdev, 0, sizeof(u32));
+        u32 ap_ctrl = 0xFFFFFFFF;
+        int elapsed_ms = 0;
+
+        if (bar0) {
+            while (ap_ctrl == 0xFFFFFFFF && elapsed_ms < PF2_AXI_POLL_TIMEOUT_MS) {
+                msleep(PF2_AXI_POLL_INTERVAL_MS);
+                elapsed_ms += PF2_AXI_POLL_INTERVAL_MS;
+                ap_ctrl = ioread32(bar0);
+            }
+            pci_iounmap(pdev, bar0);
+        } else {
+            dev_warn(&pdev->dev, "slash: pci_iomap(BAR0) failed — skipping AXI readiness check\n");
+        }
+
+        if (aer_cap) {
+            pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK, saved_aer_mask);
+            dev_dbg(&pdev->dev, "slash: AER mask restored on %s\n", pci_name(bridge));
+        }
+
+        if (bar0 && ap_ctrl == 0xFFFFFFFF) {
+            dev_err(&pdev->dev,
+                    "slash: PF2 BAR0 AXI fabric not ready after %d ms — "
+                    "deferring probe (will retry on rescan)\n", elapsed_ms);
+            err = -ETIMEDOUT;
+            goto err_disable_device;
+        }
+
+        dev_info(&pdev->dev,
+                 "slash: PF2 BAR0 AXI fabric ready (ap_ctrl=0x%08x) after %d ms\n",
+                 ap_ctrl, elapsed_ms);
+
+#undef PF2_AXI_PROBE_MASK
+#undef PF2_AXI_POLL_INTERVAL_MS
+#undef PF2_AXI_POLL_TIMEOUT_MS
+    }
 
     err = slash_ctldev_create(pdev);
     if (err) {
