@@ -131,9 +131,36 @@ static int slash_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id
     {
 #define PF2_AXI_PROBE_MASK \
     (PCI_ERR_UNC_COMP_TIME | PCI_ERR_UNC_UNSUP | PCI_ERR_UNC_COMP_ABORT)
-#define PF2_AXI_POLL_INTERVAL_MS  100
-#define PF2_AXI_POLL_TIMEOUT_MS   10000
 
+        /*
+         * Check whether the AXI user-logic fabric behind PF2's BAR0 has
+         * finished initialising.
+         *
+         * Problem: after an SBR the FPGA reloads from flash and the PCIe
+         * link retrains before the AXI slave in the PR fabric is ready.
+         * Any MMIO read to an unresponsive AXI slave from userspace
+         * generates a Completion Timeout that propagates as ERR_FATAL on
+         * a root-port topology, killing PF0 and PF1.
+         *
+         * Solution: read BAR0 from kernel context with Completion Timeout,
+         * Unsupported Request, and Completer Abort masked at the upstream
+         * bridge's AER Uncorrectable Error Mask register.  Masking at the
+         * bridge prevents ERR_FATAL escalation even if the AXI slave does
+         * not respond.  A single non-blocking read is performed:
+         *
+         *   - 0xFFFFFFFF → fabric not ready; return -EPROBE_DEFER so the
+         *     kernel reschedules the probe asynchronously.  We MUST NOT
+         *     sleep here: probe is called from pci_rescan_bus() while
+         *     pci_lock_rescan_remove() is held, and any msleep() in probe
+         *     blocks that global lock for its full duration, stalling all
+         *     other PCI activity (hotplug, AER handler, sysfs, etc.).
+         *   - any other value → fabric is up; continue probe normally.
+         *
+         * -EPROBE_DEFER causes the kernel driver core to retry the probe
+         * after a short delay (typically ~1 s), outside the rescan lock.
+         * Userspace sees no /dev/slash_ctlN until probe succeeds, so the
+         * existing rescan-retry loop in vrtd naturally waits.
+         */
         struct pci_dev *bridge = pdev->bus->self;
         int aer_cap = bridge ? pci_find_ext_capability(bridge, PCI_EXT_CAP_ID_ERR) : 0;
         u32 saved_aer_mask = 0;
@@ -153,40 +180,29 @@ static int slash_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id
         }
 
         void __iomem *bar0 = pci_iomap(pdev, 0, sizeof(u32));
-        u32 ap_ctrl = 0xFFFFFFFF;
-        int elapsed_ms = 0;
+        u32 ap_ctrl = bar0 ? ioread32(bar0) : 0xFFFFFFFF;
 
-        if (bar0) {
-            while (ap_ctrl == 0xFFFFFFFF && elapsed_ms < PF2_AXI_POLL_TIMEOUT_MS) {
-                msleep(PF2_AXI_POLL_INTERVAL_MS);
-                elapsed_ms += PF2_AXI_POLL_INTERVAL_MS;
-                ap_ctrl = ioread32(bar0);
-            }
+        if (bar0)
             pci_iounmap(pdev, bar0);
-        } else {
-            dev_warn(&pdev->dev, "slash: pci_iomap(BAR0) failed — skipping AXI readiness check\n");
-        }
 
         if (aer_cap) {
             pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK, saved_aer_mask);
             dev_dbg(&pdev->dev, "slash: AER mask restored on %s\n", pci_name(bridge));
         }
 
-        if (bar0 && ap_ctrl == 0xFFFFFFFF) {
-            dev_err(&pdev->dev,
-                    "slash: PF2 BAR0 AXI fabric not ready after %d ms — "
-                    "deferring probe (will retry on rescan)\n", elapsed_ms);
-            err = -ETIMEDOUT;
+        if (ap_ctrl == 0xFFFFFFFF) {
+            dev_info(&pdev->dev,
+                     "slash: PF2 BAR0 AXI fabric not ready (ap_ctrl=0x%08x%s) — "
+                     "deferring probe\n",
+                     ap_ctrl, bar0 ? "" : ", BAR0 map failed");
+            err = -EPROBE_DEFER;
             goto err_disable_device;
         }
 
         dev_info(&pdev->dev,
-                 "slash: PF2 BAR0 AXI fabric ready (ap_ctrl=0x%08x) after %d ms\n",
-                 ap_ctrl, elapsed_ms);
+                 "slash: PF2 BAR0 AXI fabric ready (ap_ctrl=0x%08x)\n", ap_ctrl);
 
 #undef PF2_AXI_PROBE_MASK
-#undef PF2_AXI_POLL_INTERVAL_MS
-#undef PF2_AXI_POLL_TIMEOUT_MS
     }
 
     err = slash_ctldev_create(pdev);
