@@ -83,7 +83,10 @@
 #include "reset.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <unistd.h>
 
 #include <sys/ioctl.h>
@@ -354,20 +357,94 @@ uint16_t reset_with_ami(struct device *device, struct device_ptr_array  *devices
         usleep(10000000);
 
         ret = ami_dev_find(pf0_bdf, &ami_device);
-        if (ret == AMI_STATUS_OK) {
-            LOG(LOG_INFO, "reset_with_ami: device %s found after reset", pf0_bdf);
-            break;
+        if (ret != AMI_STATUS_OK) {
+            if (attempt < RESCAN_MAX_RETRIES) {
+                LOG(LOG_WARNING, "reset_with_ami: ami_dev_find(%s) failed (attempt %d/%d): %s, retrying in 3s",
+                    pf0_bdf, attempt, RESCAN_MAX_RETRIES, ami_get_last_error());
+                usleep(RESCAN_RETRY_DELAY_US);
+            } else {
+                LOG(LOG_ERR, "reset_with_ami: post-reset ami_dev_find(%s) failed after %d attempts: %s",
+                    pf0_bdf, RESCAN_MAX_RETRIES, ami_get_last_error());
+                return VRTD_RET_INTERNAL_ERROR;
+            }
+            continue;
+        }
+        LOG(LOG_INFO, "reset_with_ami: PF0 %s found after reset", pf0_bdf);
+
+        /*
+         * Verify PF2 was fully enumerated and the slash driver bound to it.
+         *
+         * ami_dev_find() on PF0 only confirms the AVED/AMI driver probed
+         * successfully.  On root-port topologies an intermittent race can
+         * leave PF2's AXI fabric uninitialised: the PCIe endpoint accepts
+         * config-space reads (so PF2 appears present) but MMIO accesses to
+         * its BAR generate Completion Timeouts.  Those timeouts propagate as
+         * ERR_FATAL through the root port and tear down PF0/PF1 too.
+         *
+         * Check that the slash driver created its control device for PF2
+         * (i.e. slash_ctldev_create() ran successfully), and then verify
+         * PF2's config-space vendor ID is not 0xFFFF.  If either check fails
+         * we retry the rescan rather than handing a broken device to the
+         * application.
+         */
+        {
+            char *pf2_ctl_path = NULL;
+            bool pf2_ok = false;
+
+            if (find_slash_ctl_dev_path_by_bdf(pf2_bdf, &pf2_ctl_path) != 0
+                || pf2_ctl_path == NULL) {
+                LOG(LOG_WARNING,
+                    "reset_with_ami: PF2 slash_ctl device not found for %s "
+                    "(attempt %d/%d) — rescan incomplete, retrying",
+                    pf2_bdf, attempt, RESCAN_MAX_RETRIES);
+            } else {
+                LOG(LOG_INFO, "reset_with_ami: PF2 slash_ctl device: %s", pf2_ctl_path);
+
+                /* Read PF2 vendor ID from sysfs config space. */
+                char config_path[PATH_MAX];
+                snprintf(config_path, sizeof(config_path),
+                         "/sys/bus/pci/devices/%s/config", pf2_bdf);
+                int cfg_fd = open(config_path, O_RDONLY | O_CLOEXEC);
+                if (cfg_fd >= 0) {
+                    uint16_t vid = 0xFFFF;
+                    if (read(cfg_fd, &vid, sizeof(vid)) == (ssize_t)sizeof(vid)
+                        && vid == 0xFFFF) {
+                        LOG(LOG_WARNING,
+                            "reset_with_ami: PF2 %s config space returns 0xFFFF "
+                            "(attempt %d/%d) — device not responding, retrying",
+                            pf2_bdf, attempt, RESCAN_MAX_RETRIES);
+                    } else {
+                        pf2_ok = true;
+                    }
+                    close(cfg_fd);
+                } else {
+                    /* sysfs file absent — treat as not ready */
+                    LOG(LOG_WARNING,
+                        "reset_with_ami: cannot open %s: %m "
+                        "(attempt %d/%d), retrying",
+                        config_path, attempt, RESCAN_MAX_RETRIES);
+                }
+
+                free(pf2_ctl_path);
+            }
+
+            if (!pf2_ok) {
+                ami_dev_delete(&ami_device);
+                if (attempt < RESCAN_MAX_RETRIES)
+                    usleep(RESCAN_RETRY_DELAY_US);
+                else {
+                    LOG(LOG_ERR,
+                        "reset_with_ami: PF2 %s not ready after %d attempts",
+                        pf2_bdf, RESCAN_MAX_RETRIES);
+                    return VRTD_RET_INTERNAL_ERROR;
+                }
+                continue;
+            }
         }
 
-        if (attempt < RESCAN_MAX_RETRIES) {
-            LOG(LOG_WARNING, "reset_with_ami: ami_dev_find(%s) failed (attempt %d/%d): %s, retrying in 3s",
-                pf0_bdf, attempt, RESCAN_MAX_RETRIES, ami_get_last_error());
-            usleep(RESCAN_RETRY_DELAY_US);
-        } else {
-            LOG(LOG_ERR, "reset_with_ami: post-reset ami_dev_find(%s) failed after %d attempts: %s",
-                pf0_bdf, RESCAN_MAX_RETRIES, ami_get_last_error());
-            return VRTD_RET_INTERNAL_ERROR;
-        }
+        LOG(LOG_INFO, "reset_with_ami: all PFs verified after reset (attempt %d/%d)",
+            attempt, RESCAN_MAX_RETRIES);
+        break;
     }
 
     #undef RESCAN_MAX_RETRIES

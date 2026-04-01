@@ -270,8 +270,21 @@ static int slash_hotplug_handle_toggle_sbr(const char *bdf)
     bridge = pci_dev_get(ep_bus->self);
     pci_unlock_rescan_remove();
 
-    pr_info("slash_hotplug: toggle_sbr: bridge=%s bus=%02x\n",
-            pci_name(bridge), bus_nr);
+    /*
+     * Detect whether the upstream bridge is a PCIe root port.
+     *
+     * When the card sits directly under a root port there is no intermediate
+     * switch to buffer link training.  The PCIe link between the root port
+     * and the FPGA goes down during SBR and must re-train from scratch.
+     * This has different timing and error-propagation behaviour compared to
+     * the switch case (where only the switch's downstream link goes down and
+     * the root port never loses connectivity).
+     */
+    bool is_root_port = (bridge->bus->parent == NULL) ||
+                        (pci_pcie_type(bridge) == PCI_EXP_TYPE_ROOT_PORT);
+
+    pr_info("slash_hotplug: toggle_sbr: bridge=%s bus=%02x is_root_port=%d\n",
+            pci_name(bridge), bus_nr, is_root_port);
 
     /*
      * pci_bridge_secondary_bus_reset() saves and restores bridge config
@@ -304,6 +317,60 @@ static int slash_hotplug_handle_toggle_sbr(const char *bdf)
     pr_info("slash_hotplug: toggle_sbr: waiting 1000 ms for PCIe link training\n");
     msleep(1000);
     pr_info("slash_hotplug: toggle_sbr: post-SBR settle complete (1000 ms)\n");
+
+    /*
+     * Root-port topology: poll PF2 config space until the endpoint responds.
+     *
+     * When the FPGA is directly under a root port the link trains against the
+     * root port itself, with no switch to buffer the process.  The 1000 ms
+     * sleep above covers the PCIe link layer, but the FPGA's internal fabric
+     * (particularly the user logic behind PF2's BAR) may take longer to
+     * initialise.  If userspace proceeds while PF2's AXI slave is still
+     * starting up, the first MMIO read to PF2 generates a Completion Timeout
+     * or Unsupported Request completion.  On a root port this propagates as
+     * ERR_FATAL and tears down the entire downstream link (killing PF0/PF1
+     * too).  On a switch the switch absorbs / isolates the error.
+     *
+     * Actively poll PF2 (function 2) config-space vendor ID.  The kernel's
+     * config accessor returns 0xFFFF while the link is training or the
+     * endpoint is not ready; the real vendor ID (0x10EE for Xilinx/AMD) once
+     * the endpoint responds.  We poll with pci_lock_rescan_remove() held
+     * briefly per iteration to safely re-discover ep_bus (which is the pci_bus
+     * struct for the endpoint's bus; it is not freed during SBR even though
+     * the child devices have been removed).
+     *
+     * This replaces a pure fixed delay for root-port systems and terminates as
+     * soon as PF2 is ready, so the common case incurs no extra latency.
+     */
+    if (is_root_port) {
+#define SBR_PF2_POLL_INTERVAL_MS 100
+#define SBR_PF2_POLL_TIMEOUT_MS  4000
+        int sbr_elapsed = 0;
+        u16 pf2_vendor_id = 0xFFFF;
+
+        while (pf2_vendor_id == 0xFFFF && sbr_elapsed < SBR_PF2_POLL_TIMEOUT_MS) {
+            msleep(SBR_PF2_POLL_INTERVAL_MS);
+            sbr_elapsed += SBR_PF2_POLL_INTERVAL_MS;
+
+            pci_lock_rescan_remove();
+            ep_bus = pci_find_bus(domain, bus_nr);
+            if (ep_bus)
+                pci_bus_read_config_word(ep_bus, PCI_DEVFN(slot, 2),
+                                         PCI_VENDOR_ID, &pf2_vendor_id);
+            pci_unlock_rescan_remove();
+        }
+
+        if (pf2_vendor_id == 0xFFFF)
+            pr_warn("slash_hotplug: toggle_sbr: PF2 config space still 0xFFFF "
+                    "after %d ms — proceeding anyway\n",
+                    1000 + sbr_elapsed);
+        else
+            pr_info("slash_hotplug: toggle_sbr: PF2 vendor_id=0x%04x valid "
+                    "after %d ms total\n",
+                    pf2_vendor_id, 1000 + sbr_elapsed);
+#undef SBR_PF2_POLL_INTERVAL_MS
+#undef SBR_PF2_POLL_TIMEOUT_MS
+    }
 
 out_put:
     pci_dev_put(bridge);
