@@ -42,6 +42,24 @@
 
 static int slash_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 static void slash_pcie_remove(struct pci_dev *pdev);
+static bool slash_pcie_is_root_port(const struct pci_dev *bridge);
+static int slash_pcie_setup_aer_masks(struct pci_dev *pdev, struct slash_pcie_aer_ctx *ctx);
+static int slash_pcie_restore_aer_masks(struct pci_dev *pdev, const struct slash_pcie_aer_ctx *ctx);
+static int slash_pcie_read_bar0_ap_ctrl(struct pci_dev *pdev, u32 *ap_ctrl);
+static int slash_pcie_check_bar0_ready(struct pci_dev *pdev);
+
+#define PF2_AXI_PROBE_MASK \
+    (PCI_ERR_UNC_COMP_TIME | PCI_ERR_UNC_UNSUP | PCI_ERR_UNC_COMP_ABORT)
+
+struct slash_pcie_aer_ctx {
+    struct pci_dev *bridge;
+    int ep_aer;
+    int br_aer;
+    u32 saved_ep_mask;
+    u32 saved_br_mask;
+    bool ep_masked;
+    bool br_masked;
+};
 
 /* Match only the SLASH control function (PF2, device 0x50B6). */
 static const struct pci_device_id slash_pcie_ids[] = {
@@ -56,6 +74,241 @@ static struct pci_driver slash_pcie_driver = {
     .probe = slash_pcie_probe,
     .remove = slash_pcie_remove,
 };
+
+/**
+ * slash_pcie_is_root_port() - Determine whether the immediate upstream bridge is a root port.
+ * @bridge: Upstream bridge for PF2 (may be NULL).
+ *
+ * Return: true if @bridge is a root-port-like parent, false otherwise.
+ */
+static bool slash_pcie_is_root_port(const struct pci_dev *bridge)
+{
+    if (!bridge)
+        return true;
+
+    return (bridge->bus && bridge->bus->parent == NULL)
+        || (pci_pcie_type(bridge) == PCI_EXP_TYPE_ROOT_PORT);
+}
+
+/**
+ * slash_pcie_restore_aer_masks() - Clear induced AER errors and restore saved masks.
+ * @pdev: PF2 endpoint.
+ * @ctx:  Saved AER context from slash_pcie_setup_aer_masks().
+ *
+ * Return: 0 on success, -EIO on config-space write failure.
+ */
+static int slash_pcie_restore_aer_masks(struct pci_dev *pdev, const struct slash_pcie_aer_ctx *ctx)
+{
+    int ret;
+    int err = 0;
+
+    if (ctx->ep_masked) {
+        ret = pci_write_config_dword(pdev, ctx->ep_aer + PCI_ERR_UNCOR_STATUS,
+                                     PF2_AXI_PROBE_MASK);
+        if (ret != PCIBIOS_SUCCESSFUL) {
+            dev_err(&pdev->dev,
+                    "slash: failed to clear endpoint AER status: %d\n", ret);
+            err = -EIO;
+        }
+
+        ret = pci_write_config_dword(pdev, ctx->ep_aer + PCI_ERR_UNCOR_MASK,
+                                     ctx->saved_ep_mask);
+        if (ret != PCIBIOS_SUCCESSFUL) {
+            dev_err(&pdev->dev,
+                    "slash: failed to restore endpoint AER mask: %d\n", ret);
+            err = -EIO;
+        } else {
+            dev_dbg(&pdev->dev, "slash: AER mask restored on endpoint\n");
+        }
+    }
+
+    if (ctx->br_masked && ctx->bridge) {
+        ret = pci_write_config_dword(ctx->bridge, ctx->br_aer + PCI_ERR_UNCOR_STATUS,
+                                     PF2_AXI_PROBE_MASK);
+        if (ret != PCIBIOS_SUCCESSFUL) {
+            dev_err(&pdev->dev,
+                    "slash: failed to clear bridge AER status on %s: %d\n",
+                    pci_name(ctx->bridge), ret);
+            err = -EIO;
+        }
+
+        ret = pci_write_config_dword(ctx->bridge, ctx->br_aer + PCI_ERR_UNCOR_MASK,
+                                     ctx->saved_br_mask);
+        if (ret != PCIBIOS_SUCCESSFUL) {
+            dev_err(&pdev->dev,
+                    "slash: failed to restore bridge AER mask on %s: %d\n",
+                    pci_name(ctx->bridge), ret);
+            err = -EIO;
+        } else {
+            dev_dbg(&pdev->dev, "slash: AER mask restored on bridge %s\n",
+                    pci_name(ctx->bridge));
+        }
+    }
+
+    return err;
+}
+
+/**
+ * slash_pcie_setup_aer_masks() - Save and apply temporary AER masks for PF2 BAR0 probe.
+ * @pdev: PF2 endpoint.
+ * @ctx:  Output context used later by slash_pcie_restore_aer_masks().
+ *
+ * On root-port topologies, fail closed if AER capability is missing on either
+ * PF2 endpoint or immediate upstream bridge.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int slash_pcie_setup_aer_masks(struct pci_dev *pdev, struct slash_pcie_aer_ctx *ctx)
+{
+    bool root_port;
+    int ret;
+
+    ctx->bridge = pdev->bus ? pdev->bus->self : NULL;
+    ctx->ep_aer = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ERR);
+    ctx->br_aer = ctx->bridge ?
+        pci_find_ext_capability(ctx->bridge, PCI_EXT_CAP_ID_ERR) : 0;
+
+    root_port = slash_pcie_is_root_port(ctx->bridge);
+
+    if (root_port && (!ctx->ep_aer || !ctx->br_aer)) {
+        dev_err(&pdev->dev,
+                "slash: refusing PF2 BAR0 probe on root-port without required AER capabilities "
+                "(endpoint=%s bridge=%s)\n",
+                ctx->ep_aer ? "present" : "missing",
+                ctx->br_aer ? "present" : "missing");
+        return -EOPNOTSUPP;
+    }
+
+    if (ctx->ep_aer) {
+        ret = pci_read_config_dword(pdev, ctx->ep_aer + PCI_ERR_UNCOR_MASK,
+                                    &ctx->saved_ep_mask);
+        if (ret != PCIBIOS_SUCCESSFUL) {
+            dev_err(&pdev->dev,
+                    "slash: failed to read endpoint AER mask: %d\n", ret);
+            return -EIO;
+        }
+
+        ret = pci_write_config_dword(pdev, ctx->ep_aer + PCI_ERR_UNCOR_MASK,
+                                     ctx->saved_ep_mask | PF2_AXI_PROBE_MASK);
+        if (ret != PCIBIOS_SUCCESSFUL) {
+            dev_err(&pdev->dev,
+                    "slash: failed to set endpoint AER mask: %d\n", ret);
+            return -EIO;
+        }
+
+        ctx->ep_masked = true;
+        dev_dbg(&pdev->dev,
+                "slash: AER masked on endpoint (saved=0x%08x, set=0x%08x)\n",
+                ctx->saved_ep_mask, ctx->saved_ep_mask | PF2_AXI_PROBE_MASK);
+    } else {
+        dev_warn(&pdev->dev,
+                 "slash: no AER capability on PF2 endpoint — "
+                 "BAR0 probe without endpoint error masking\n");
+    }
+
+    if (ctx->br_aer && ctx->bridge) {
+        ret = pci_read_config_dword(ctx->bridge, ctx->br_aer + PCI_ERR_UNCOR_MASK,
+                                    &ctx->saved_br_mask);
+        if (ret != PCIBIOS_SUCCESSFUL) {
+            dev_err(&pdev->dev,
+                    "slash: failed to read bridge AER mask on %s: %d\n",
+                    pci_name(ctx->bridge), ret);
+            goto err_restore;
+        }
+
+        ret = pci_write_config_dword(ctx->bridge, ctx->br_aer + PCI_ERR_UNCOR_MASK,
+                                     ctx->saved_br_mask | PF2_AXI_PROBE_MASK);
+        if (ret != PCIBIOS_SUCCESSFUL) {
+            dev_err(&pdev->dev,
+                    "slash: failed to set bridge AER mask on %s: %d\n",
+                    pci_name(ctx->bridge), ret);
+            goto err_restore;
+        }
+
+        ctx->br_masked = true;
+        dev_dbg(&pdev->dev,
+                "slash: AER masked on bridge %s (saved=0x%08x, set=0x%08x)\n",
+                pci_name(ctx->bridge), ctx->saved_br_mask,
+                ctx->saved_br_mask | PF2_AXI_PROBE_MASK);
+    } else {
+        dev_warn(&pdev->dev,
+                 "slash: no AER capability on upstream bridge — "
+                 "BAR0 probe without bridge error masking\n");
+    }
+
+    return 0;
+
+err_restore:
+    if (slash_pcie_restore_aer_masks(pdev, ctx)) {
+        dev_err(&pdev->dev,
+                "slash: failed to restore AER state after setup failure\n");
+    }
+    return -EIO;
+}
+
+/**
+ * slash_pcie_read_bar0_ap_ctrl() - Read PF2 BAR0 ap_ctrl register once.
+ * @pdev: PF2 endpoint.
+ * @ap_ctrl: Output register value.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int slash_pcie_read_bar0_ap_ctrl(struct pci_dev *pdev, u32 *ap_ctrl)
+{
+    void __iomem *bar0;
+
+    bar0 = pci_iomap(pdev, 0, sizeof(u32));
+    if (!bar0) {
+        dev_err(&pdev->dev,
+                "slash: pci_iomap(BAR0) failed during PF2 readiness check\n");
+        return -ENOMEM;
+    }
+
+    *ap_ctrl = ioread32(bar0);
+    pci_iounmap(pdev, bar0);
+    return 0;
+}
+
+/**
+ * slash_pcie_check_bar0_ready() - Verify that PF2 BAR0 fabric is ready.
+ * @pdev: PF2 endpoint.
+ *
+ * Return: 0 if ready, -EPROBE_DEFER if fabric is not ready yet, other
+ *         negative errno values on hard failure.
+ */
+static int slash_pcie_check_bar0_ready(struct pci_dev *pdev)
+{
+    struct slash_pcie_aer_ctx aer_ctx = {0};
+    u32 ap_ctrl = 0xFFFFFFFF;
+    int err;
+    int restore_err;
+
+    err = slash_pcie_setup_aer_masks(pdev, &aer_ctx);
+    if (err)
+        return err;
+
+    err = slash_pcie_read_bar0_ap_ctrl(pdev, &ap_ctrl);
+
+    restore_err = slash_pcie_restore_aer_masks(pdev, &aer_ctx);
+    if (!err && restore_err)
+        err = restore_err;
+
+    if (err)
+        return err;
+
+    if (ap_ctrl == 0xFFFFFFFF) {
+        dev_info(&pdev->dev,
+                 "slash: PF2 BAR0 AXI fabric not ready (ap_ctrl=0x%08x) — "
+                 "deferring probe\n",
+                 ap_ctrl);
+        return -EPROBE_DEFER;
+    }
+
+    dev_info(&pdev->dev,
+             "slash: PF2 BAR0 AXI fabric ready (ap_ctrl=0x%08x)\n", ap_ctrl);
+
+    return 0;
+}
 
 /**
  * slash_pcie_probe() - Bind to a SLASH control function.
@@ -104,129 +357,14 @@ static int slash_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id
     pci_set_master(pdev);
     dev_dbg(&pdev->dev, "slash: bus mastering enabled\n");
 
-    /*
-     * Wait for the AXI user-logic fabric behind PF2's BAR0 to finish
-     * initialising before completing the probe.
-     *
-     * After a full SBR reset the FPGA reloads its base bitstream and retrains
-     * the PCIe link from scratch.  A subsequent DESIGN_WRITE (PDI partial
-     * reconfiguration) then re-programs the PR region.  Config space and link
-     * training complete before the AXI slave in the PR fabric is ready.
-     * If any userspace process (vrtd or the application) performs an MMIO
-     * read to BAR0 while the AXI slave is still initialising, the PCIe
-     * endpoint generates a Completion Timeout (or UR).  On a root-port
-     * topology this propagates as ERR_FATAL and tears down the entire
-     * downstream link, killing PF0 and PF1 too.  On a switch topology the
-     * switch absorbs the error, so the application's retry loop works.
-     *
-     * The fix: probe BAR0 from kernel context with AER Completion Timeout,
-     * Unsupported Request, and Completer Abort masked at the upstream
-     * bridge.  Masking at the bridge prevents ERR_FATAL escalation even if
-     * the AXI slave does not respond.  Once the read returns a value other
-     * than 0xFFFFFFFF the fabric is confirmed ready and we complete the probe.
-     * If the fabric is not ready within the timeout, return -ETIMEDOUT so the
-     * driver does not bind.  The userspace rescan-retry loop in reset_with_ami()
-     * will trigger another pci_rescan_bus(), which re-invokes this probe.
-     */
-    {
-#define PF2_AXI_PROBE_MASK \
-    (PCI_ERR_UNC_COMP_TIME | PCI_ERR_UNC_UNSUP | PCI_ERR_UNC_COMP_ABORT)
-
-        /*
-         * Check whether the AXI user-logic fabric behind PF2's BAR0 has
-         * finished initialising.
-         *
-         * Problem: after an SBR the FPGA reloads from flash and the PCIe
-         * link retrains before the AXI slave in the PR fabric is ready.
-         * Any MMIO read to an unresponsive AXI slave generates an error
-         * that propagates as ERR_FATAL on a root-port topology, killing
-         * PF0 and PF1.
-         *
-         * The AXI slave may respond with Unsupported Request (UR) rather
-         * than timing out (CTO).  In the UR case PF2's own PCIe logic
-         * logs "UR Detected" and sends ERR_FATAL upstream — masking at
-         * the bridge alone cannot suppress a fatal error message sourced
-         * by the endpoint itself.
-         *
-         * We therefore mask CTO, UR, and CA at TWO points:
-         *   1. The endpoint (pdev) — suppresses ERR_FATAL sent by PF2
-         *      when its AXI slave rejects the request.
-         *   2. The upstream bridge — suppresses CTO generated by the
-         *      root port if the AXI slave does not respond at all.
-         *
-         * After the probe read, AER status bits are cleared (RW1C) in
-         * both registers before the masks are restored, so the AER
-         * handler does not act on errors we deliberately induced.
-         *
-         * A single non-blocking ioread32() is performed.  Sleeping in
-         * probe while pci_lock_rescan_remove() is held would stall all
-         * other PCI activity for the sleep duration.  -EPROBE_DEFER
-         * causes the kernel driver core to retry the probe asynchronously,
-         * outside the rescan lock, until the fabric is ready.
-         */
-        struct pci_dev *bridge = pdev->bus->self;
-        int ep_aer = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ERR);
-        int br_aer = bridge ? pci_find_ext_capability(bridge, PCI_EXT_CAP_ID_ERR) : 0;
-        u32 saved_ep_mask = 0, saved_br_mask = 0;
-
-        if (ep_aer) {
-            pci_read_config_dword(pdev, ep_aer + PCI_ERR_UNCOR_MASK, &saved_ep_mask);
-            pci_write_config_dword(pdev, ep_aer + PCI_ERR_UNCOR_MASK,
-                                   saved_ep_mask | PF2_AXI_PROBE_MASK);
-            dev_dbg(&pdev->dev,
-                    "slash: AER masked on endpoint (saved=0x%08x, set=0x%08x)\n",
-                    saved_ep_mask, saved_ep_mask | PF2_AXI_PROBE_MASK);
-        } else {
-            dev_warn(&pdev->dev,
-                     "slash: no AER capability on PF2 endpoint — "
-                     "BAR0 probe without endpoint error masking\n");
+    /* Ensure PF2 AXI fabric behind BAR0 is ready before exposing userspace access. */
+    err = slash_pcie_check_bar0_ready(pdev);
+    if (err) {
+        if (err != -EPROBE_DEFER) {
+            dev_err(&pdev->dev,
+                    "slash: PF2 BAR0 readiness check failed: %d\n", err);
         }
-
-        if (br_aer) {
-            pci_read_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK, &saved_br_mask);
-            pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK,
-                                   saved_br_mask | PF2_AXI_PROBE_MASK);
-            dev_dbg(&pdev->dev,
-                    "slash: AER masked on bridge %s (saved=0x%08x, set=0x%08x)\n",
-                    pci_name(bridge), saved_br_mask,
-                    saved_br_mask | PF2_AXI_PROBE_MASK);
-        } else {
-            dev_warn(&pdev->dev,
-                     "slash: no AER capability on upstream bridge — "
-                     "BAR0 probe without bridge error masking\n");
-        }
-
-        void __iomem *bar0 = pci_iomap(pdev, 0, sizeof(u32));
-        u32 ap_ctrl = bar0 ? ioread32(bar0) : 0xFFFFFFFF;
-
-        if (bar0)
-            pci_iounmap(pdev, bar0);
-
-        /* Clear any errors induced by the probe read (RW1C) before unmasking. */
-        if (ep_aer) {
-            pci_write_config_dword(pdev, ep_aer + PCI_ERR_UNCOR_STATUS, PF2_AXI_PROBE_MASK);
-            pci_write_config_dword(pdev, ep_aer + PCI_ERR_UNCOR_MASK, saved_ep_mask);
-            dev_dbg(&pdev->dev, "slash: AER mask restored on endpoint\n");
-        }
-        if (br_aer) {
-            pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_STATUS, PF2_AXI_PROBE_MASK);
-            pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK, saved_br_mask);
-            dev_dbg(&pdev->dev, "slash: AER mask restored on bridge %s\n", pci_name(bridge));
-        }
-
-        if (ap_ctrl == 0xFFFFFFFF) {
-            dev_info(&pdev->dev,
-                     "slash: PF2 BAR0 AXI fabric not ready (ap_ctrl=0x%08x%s) — "
-                     "deferring probe\n",
-                     ap_ctrl, bar0 ? "" : ", BAR0 map failed");
-            err = -EPROBE_DEFER;
-            goto err_disable_device;
-        }
-
-        dev_info(&pdev->dev,
-                 "slash: PF2 BAR0 AXI fabric ready (ap_ctrl=0x%08x)\n", ap_ctrl);
-
-#undef PF2_AXI_PROBE_MASK
+        goto err_disable_device;
     }
 
     err = slash_ctldev_create(pdev);
