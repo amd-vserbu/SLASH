@@ -182,6 +182,12 @@ def generate_base_pdi_with_aved(config: CommandConfiguration) -> Path:
         with resources.path("slashkit.resources.aved", file_name) as in_path:
             _copy_checked(in_path, target_dir / file_name)
 
+    # Copy RP1 firmware sources into the AVED build tree
+    rp1_src_dir = config.resources_dir / "aved" / "rp1"
+    rp1_dest_dir = aved_dir / "fw" / "RP1"
+    if rp1_src_dir.is_dir():
+        shutil.copytree(rp1_src_dir, rp1_dest_dir, dirs_exist_ok=True)
+
     logger.info("Running AVED build script in %s", aved_hw_dir)
     subprocess.run(
         ["bash", "build_all.sh"],
