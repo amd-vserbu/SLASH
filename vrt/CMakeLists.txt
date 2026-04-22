@@ -75,15 +75,18 @@ configure_file(
 file(
   GLOB
   LIB_SOURCES
-  
+
   ${CMAKE_CURRENT_SOURCE_DIR}/src/allocator/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/buffer/*.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/qdma/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp 
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/register/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/driver/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/graph/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/graph/device/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/graph/crossdevice/*.cpp
 )
 
 add_library(vrt SHARED ${LIB_SOURCES})

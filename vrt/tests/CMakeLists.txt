@@ -27,6 +27,7 @@ add_vrt_test(xml_parser_test xml_parser_test.cpp)
 add_vrt_test(utilization_parser_test utilization_parser_test.cpp)
 add_vrt_test(kernel_test kernel_test.cpp)
 add_vrt_test(vrtbin_test vrtbin_test.cpp)
+add_vrt_test(graph_test graph_test.cpp)
 
 # --- Stub VBIN generation ---
 set(STUB_VBIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/stub_vbin)
