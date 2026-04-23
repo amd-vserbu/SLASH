@@ -19,17 +19,26 @@
  */
 
 /**
- * @file cpu_fpga_bridge.hpp
- * @brief CpuFpgaBridge — per-pair bridge for CPU ↔ FPGA transfers.
+ * @file cpu_gpu_bridge.hpp
+ * @brief CpuGpuBridge — bridge for CPU ↔ GPU transfers.
  *
- * One instance is constructed per concrete `(srcDevice, dstDevice)` pair
- * by the Graph's bridge-factory machinery. The bridge owns its private
- * `SemaphorePool` plus per-transfer staging buffers, and exposes its
- * primitives only as opaque closures returned in a `BridgeStepPair`.
+ * Only available when the VRT GPU backend is built (VRT_HAS_GPU).
+ *
+ * The bridge owns its own primitive state (a private `SemaphorePool` plus a
+ * host-side staging buffer per transfer) and exposes that state to the
+ * participating devices only as opaque `std::function<void()>` closures via
+ * a `BridgeStepPair` returned to the compiler. The closures use the public
+ * `setInputBuffer` /
+ * `getOutputBuffer` accessors of the concrete device types to move data, so
+ * no part of the GPU-specific machinery leaks into the device interface.
  */
 
-#ifndef VRT_GRAPH_CROSSDEVICE_CPU_FPGA_BRIDGE_HPP
-#define VRT_GRAPH_CROSSDEVICE_CPU_FPGA_BRIDGE_HPP
+#ifndef VRT_GRAPH_CROSSDEVICE_CPU_GPU_BRIDGE_HPP
+#define VRT_GRAPH_CROSSDEVICE_CPU_GPU_BRIDGE_HPP
+
+#if !defined(VRT_HAS_GPU) || (VRT_HAS_GPU == 0)
+#error "cpu_gpu_bridge.hpp requires VRT_HAS_GPU; build VRT with VRT_ENABLE_GPU=ON."
+#endif
 
 #include <memory>
 
@@ -39,16 +48,17 @@
 namespace vrt::graph {
 
 class CpuDevice;
+class GpuDevice;
 
-class CpuFpgaBridge : public IBridge {
+class CpuGpuBridge : public IBridge {
    public:
     /**
-     * @brief Construct a bridge bound to a specific (src, dst) device pair.
+     * @brief Construct a bridge bound to a specific (src, dst) pair where
+     *        each endpoint is either a CpuDevice or a GpuDevice.
      *
-     * Exactly one of the endpoints must be a CpuDevice; the other is the
-     * FPGA endpoint (currently a stub — see `makeTransfer`).
+     * @throws std::runtime_error if neither endpoint is CPU or GPU.
      */
-    CpuFpgaBridge(IDevice& src, IDevice& dst);
+    CpuGpuBridge(IDevice& src, IDevice& dst);
 
     BridgeStepPair makeTransfer(IDevice&            src,
                                 IDevice&            dst,
@@ -65,22 +75,20 @@ class CpuFpgaBridge : public IBridge {
    private:
     SemaphorePool pool_;
     CpuDevice*    srcCpu_ = nullptr;
+    GpuDevice*    srcGpu_ = nullptr;
     CpuDevice*    dstCpu_ = nullptr;
+    GpuDevice*    dstGpu_ = nullptr;
 };
 
 /**
  * @brief Convenience factory for `Graph::registerBridgeFactory`.
- *
- * Usage:
- *   g.registerBridgeFactory(DeviceType::CPU,  DeviceType::FPGA, CpuFpgaBridgeFactory());
- *   g.registerBridgeFactory(DeviceType::FPGA, DeviceType::CPU,  CpuFpgaBridgeFactory());
  */
-inline BridgeFactory CpuFpgaBridgeFactory() {
+inline BridgeFactory CpuGpuBridgeFactory() {
     return [](IDevice& src, IDevice& dst) -> std::shared_ptr<IBridge> {
-        return std::make_shared<CpuFpgaBridge>(src, dst);
+        return std::make_shared<CpuGpuBridge>(src, dst);
     };
 }
 
 }  // namespace vrt::graph
 
-#endif  // VRT_GRAPH_CROSSDEVICE_CPU_FPGA_BRIDGE_HPP
+#endif  // VRT_GRAPH_CROSSDEVICE_CPU_GPU_BRIDGE_HPP

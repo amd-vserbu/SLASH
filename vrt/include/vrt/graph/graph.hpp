@@ -103,66 +103,151 @@ class Graph {
     }
 
     /**
-     * @brief Register a cross-device backend for a pair of device types.
+     * @brief Register a cross-device bridge **factory** for an ordered
+     *        device-type pair.
      *
-     * One bridge per canonical DeviceType pair.  Must be called before
-     * compile/run.  Registering a bridge after compilation resets the
-     * compiled state.
+     * The compiler lazily invokes the factory once per concrete
+     * `(srcDeviceId, dstDeviceId)` pair it encounters, constructing one
+     * bridge instance bound to that specific pair. The instance is owned
+     * by the Graph, so any closures it returns via `BridgeStepPair`
+     * remain valid for the Graph's lifetime.
      *
-     * @param cb  Shared-ownership bridge instance.
-     * @throws std::invalid_argument  If a bridge for the same device-type
-     *         pair is already registered, or if both types are CPU.
+     * Each non-CPU device type SHOULD register at least a `(CPU, T)` and
+     * `(T, CPU)` factory; missing factories surface as runtime errors at
+     * `compile()` time when a transfer needs them.
+     *
+     * @throws std::invalid_argument  If a factory for the same ordered
+     *         pair is already registered, or both types are CPU.
      */
-    void registerBridge(std::shared_ptr<IBridge> cb) {
-        auto key = cb->devicePair();
-        if (key.first == DeviceType::CPU && key.second == DeviceType::CPU) {
+    void registerBridgeFactory(DeviceType    srcType,
+                                DeviceType    dstType,
+                                BridgeFactory factory) {
+        if (srcType == DeviceType::CPU && dstType == DeviceType::CPU) {
             throw std::invalid_argument(
-                "Graph::registerBridge: {CPU, CPU} bridge is not allowed");
+                "Graph::registerBridgeFactory: {CPU, CPU} factory is not allowed");
         }
-        if (bridges_.count(key)) {
+        auto key = std::make_pair(srcType, dstType);
+        if (bridgeFactories_.count(key)) {
             throw std::invalid_argument(
-                "Graph::registerBridge: duplicate bridge for device-type pair");
+                "Graph::registerBridgeFactory: duplicate factory for device-type pair");
         }
-        bridges_[key] = std::move(cb);
+        bridgeFactories_[key] = std::move(factory);
         compiled_ = false;
     }
 
     /**
-     * @brief Look up the cross-device backend for a pair of device types.
+     * @brief Look up (or lazily create) the bridge instance handling
+     *        transfers from device id @p srcDevId to @p dstDevId.
      *
-     * The argument order does not matter; the key is canonicalised internally.
+     * The instance is cached; subsequent calls with the same pair return
+     * the same `IBridge`.
      *
-     * @return The registered bridge, or nullptr if none exists.
+     * @throws std::runtime_error If no factory is registered for the
+     *         underlying device-type pair, or if either device id is
+     *         unknown.
      */
-    std::shared_ptr<IBridge> findBridge(DeviceType a,
-                                                          DeviceType b) const {
-        auto it = bridges_.find(IBridge::makeKey(a, b));
-        if (it != bridges_.end()) return it->second;
-        return nullptr;
+    IBridge& bridgeFor(const std::string& srcDevId,
+                       const std::string& dstDevId) {
+        auto cacheKey = std::make_pair(srcDevId, dstDevId);
+        auto it = bridgeInstances_.find(cacheKey);
+        if (it != bridgeInstances_.end()) return *it->second;
+
+        auto sIt = devices_.find(srcDevId);
+        auto dIt = devices_.find(dstDevId);
+        if (sIt == devices_.end()) {
+            throw std::runtime_error(
+                "Graph::bridgeFor: unknown source device id '" + srcDevId + "'");
+        }
+        if (dIt == devices_.end()) {
+            throw std::runtime_error(
+                "Graph::bridgeFor: unknown destination device id '" + dstDevId + "'");
+        }
+
+        auto typeKey = std::make_pair(sIt->second->type(), dIt->second->type());
+        auto fIt = bridgeFactories_.find(typeKey);
+        if (fIt == bridgeFactories_.end()) {
+            throw std::runtime_error(
+                "Graph::bridgeFor: no bridge factory registered for {" +
+                std::string(deviceTypeName(typeKey.first)) + ", " +
+                std::string(deviceTypeName(typeKey.second)) +
+                "} (needed for transfer from '" + srcDevId + "' to '" + dstDevId + "')");
+        }
+
+        auto inst = fIt->second(*sIt->second, *dIt->second);
+        if (!inst) {
+            throw std::runtime_error(
+                "Graph::bridgeFor: factory returned null for '" + srcDevId +
+                "' -> '" + dstDevId + "'");
+        }
+        auto& ref = *inst;
+        bridgeInstances_[cacheKey] = std::move(inst);
+        return ref;
     }
 
     /**
-     * @brief Returns the full map of registered cross-device backends.
+     * @brief Returns whether a factory is registered for an ordered
+     *        device-type pair.
      */
-    const std::map<std::pair<DeviceType, DeviceType>,
-                   std::shared_ptr<IBridge>>& bridges() const {
-        return bridges_;
+    bool hasBridgeFactory(DeviceType srcType, DeviceType dstType) const {
+        return bridgeFactories_.count({srcType, dstType}) != 0;
     }
+
+    /**
+     * @brief Returns the registered bridge factories.
+     */
+    const std::map<std::pair<DeviceType, DeviceType>, BridgeFactory>&
+    bridgeFactories() const {
+        return bridgeFactories_;
+    }
+
+    /**
+     * @brief Returns the lazily-instantiated per-pair bridge cache.
+     */
+    const std::map<std::pair<std::string, std::string>,
+                   std::shared_ptr<IBridge>>& bridgeInstances() const {
+        return bridgeInstances_;
+    }
+
+    /**
+     * @brief Returns the user-added kernel nodes in insertion order.
+     *
+     * Intended for inspection and visualisation; mutating the graph must go
+     * through addNode(). Users only ever construct KernelNodes; BridgeOpNodes
+     * are synthesised by the compiler into the per-device DGraphs (see
+     * dgraphs()).
+     */
+    const std::vector<KernelNode>& nodes() const { return nodes_; }
+
+    /**
+     * @brief Returns the registered devices keyed by id().
+     */
+    const std::map<std::string, std::shared_ptr<IDevice>>& devices() const {
+        return devices_;
+    }
+
+    /**
+     * @brief Returns the per-device subgraphs produced by the last compile.
+     *
+     * Empty until launch()/run() (or any operation that triggers
+     * ensureCompiled()) has been called.
+     */
+    const std::vector<DGraph>& dgraphs() const { return dgraphs_; }
 
     /**
      * @brief Declare a graph-level input buffer (no producer node).
      *
+     * @param type  Element type of the buffer.
      * @param name  Logical name; must be unique among all graph buffers.
      * @return      A GraphBuffer token that may be passed to IOMap::bindInputBuffer().
-     * @throws std::invalid_argument  If the name is already taken.
+     * @throws std::invalid_argument  If the name is already taken or empty.
      */
-    GraphBuffer inputBuffer(std::string name) {
+    GraphBuffer inputBuffer(BufferType type, std::string name) {
         if (bufferNames_.count(name)) {
             throw std::invalid_argument("Graph::inputBuffer: name '" + name + "' already used");
         }
         bufferNames_.insert(name);
         compiled_ = false;
-        return GraphBuffer(std::move(name));
+        return GraphBuffer::make(type, std::move(name));
     }
 
     /**
@@ -186,8 +271,8 @@ class Graph {
         if (nodeById_.count(id)) {
             throw std::invalid_argument("Graph::addNode: node id collision for '" + id + "'");
         }
-        Node n{std::move(id), std::move(kernel), std::move(deviceHint),
-               std::move(ioMap), std::move(afterNodes)};
+        KernelNode n{std::move(id), std::move(kernel), std::move(deviceHint),
+                     std::move(ioMap), std::move(afterNodes)};
         const std::string nodeId = n.id;
         nodeById_[nodeId] = nodes_.size();
         nodes_.push_back(std::move(n));
@@ -209,11 +294,14 @@ class Graph {
      *
      * @throws std::runtime_error  On any structural violation, with a descriptive message.
      */
-    void validate() const {
+    void validate() {
         // Cycle detection and basic consistency — delegate to compiler logic.
         // Full port-binding validation is backend-specific and deferred to compile().
         GraphCompiler compiler;
-        compiler.compile(nodes_, devices_, bridges_);  // throws on structural errors
+        auto lookup = [this](const std::string& s, const std::string& d) -> IBridge& {
+            return this->bridgeFor(s, d);
+        };
+        compiler.compile(nodes_, devices_, lookup);  // throws on structural errors
         // If compile() succeeds we discard the result; this is a dry-run.
     }
 
@@ -265,23 +353,28 @@ class Graph {
         }
         validateBridges();
         GraphCompiler compiler;
-        dgraphs_ = compiler.compile(nodes_, devices_, bridges_);
+        auto lookup = [this](const std::string& s, const std::string& d) -> IBridge& {
+            return this->bridgeFor(s, d);
+        };
+        dgraphs_ = compiler.compile(nodes_, devices_, lookup);
         compiled_ = true;
     }
 
     /**
-     * @brief Verify that every non-CPU device type has a {CPU, Type} bridge.
+     * @brief Verify that every non-CPU device type has a {CPU, Type} factory
+     *        in both directions.
      */
     void validateBridges() const {
         for (const auto& [id, device] : devices_) {
             DeviceType dt = device->type();
             if (dt == DeviceType::CPU) continue;
-            auto key = IBridge::makeKey(DeviceType::CPU, dt);
-            if (!bridges_.count(key)) {
+            if (!bridgeFactories_.count({DeviceType::CPU, dt}) ||
+                !bridgeFactories_.count({dt, DeviceType::CPU})) {
                 throw std::runtime_error(
                     "Graph: device '" + id +
-                    "' requires a {CPU, " + deviceTypeName(dt) +
-                    "} bridge, but none is registered");
+                    "' requires {CPU, " + deviceTypeName(dt) +
+                    "} and {" + deviceTypeName(dt) +
+                    ", CPU} bridge factories, but at least one is missing");
             }
         }
     }
@@ -296,11 +389,12 @@ class Graph {
         return "unknown";
     }
 
-    std::vector<Node>                                         nodes_;
+    std::vector<KernelNode>                                   nodes_;
     std::map<std::string, size_t>                             nodeById_;    // id → index in nodes_
     std::map<std::string, std::shared_ptr<IDevice>>           devices_;    // device-id → device
-    std::map<std::pair<DeviceType, DeviceType>,
-             std::shared_ptr<IBridge>>             bridges_; // type-pair → bridge
+    std::map<std::pair<DeviceType, DeviceType>, BridgeFactory> bridgeFactories_;
+    std::map<std::pair<std::string, std::string>,
+             std::shared_ptr<IBridge>>                        bridgeInstances_;
     std::set<std::string>                                     bufferNames_; // declared buffer names
 
     std::vector<DGraph> dgraphs_;   // populated by ensureCompiled()

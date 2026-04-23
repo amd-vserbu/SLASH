@@ -20,12 +20,16 @@
 
 /**
  * @file graph_buffer.hpp
- * @brief GraphBuffer — opaque buffer token used in graph construction.
+ * @brief GraphBuffer — typed, opaque buffer token used in graph construction.
  *
- * A GraphBuffer is a first-class value in the graph.  The compiler resolves
- * each token to a concrete, device-allocated buffer at compile time.
+ * A GraphBuffer is a first-class value in the graph: a (name, element-type)
+ * pair that the compiler resolves to a concrete, device-allocated buffer at
+ * compile time.
  *
- * Tokens are produced in two ways:
+ * Tokens are minted via the public factory:
+ *   GraphBuffer::make(BufferType, std::string)
+ *
+ * In normal usage the factory is invoked indirectly through:
  *  - Graph::inputBuffer()         — graph-level inputs (no producer node)
  *  - IOMap::bindOutputBuffer()    — output of a kernel node
  *  - IOMap::bindRWBuffer()        — output side of an in-place RW operation
@@ -36,16 +40,32 @@
 #ifndef VRT_GRAPH_CORE_GRAPH_BUFFER_HPP
 #define VRT_GRAPH_CORE_GRAPH_BUFFER_HPP
 
+#include <stdexcept>
 #include <string>
+#include <utility>
+
+#include <vrt/graph/core/types.hpp>
 
 namespace vrt::graph {
-
-class Graph;  // friend; creates tokens
-class IOMap;  // friend; creates output tokens
 
 class GraphBuffer {
    public:
     GraphBuffer() = default;
+
+    /**
+     * @brief Mint a new, valid buffer token.
+     *
+     * @param type  Element type of the buffer.
+     * @param name  Logical name (unique within its Graph).  Must be non-empty.
+     * @throws std::invalid_argument if @p name is empty.
+     */
+    static GraphBuffer make(BufferType type, std::string name) {
+        if (name.empty()) {
+            throw std::invalid_argument(
+                "GraphBuffer::make: name must not be empty");
+        }
+        return GraphBuffer(type, std::move(name));
+    }
 
     /**
      * @brief Returns the logical name of this buffer (unique within its Graph).
@@ -53,17 +73,23 @@ class GraphBuffer {
     const std::string& name() const { return name_; }
 
     /**
+     * @brief Returns the element type of this buffer.
+     *
+     * For a default-constructed (invalid) token the returned value is
+     * unspecified and should not be relied upon.
+     */
+    BufferType type() const { return type_; }
+
+    /**
      * @brief Returns false for default-constructed (unbound) tokens.
      */
     bool valid() const { return !name_.empty(); }
 
    private:
-    friend class Graph;
-    friend class IOMap;
-    friend class BridgeRouter;
+    GraphBuffer(BufferType type, std::string name)
+        : type_(type), name_(std::move(name)) {}
 
-    explicit GraphBuffer(std::string name) : name_(std::move(name)) {}
-
+    BufferType  type_ = BufferType::U8;  // placeholder for default-constructed tokens
     std::string name_;
 };
 

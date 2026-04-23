@@ -26,12 +26,13 @@
  * Graph::launch() which invoke the compiler transparently.
  *
  * Compilation steps:
- *  1. Topological sort of all Nodes using data-dependency edges (derived from
- *     IOMap buffer tokens) and explicit afterNodes edges.
- *  2. Group nodes by deviceHint → one DGraph per device.
- *  3. For each cross-device buffer edge: allocate a SemaphoreHandle, call
- *     insertSignal() on the producer backend and insertAwait() on the consumer
- *     backend; call insertDMA() on whichever backend prefersDMAInitiation().
+ *  1. Topological sort of all KernelNodes using data-dependency edges (derived
+ *     from IOMap buffer tokens) and explicit afterNodes edges.
+ *  2. Group kernels by deviceHint → one DGraph per device.
+ *  3. For each cross-device buffer edge: ask BridgeRouter for a `RoutedLeg`
+ *     (one direct hop or two via the CPU bounce). Each leg's `BridgeStepPair`
+ *     is materialised as a producer-side and a consumer-side `BridgeOpNode`
+ *     and spliced into the corresponding DGraphs.
  *  4. Call backend.compile(dg) for each DGraph.
  */
 
@@ -40,6 +41,7 @@
 
 #include <map>
 #include <memory>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -57,22 +59,39 @@ class Graph;  // forward; compiler reads graph internals via a friend accessor
 class GraphCompiler {
    public:
     /**
+     * @brief Lookup callback used by the compiler to obtain a bridge
+     *        instance for a concrete (srcDeviceId, dstDeviceId) pair.
+     *
+     * Implementations are expected to lazily instantiate one bridge per
+     * pair from registered factories and cache the result. `Graph` wraps
+     * its `bridgeFor()` method as this callback.
+     */
+    using BridgeFor =
+        std::function<IBridge&(const std::string& srcDevId,
+                               const std::string& dstDevId)>;
+
+    /**
      * @brief Compile a Graph given the registered backends.
      *
-     * @param nodes     Nodes in insertion order (will be topologically sorted internally).
+     * @param nodes     Kernel nodes in insertion order (will be topologically
+     *                  sorted internally).
      * @param devices   Map of device-id → device, as registered with Graph.
-     * @param bridges  Map of device-type pair → cross-device backend (optional;
-     *                       empty map disables cross-device sync injection).
-     * @return          One DGraph per device, each with its nodes in execution order.
+     * @param bridgeFor Lookup that returns (lazily creating if needed) the
+     *                  bridge instance handling a concrete pair of device ids.
+     *                  The compiler invokes this once per cross-device edge it
+     *                  materialises.
+     * @return          One DGraph per device, each with its nodes (kernel +
+     *                  bridge ops) in execution order.
      *
-     * @throws std::runtime_error  If the graph contains a cycle, an unbound mandatory
-     *                             port, or a deviceHint that has no matching device.
+     * @throws std::runtime_error  If the graph contains a cycle, an unbound
+     *                             mandatory port, a deviceHint with no
+     *                             matching device, or `bridgeFor` rejects a
+     *                             needed pair.
      */
     std::vector<DGraph> compile(
-        const std::vector<Node>&                               nodes,
+        const std::vector<KernelNode>&                         nodes,
         const std::map<std::string, std::shared_ptr<IDevice>>& devices,
-        const std::map<std::pair<DeviceType, DeviceType>,
-                       std::shared_ptr<IBridge>>& bridges = {});
+        const BridgeFor&                                       bridgeFor);
 
    private:
     // --- Topology ---
@@ -82,7 +101,7 @@ class GraphCompiler {
      *        data-dependency edges and explicit afterNodes edges.
      */
     std::map<std::string, std::vector<std::string>> buildAdjacency(
-        const std::vector<Node>& nodes) const;
+        const std::vector<KernelNode>& nodes) const;
 
     /**
      * @brief Kahn's algorithm topological sort.
@@ -90,44 +109,19 @@ class GraphCompiler {
      * @throws std::runtime_error on cycle detection.
      */
     std::vector<std::string> topoSort(
-        const std::vector<Node>&                                 nodes,
+        const std::vector<KernelNode>&                           nodes,
         const std::map<std::string, std::vector<std::string>>&   adj) const;
 
     // --- Buffer token → producer node mapping ---
 
     /**
-     * @brief Build a map from GraphBuffer name → the node id that produced it.
+     * @brief Build a map from GraphBuffer name → the kernel-node id that
+     *        produced it.
      *
      * Graph-level input buffers (no producer) are absent from this map.
      */
     std::map<std::string, std::string> buildProducerMap(
-        const std::vector<Node>& nodes) const;
-
-    // --- Cross-device sync ---
-
-    /**
-     * @brief Allocate a fresh semaphore id (monotonically increasing).
-     */
-    SemaphoreHandle allocSemaphore() { return {nextSemId_++}; }
-
-    /**
-     * @brief For a cross-device edge producer→consumer, inject the appropriate
-     *        semaphore and DMA nodes into both devices.
-     *
-     * Delegates to BridgeRouter::routeTransfer which uses the registered
-     * cross-device backends or bounces via CPU if no direct path exists.
-     */
-    void injectCrossDeviceSync(IDevice& producer,
-                               IDevice& consumer,
-                               const GraphBuffer& buf,
-                               uint64_t sizeHint,
-                               const std::map<std::pair<DeviceType, DeviceType>,
-                                              std::shared_ptr<IBridge>>& bridges,
-                               IDevice& cpuDevice,
-                               const std::string& producerNodeId,
-                               const std::string& consumerNodeId);
-
-    uint32_t nextSemId_ = 0;
+        const std::vector<KernelNode>& nodes) const;
 };
 
 }  // namespace vrt::graph

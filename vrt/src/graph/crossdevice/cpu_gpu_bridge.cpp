@@ -18,30 +18,29 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <vrt/graph/crossdevice/cpu_fpga_bridge.hpp>
+#include <vrt/graph/crossdevice/cpu_gpu_bridge.hpp>
 
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include <vrt/graph/crossdevice/bridge_op.hpp>
 #include <vrt/graph/device/cpu_device.hpp>
+#include <vrt/graph/device/gpu_device.hpp>
 
 namespace vrt::graph {
 
 namespace {
 
-/**
- * @brief Bridge-private state for a single CPU↔FPGA transfer.
- */
-struct CpuFpgaBridgeOp : IBridgeOp {
+struct CpuGpuBridgeOp : IBridgeOp {
     SemaphorePool*       pool;
     SemaphoreHandle      sem;
     std::vector<uint8_t> staging;
 
-    std::string label() const override { return "cpu_fpga_xfer"; }
+    std::string label() const override { return "cpu_gpu_xfer"; }
 };
 
-struct CpuFpgaBarrierOp : IBridgeOp {
+struct CpuGpuBarrierOp : IBridgeOp {
     SemaphorePool*  pool;
     SemaphoreHandle sem;
     std::string     label() const override { return "barrier"; }
@@ -49,44 +48,48 @@ struct CpuFpgaBarrierOp : IBridgeOp {
 
 }  // namespace
 
-CpuFpgaBridge::CpuFpgaBridge(IDevice& src, IDevice& dst)
+CpuGpuBridge::CpuGpuBridge(IDevice& src, IDevice& dst)
     : srcCpu_(dynamic_cast<CpuDevice*>(&src)),
-      dstCpu_(dynamic_cast<CpuDevice*>(&dst)) {}
+      srcGpu_(dynamic_cast<GpuDevice*>(&src)),
+      dstCpu_(dynamic_cast<CpuDevice*>(&dst)),
+      dstGpu_(dynamic_cast<GpuDevice*>(&dst)) {
+    if (!(srcCpu_ || srcGpu_) || !(dstCpu_ || dstGpu_)) {
+        throw std::runtime_error(
+            "CpuGpuBridge: endpoints must be CpuDevice or GpuDevice");
+    }
+}
 
-BridgeStepPair CpuFpgaBridge::makeTransfer(IDevice&            /*src*/,
-                                            IDevice&            /*dst*/,
-                                            const GraphBuffer&  buffer,
-                                            uint64_t            /*sizeHintBytes*/,
-                                            const std::string&  /*producerNodeId*/,
-                                            const std::string&  /*consumerNodeId*/) {
-    auto op  = std::make_shared<CpuFpgaBridgeOp>();
+BridgeStepPair CpuGpuBridge::makeTransfer(IDevice&            /*src*/,
+                                           IDevice&            /*dst*/,
+                                           const GraphBuffer&  buffer,
+                                           uint64_t            /*sizeHintBytes*/,
+                                           const std::string&  /*producerNodeId*/,
+                                           const std::string&  /*consumerNodeId*/) {
+    auto op  = std::make_shared<CpuGpuBridgeOp>();
     op->pool = &pool_;
     op->sem  = pool_.allocate();
 
     const std::string bufName = buffer.name();
     auto* srcCpu = srcCpu_;
+    auto* srcGpu = srcGpu_;
     auto* dstCpu = dstCpu_;
+    auto* dstGpu = dstGpu_;
 
-    // Producer: snapshot the source buffer (CPU side) into staging and signal.
-    auto producerClosure = [op, srcCpu, bufName]() {
-        if (srcCpu) {
-            size_t sz = srcCpu->bufferSize(bufName);
-            op->staging.resize(sz);
-            if (sz > 0) srcCpu->getOutputBuffer(bufName, op->staging.data(), sz);
+    auto producerClosure = [op, srcCpu, srcGpu, bufName]() {
+        size_t sz = srcCpu ? srcCpu->bufferSize(bufName)
+                           : srcGpu->bufferSize(bufName);
+        op->staging.resize(sz);
+        if (sz > 0) {
+            if (srcCpu) srcCpu->getOutputBuffer(bufName, op->staging.data(), sz);
+            else        srcGpu->getOutputBuffer(bufName, op->staging.data(), sz);
         }
-        // else: FPGA-side producer — needs FpgaDevice accessor (TODO).
         op->pool->signal(op->sem);
     };
 
-    // Split consumer into a non-blocking probe + the actual copy.
-    auto tryReady = [op]() -> bool {
-        return op->pool->tryAwait(op->sem);
-    };
-    auto consumerAction = [op, dstCpu, bufName]() {
-        if (dstCpu) {
-            dstCpu->setInputBuffer(bufName, op->staging.data(), op->staging.size());
-        }
-        // else: FPGA-side consumer — needs FpgaDevice accessor (TODO).
+    auto tryReady = [op]() { return op->pool->tryAwait(op->sem); };
+    auto consumerAction = [op, dstCpu, dstGpu, bufName]() {
+        if (dstCpu) dstCpu->setInputBuffer(bufName, op->staging.data(), op->staging.size());
+        else        dstGpu->setInputBuffer(bufName, op->staging.data(), op->staging.size());
     };
 
     return BridgeStepPair{op,
@@ -95,11 +98,11 @@ BridgeStepPair CpuFpgaBridge::makeTransfer(IDevice&            /*src*/,
                           std::move(consumerAction)};
 }
 
-BridgeStepPair CpuFpgaBridge::makeBarrier(IDevice&            /*src*/,
-                                           IDevice&            /*dst*/,
-                                           const std::string&  /*producerNodeId*/,
-                                           const std::string&  /*consumerNodeId*/) {
-    auto op  = std::make_shared<CpuFpgaBarrierOp>();
+BridgeStepPair CpuGpuBridge::makeBarrier(IDevice&            /*src*/,
+                                          IDevice&            /*dst*/,
+                                          const std::string&  /*producerNodeId*/,
+                                          const std::string&  /*consumerNodeId*/) {
+    auto op  = std::make_shared<CpuGpuBarrierOp>();
     op->pool = &pool_;
     op->sem  = pool_.allocate();
 

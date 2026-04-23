@@ -21,8 +21,10 @@
 #include <vrt/graph/compiler.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <queue>
 #include <set>
+#include <utility>
 
 namespace vrt::graph {
 
@@ -31,7 +33,7 @@ namespace vrt::graph {
 // ---------------------------------------------------------------------------
 
 std::map<std::string, std::string> GraphCompiler::buildProducerMap(
-    const std::vector<Node>& nodes) const {
+    const std::vector<KernelNode>& nodes) const {
     std::map<std::string, std::string> producers;
     for (const auto& node : nodes) {
         for (const auto& [port, buf] : node.ioMap.outputBuffers()) {
@@ -49,34 +51,28 @@ std::map<std::string, std::string> GraphCompiler::buildProducerMap(
 // ---------------------------------------------------------------------------
 
 std::map<std::string, std::vector<std::string>> GraphCompiler::buildAdjacency(
-    const std::vector<Node>& nodes) const {
+    const std::vector<KernelNode>& nodes) const {
     auto producers = buildProducerMap(nodes);
 
     std::map<std::string, std::vector<std::string>> adj;
 
-    // Ensure every node has an entry even if it has no successors.
     for (const auto& node : nodes) {
         adj.emplace(node.id, std::vector<std::string>{});
     }
 
     for (const auto& node : nodes) {
-        // Data-dependency edges: input buffer produced by another node.
         for (const auto& [port, buf] : node.ioMap.inputBuffers()) {
             auto it = producers.find(buf.name());
             if (it != producers.end()) {
                 adj[it->second].push_back(node.id);
             }
         }
-
-        // RW buffer input side.
         for (const auto& rw : node.ioMap.rwBuffers()) {
             auto it = producers.find(rw.in.name());
             if (it != producers.end()) {
                 adj[it->second].push_back(node.id);
             }
         }
-
-        // Explicit ordering constraints.
         for (const auto& after : node.afterNodes) {
             adj[after].push_back(node.id);
         }
@@ -90,7 +86,7 @@ std::map<std::string, std::vector<std::string>> GraphCompiler::buildAdjacency(
 // ---------------------------------------------------------------------------
 
 std::vector<std::string> GraphCompiler::topoSort(
-    const std::vector<Node>& nodes,
+    const std::vector<KernelNode>& nodes,
     const std::map<std::string, std::vector<std::string>>& adj) const {
 
     std::map<std::string, int> inDegree;
@@ -137,49 +133,28 @@ std::vector<std::string> GraphCompiler::topoSort(
 }
 
 // ---------------------------------------------------------------------------
-// injectCrossDeviceSync
-// ---------------------------------------------------------------------------
-
-void GraphCompiler::injectCrossDeviceSync(
-    IDevice& producer,
-    IDevice& consumer,
-    const GraphBuffer& buf,
-    uint64_t sizeHint,
-    const std::map<std::pair<DeviceType, DeviceType>,
-                   std::shared_ptr<IBridge>>& bridges,
-    IDevice& cpuDevice,
-    const std::string& producerNodeId,
-    const std::string& consumerNodeId) {
-    BridgeRouter::routeTransfer(
-        producer, consumer, buf, sizeHint, bridges, cpuDevice,
-        [this]() { return allocSemaphore(); },
-        producerNodeId, consumerNodeId);
-}
-
-// ---------------------------------------------------------------------------
 // compile
 // ---------------------------------------------------------------------------
 
 std::vector<DGraph> GraphCompiler::compile(
-    const std::vector<Node>& nodes,
+    const std::vector<KernelNode>& nodes,
     const std::map<std::string, std::shared_ptr<IDevice>>& devices,
-    const std::map<std::pair<DeviceType, DeviceType>,
-                   std::shared_ptr<IBridge>>& bridges) {
+    const BridgeFor&                                       bridgeFor) {
 
     // 1. Topological sort.
     auto adj       = buildAdjacency(nodes);
     auto sortedIds = topoSort(nodes, adj);
 
-    // Build node lookup by id.
-    std::map<std::string, const Node*> nodeById;
+    // KernelNode lookup by id.
+    std::map<std::string, const KernelNode*> nodeById;
     for (const auto& node : nodes) {
         nodeById[node.id] = &node;
     }
 
-    // 2. Resolve device placement for each node.
+    // 2. Resolve device placement for each kernel.
     std::map<std::string, std::string> nodeDevice;  // node-id → device-id
     for (const auto& id : sortedIds) {
-        const Node* node = nodeById[id];
+        const KernelNode* node = nodeById[id];
         if (!node->deviceHint.empty()) {
             if (devices.find(node->deviceHint) == devices.end()) {
                 throw std::runtime_error(
@@ -204,21 +179,22 @@ std::vector<DGraph> GraphCompiler::compile(
         }
     }
 
-    // 3. Group nodes by device in topological order.
-    std::map<std::string, DGraph> dgraphByDevice;
+    // 3. Group kernels per device in topological order.
+    //
+    // Build an ordered list of KernelNodes per device id; we splice
+    // BridgeOpNodes around them in step 4.
+    std::map<std::string, std::vector<KernelNode>> kernelsByDevice;
     for (const auto& [did, dev] : devices) {
-        auto& dg = dgraphByDevice[did];
-        dg.deviceId = did;
-        dg.device   = dev;
+        kernelsByDevice[did];  // ensure entry exists
     }
     for (const auto& id : sortedIds) {
-        dgraphByDevice[nodeDevice[id]].nodes.push_back(*nodeById[id]);
+        kernelsByDevice[nodeDevice[id]].push_back(*nodeById[id]);
     }
 
-    // 4. Inject cross-device synchronisation via bridges.
+    // 4. Synthesise BridgeOpNodes for every cross-device buffer edge.
     auto producerMap = buildProducerMap(nodes);
 
-    // Find CPU device for bounce routing (if any).
+    // Find a CPU device for bounce routing (if any).
     IDevice* cpuDevice = nullptr;
     for (const auto& [did, dev] : devices) {
         if (dev->type() == DeviceType::CPU) {
@@ -227,11 +203,92 @@ std::vector<DGraph> GraphCompiler::compile(
         }
     }
 
-    // Track already-injected edges to avoid duplicates.
-    std::set<std::pair<std::string, std::string>> injectedEdges;
+    // For each device, accumulate the bridge ops to insert before/after each
+    // kernel index in kernelsByDevice[did].
+    struct DeviceInsertions {
+        // index into kernelsByDevice[did] → ordered list of ops to splice
+        std::map<size_t, std::vector<BridgeOpNode>> beforeKernel;
+        std::map<size_t, std::vector<BridgeOpNode>> afterKernel;
+        // Bridge ops with no anchor kernel on this device (bounce-route
+        // intermediaries living on the cpu when neither endpoint kernel
+        // is on the cpu). Appended to the DGraph after the kernel
+        // sequence in insertion order.
+        std::vector<BridgeOpNode> trailing;
+    };
+    std::map<std::string, DeviceInsertions> insertions;
+
+    // Helper: index of a kernel id within a device's kernel vector, or
+    // SIZE_MAX if not found.
+    auto kernelIndex = [&](const std::string& did, const std::string& kid) -> size_t {
+        const auto& v = kernelsByDevice[did];
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (v[i].id == kid) return i;
+        }
+        return std::numeric_limits<size_t>::max();
+    };
+
+    // Track already-handled (buffer, consumer-device) pairs.
+    std::set<std::pair<std::string, std::string>> handledEdges;
+
+    // Bridge-op id counter.
+    uint32_t bridgeCounter = 0;
+
+    auto materialiseLeg = [&](const RoutedLeg& leg,
+                              const std::string& extraProducerDep,
+                              const std::string& opIdPrefix = "_bridge_")
+        -> std::pair<std::string, std::string> {
+        auto pOpId = opIdPrefix + std::to_string(bridgeCounter) + "_p";
+        auto cOpId = opIdPrefix + std::to_string(bridgeCounter) + "_c";
+        ++bridgeCounter;
+
+        BridgeOpNode pNode{
+            pOpId, leg.srcDeviceId, leg.pair.op,
+            leg.pair.producerAction,
+            BridgeOpNode::Side::Producer,
+            leg.producerKernelId};
+        // Producer side: tryReady defaults to always-true (no wait).
+        // Producer side runs after the kernel that produced its data.
+        pNode.dependsOn.push_back(leg.producerKernelId);
+        // Bounce-route chaining: leg2's producer (on the cpu) runs after
+        // leg1's consumer (also on the cpu) finishes the first hop.
+        if (!extraProducerDep.empty()) {
+            pNode.dependsOn.push_back(extraProducerDep);
+        }
+
+        BridgeOpNode cNode{
+            cOpId, leg.dstDeviceId, leg.pair.op,
+            leg.pair.consumerAction,
+            BridgeOpNode::Side::Consumer,
+            leg.consumerKernelId};
+        // Consumer side learns it is fire-able via the bridge's
+        // tryReady probe; the executor calls it before action().
+        cNode.tryReady = leg.pair.consumerTryReady;
+        // Consumer side has no kernel-side predecessors here.
+        // dependsOn intentionally empty.
+
+        // Producer side: AFTER producerKernelId on src device, or trailed
+        // if the producer kernel doesn't live on src (bounce intermediary).
+        size_t pIdx = kernelIndex(leg.srcDeviceId, leg.producerKernelId);
+        if (pIdx == std::numeric_limits<size_t>::max()) {
+            insertions[leg.srcDeviceId].trailing.push_back(std::move(pNode));
+        } else {
+            insertions[leg.srcDeviceId].afterKernel[pIdx].push_back(std::move(pNode));
+        }
+
+        // Consumer side: BEFORE consumerKernelId on dst device, or trailed
+        // similarly if the consumer kernel isn't on dst.
+        size_t cIdx = kernelIndex(leg.dstDeviceId, leg.consumerKernelId);
+        if (cIdx == std::numeric_limits<size_t>::max()) {
+            insertions[leg.dstDeviceId].trailing.push_back(std::move(cNode));
+        } else {
+            insertions[leg.dstDeviceId].beforeKernel[cIdx].push_back(std::move(cNode));
+        }
+
+        return {pOpId, cOpId};
+    };
 
     for (const auto& id : sortedIds) {
-        const Node* node = nodeById[id];
+        const KernelNode* node = nodeById[id];
         const std::string& consumerDevId = nodeDevice[id];
 
         auto checkBuffer = [&](const std::string& bufName, const GraphBuffer& bufObj) {
@@ -242,18 +299,25 @@ std::vector<DGraph> GraphCompiler::compile(
             if (producerDevId == consumerDevId) return;  // same device
 
             auto edgeKey = std::make_pair(bufName, consumerDevId);
-            if (injectedEdges.count(edgeKey)) return;
-            injectedEdges.insert(edgeKey);
+            if (handledEdges.count(edgeKey)) return;
+            handledEdges.insert(edgeKey);
 
-            injectCrossDeviceSync(
+            if (!cpuDevice) {
+                throw std::runtime_error(
+                    "GraphCompiler: cross-device transfer of buffer '" + bufName +
+                    "' requires a CPU device but none is registered");
+            }
+
+            auto legs = BridgeRouter::routeTransfer(
                 *devices.at(producerDevId),
                 *devices.at(consumerDevId),
-                bufObj,
-                0,  // sizeHint unknown at compile time
-                bridges,
-                *cpuDevice,
-                producerNodeId,
-                id);
+                bufObj, 0, bridgeFor, *cpuDevice,
+                producerNodeId, id);
+            std::string prevConsumerId;
+            for (const auto& leg : legs) {
+                auto idsPair = materialiseLeg(leg, prevConsumerId);
+                prevConsumerId = idsPair.second;
+            }
         };
 
         for (const auto& [port, buf] : node->ioMap.inputBuffers()) {
@@ -264,10 +328,146 @@ std::vector<DGraph> GraphCompiler::compile(
         }
     }
 
-    // 5. Build result and call device compile().
+    // 5a. Materialise barrier op pairs for every cross-device afterNodes
+    //     edge. The consumer-side barrier op lands in
+    //     `insertions[k.dev].beforeKernel[i]` and is picked up by the
+    //     dependsOn loop below as a regular consumer-side bridge dep.
+    //
+    //     If no direct (srcType,dstType) bridge factory exists, bounce
+    //     the barrier through the cpu (one barrier per hop), chaining
+    //     leg2.producer after leg1.consumer.
+    for (auto& [did, kernels] : kernelsByDevice) {
+        for (size_t i = 0; i < kernels.size(); ++i) {
+            KernelNode& k = kernels[i];
+            for (const auto& a : k.afterNodes) {
+                auto ndIt = nodeDevice.find(a);
+                if (ndIt == nodeDevice.end()) continue;
+                if (ndIt->second == did) continue;  // same-device handled below
+
+                IDevice& srcDev = *devices.at(ndIt->second);
+                IDevice& dstDev = *devices.at(did);
+
+                // Try direct.
+                IBridge* directBr = nullptr;
+                try {
+                    directBr = &bridgeFor(srcDev.id(), dstDev.id());
+                } catch (const std::runtime_error&) {
+                    directBr = nullptr;
+                }
+
+                if (directBr) {
+                    auto pair = directBr->makeBarrier(srcDev, dstDev, a, k.id);
+                    RoutedLeg leg{
+                        srcDev.id(), dstDev.id(),
+                        a, k.id,
+                        std::move(pair)};
+                    materialiseLeg(leg, "", "_barrier_");
+                    continue;
+                }
+
+                // Bounce through cpu.
+                if (!cpuDevice) {
+                    throw std::runtime_error(
+                        "GraphCompiler: cross-device afterNodes from '" + a +
+                        "' to '" + k.id + "' requires bouncing a barrier "
+                        "through cpu but no CPU device is registered");
+                }
+                IBridge& srcCpu = bridgeFor(srcDev.id(), cpuDevice->id());
+                IBridge& cpuDst = bridgeFor(cpuDevice->id(), dstDev.id());
+                auto pair1 = srcCpu.makeBarrier(srcDev, *cpuDevice, a, k.id);
+                RoutedLeg leg1{
+                    srcDev.id(), cpuDevice->id(),
+                    a, k.id,
+                    std::move(pair1)};
+                auto ids1 = materialiseLeg(leg1, "", "_barrier_");
+
+                auto pair2 = cpuDst.makeBarrier(*cpuDevice, dstDev, a, k.id);
+                RoutedLeg leg2{
+                    cpuDevice->id(), dstDev.id(),
+                    a, k.id,
+                    std::move(pair2)};
+                materialiseLeg(leg2, ids1.second, "_barrier_");
+            }
+        }
+    }
+
+    // 5b. Populate `dependsOn` on every KernelNode in `kernelsByDevice`.
+    //
+    // For each kernel k on device D:
+    //   - Same-device data deps: producer kernel id (via producerMap).
+    //   - Cross-device data deps: covered by adding all entries in
+    //     insertions[D].beforeKernel[kIdx] (the consumer-side bridge or
+    //     barrier ops synthesised for k's incoming buffers / cross-device
+    //     afterNodes).
+    //   - afterNodes: same-device → copy; cross-device → already reflected
+    //     via the consumer-side barrier ops added in step 5a.
+    for (auto& [did, kernels] : kernelsByDevice) {
+        const auto& devIns = insertions[did];
+        for (size_t i = 0; i < kernels.size(); ++i) {
+            KernelNode& k = kernels[i];
+            std::set<std::string> seen;
+
+            auto addDep = [&](const std::string& depId) {
+                if (depId.empty() || depId == k.id) return;
+                if (seen.insert(depId).second) k.dependsOn.push_back(depId);
+            };
+
+            auto pushBufferDep = [&](const std::string& bufName) {
+                auto pit = producerMap.find(bufName);
+                if (pit == producerMap.end()) return;
+                if (nodeDevice[pit->second] == did) addDep(pit->second);
+            };
+            for (const auto& [port, buf] : k.ioMap.inputBuffers()) {
+                (void)port;
+                pushBufferDep(buf.name());
+            }
+            for (const auto& rw : k.ioMap.rwBuffers()) {
+                pushBufferDep(rw.in.name());
+            }
+
+            // Cross-device data + barrier deps via consumer-side ops.
+            auto bIt = devIns.beforeKernel.find(i);
+            if (bIt != devIns.beforeKernel.end()) {
+                for (const auto& bop : bIt->second) addDep(bop.id);
+            }
+
+            // Same-device afterNodes only; cross-device afterNodes are
+            // already represented as consumer-side barrier ops above.
+            for (const auto& a : k.afterNodes) {
+                auto ndIt = nodeDevice.find(a);
+                if (ndIt == nodeDevice.end()) continue;
+                if (ndIt->second == did) {
+                    addDep(a);
+                }
+            }
+        }
+    }
+
+    // 6. Build final DGraphs by interleaving bridge ops with kernels.
+    //    Devices with no user kernels but with bounce-intermediary trailing
+    //    ops still get a DGraph so the executor runs those ops.
     std::vector<DGraph> result;
-    for (auto& [did, dg] : dgraphByDevice) {
-        if (dg.nodes.empty()) continue;  // skip devices with no work
+    for (auto& [did, kernels] : kernelsByDevice) {
+        const auto& ins = insertions[did];
+        if (kernels.empty() && ins.trailing.empty()) continue;
+
+        DGraph dg;
+        dg.deviceId = did;
+        dg.device   = devices.at(did);
+
+        for (size_t i = 0; i < kernels.size(); ++i) {
+            auto bIt = ins.beforeKernel.find(i);
+            if (bIt != ins.beforeKernel.end()) {
+                for (const auto& op : bIt->second) dg.nodes.emplace_back(op);
+            }
+            dg.nodes.emplace_back(std::move(kernels[i]));
+            auto aIt = ins.afterKernel.find(i);
+            if (aIt != ins.afterKernel.end()) {
+                for (const auto& op : aIt->second) dg.nodes.emplace_back(op);
+            }
+        }
+        for (const auto& op : ins.trailing) dg.nodes.emplace_back(op);
+
         dg.device->compile(dg);
         result.push_back(std::move(dg));
     }

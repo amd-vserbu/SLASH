@@ -28,6 +28,21 @@ add_vrt_test(utilization_parser_test utilization_parser_test.cpp)
 add_vrt_test(kernel_test kernel_test.cpp)
 add_vrt_test(vrtbin_test vrtbin_test.cpp)
 add_vrt_test(graph_test graph_test.cpp)
+add_vrt_test(render_test render_test.cpp)
+add_vrt_test(semaphore_pool_test semaphore_pool_test.cpp)
+
+# --- GPU graph tests (conditional on HIP) ---
+if(VRT_HAS_GPU)
+  add_executable(gpu_graph_test gpu_graph_test.hip)
+  set_source_files_properties(gpu_graph_test.hip PROPERTIES
+    LANGUAGE HIP
+    HIP_ARCHITECTURES "${GPU_ARCH}"
+  )
+  target_link_libraries(gpu_graph_test PRIVATE GTest::gtest_main GTest::gmock vrt::vrt ${HIP_LIB})
+  target_include_directories(gpu_graph_test PRIVATE /opt/rocm/include)
+  gtest_discover_tests(gpu_graph_test)
+  add_dependencies(unit_tests gpu_graph_test)
+endif()
 
 # --- Stub VBIN generation ---
 set(STUB_VBIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/stub_vbin)

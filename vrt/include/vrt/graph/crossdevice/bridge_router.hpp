@@ -23,21 +23,22 @@
  * @brief BridgeRouter — routes cross-device transfers through direct
  *        bridges or bounces via the CPU when no direct path exists.
  *
- * Used by the compiler's injectCrossDeviceSync to transparently handle the
- * case where two devices have no dedicated bridge.  In that case
- * the transfer is split into two hops: src → CPU, then CPU → dst, using the
- * mandatory {CPU, SrcType} and {CPU, DstType} bridges.
+ * `routeTransfer` returns one or two `RoutedLeg`s describing where each
+ * BridgeOpNode should be spliced into the per-device DGraphs. The compiler
+ * does the actual splicing; this header is purely policy.
  */
 
 #ifndef VRT_GRAPH_CROSSDEVICE_BRIDGE_ROUTER_HPP
 #define VRT_GRAPH_CROSSDEVICE_BRIDGE_ROUTER_HPP
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <vrt/graph/crossdevice/bridge.hpp>
 #include <vrt/graph/device/device.hpp>
@@ -46,83 +47,111 @@
 
 namespace vrt::graph {
 
+/**
+ * @brief One leg of a routed cross-device transfer.
+ *
+ * The compiler splices the producer-side BridgeOpNode immediately AFTER
+ * `producerKernelId` in `srcDeviceId`'s DGraph, and the consumer-side
+ * BridgeOpNode immediately BEFORE `consumerKernelId` in `dstDeviceId`'s.
+ */
+struct RoutedLeg {
+    std::string    srcDeviceId;
+    std::string    dstDeviceId;
+    std::string    producerKernelId;  // anchor on src side
+    std::string    consumerKernelId;  // anchor on dst side
+    BridgeStepPair pair;
+};
+
 class BridgeRouter {
    public:
-    using BridgeMap = std::map<std::pair<DeviceType, DeviceType>,
-                              std::shared_ptr<IBridge>>;
+    /**
+     * @brief Lookup callback that returns the bridge instance for a
+     *        concrete (srcDeviceId, dstDeviceId) pair, lazily
+     *        instantiating it from a registered factory if necessary.
+     *
+     * Should throw `std::runtime_error` if no factory is registered for
+     * the pair's underlying device-type combination.
+     */
+    using BridgeFor =
+        std::function<IBridge&(const std::string& srcDevId,
+                               const std::string& dstDevId)>;
 
     /**
-     * @brief Route a cross-device buffer transfer, bouncing via CPU if needed.
+     * @brief Resolve a cross-device buffer transfer to one or more
+     *        BridgeStepPair legs.
      *
-     * If a direct IBridge exists for {src.type(), dst.type()}, it
-     * is used.  Otherwise the transfer is split into two legs:
-     *   1. src → cpuDevice  (using the {CPU, src.type()} bridge)
-     *   2. cpuDevice → dst  (using the {CPU, dst.type()} bridge)
-     *
-     * The intermediate bounce buffer is named deterministically so the CPU
-     * backend can lazily allocate it.
-     *
-     * @param src             Producing device.
-     * @param dst             Consuming device.
-     * @param buffer          Buffer token being transferred.
-     * @param sizeHintBytes   Expected size (0 = unknown).
-     * @param crossBackends   Registered bridges (canonical keys).
-     * @param cpuDevice       CPU device (bounce target).
-     * @param allocSemaphore  Callback to allocate fresh SemaphoreHandles.
+     * If a bridge exists for {src.id(), dst.id()} (via the factory for
+     * that DeviceType pair), returns a single direct leg using it.
+     * Otherwise the transfer is split into two legs (src → cpu, then
+     * cpu → dst) using the mandatory CPU↔T factories.
      */
-    static void routeTransfer(
-        IDevice&                                 src,
-        IDevice&                                 dst,
-        const GraphBuffer&                       buffer,
-        uint64_t                                 sizeHintBytes,
-        const BridgeMap&                          bridges,
-        IDevice&                                 cpuDevice,
-        std::function<SemaphoreHandle()>          allocSemaphore,
-        const std::string&                       producerNodeId,
-        const std::string&                       consumerNodeId)
+    static std::vector<RoutedLeg> routeTransfer(
+        IDevice&            src,
+        IDevice&            dst,
+        const GraphBuffer&  buffer,
+        uint64_t            sizeHintBytes,
+        const BridgeFor&    bridgeFor,
+        IDevice&            cpuDevice,
+        const std::string&  producerKernelId,
+        const std::string&  consumerKernelId)
     {
-        auto directKey = IBridge::makeKey(src.type(), dst.type());
-        auto directIt  = bridges.find(directKey);
+        std::vector<RoutedLeg> legs;
 
-        if (directIt != bridges.end()) {
-            directIt->second->injectTransfer(src, dst, buffer,
-                                             sizeHintBytes, allocSemaphore,
-                                             producerNodeId, consumerNodeId);
-            return;
+        // Try direct.
+        try {
+            IBridge& direct = bridgeFor(src.id(), dst.id());
+            auto pair = direct.makeTransfer(
+                src, dst, buffer, sizeHintBytes,
+                producerKernelId, consumerKernelId);
+            legs.push_back(RoutedLeg{
+                src.id(), dst.id(),
+                producerKernelId, consumerKernelId,
+                std::move(pair)});
+            return legs;
+        } catch (const std::runtime_error&) {
+            // No direct factory — fall through to bounce.
         }
 
         // Bounce via CPU: src → cpu, then cpu → dst.
-        auto srcCpuKey = IBridge::makeKey(src.type(), DeviceType::CPU);
-        auto srcCpuIt  = bridges.find(srcCpuKey);
-        if (srcCpuIt == bridges.end()) {
+        IBridge* srcCpuBridge = nullptr;
+        try {
+            srcCpuBridge = &bridgeFor(src.id(), cpuDevice.id());
+        } catch (const std::runtime_error&) {
             throw std::runtime_error(
-                "BridgeRouter: no bridge for {" + src.id() +
+                "BridgeRouter: no bridge factory for {" + src.id() +
                 ", cpu} — cannot bounce transfer of buffer '" +
                 buffer.name() + "'");
         }
 
-        auto cpuDstKey = IBridge::makeKey(DeviceType::CPU, dst.type());
-        auto cpuDstIt  = bridges.find(cpuDstKey);
-        if (cpuDstIt == bridges.end()) {
+        IBridge* cpuDstBridge = nullptr;
+        try {
+            cpuDstBridge = &bridgeFor(cpuDevice.id(), dst.id());
+        } catch (const std::runtime_error&) {
             throw std::runtime_error(
-                "BridgeRouter: no bridge for {cpu, " + dst.id() +
+                "BridgeRouter: no bridge factory for {cpu, " + dst.id() +
                 "} — cannot bounce transfer of buffer '" +
                 buffer.name() + "'");
         }
 
-        // Intermediate bounce buffer lives on the CPU.
-        GraphBuffer bounceBuffer("__bounce_" + buffer.name() + "_" +
-                                 src.id() + "_" + dst.id());
-
         // Leg 1: src → cpu
-        srcCpuIt->second->injectTransfer(src, cpuDevice, buffer,
-                                         sizeHintBytes, allocSemaphore,
-                                         producerNodeId, consumerNodeId);
+        auto leg1 = srcCpuBridge->makeTransfer(
+            src, cpuDevice, buffer, sizeHintBytes,
+            producerKernelId, consumerKernelId);
+        legs.push_back(RoutedLeg{
+            src.id(), cpuDevice.id(),
+            producerKernelId, consumerKernelId,
+            std::move(leg1)});
 
         // Leg 2: cpu → dst
-        cpuDstIt->second->injectTransfer(cpuDevice, dst, bounceBuffer,
-                                         sizeHintBytes, allocSemaphore,
-                                         producerNodeId, consumerNodeId);
+        auto leg2 = cpuDstBridge->makeTransfer(
+            cpuDevice, dst, buffer, sizeHintBytes,
+            producerKernelId, consumerKernelId);
+        legs.push_back(RoutedLeg{
+            cpuDevice.id(), dst.id(),
+            producerKernelId, consumerKernelId,
+            std::move(leg2)});
+
+        return legs;
     }
 };
 

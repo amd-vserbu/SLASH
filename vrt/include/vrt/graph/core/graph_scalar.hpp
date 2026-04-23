@@ -33,12 +33,33 @@
 #ifndef VRT_GRAPH_CORE_GRAPH_SCALAR_HPP
 #define VRT_GRAPH_CORE_GRAPH_SCALAR_HPP
 
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include <vrt/graph/core/types.hpp>
 
 namespace vrt::graph {
+
+namespace detail {
+
+/**
+ * @brief Reinterpret an arithmetic value as raw uint64_t bits.
+ *
+ * Bit patterns shorter than 64 bits are zero-extended.
+ */
+template <class T>
+inline uint64_t valueToBits(T value) {
+    static_assert(std::is_arithmetic_v<T>, "valueToBits: T must be arithmetic");
+    static_assert(sizeof(T) <= sizeof(uint64_t), "valueToBits: T larger than uint64_t");
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(T));
+    return bits;
+}
+
+}  // namespace detail
 
 class GraphScalar {
    public:
@@ -48,8 +69,14 @@ class GraphScalar {
      * @param type   Element type governing bit interpretation.
      * @param bits   Raw bit pattern of the value (e.g. reinterpret_cast a float to uint32_t).
      */
-    static GraphScalar constant(ScalarType type, uint64_t bits) {
+    static GraphScalar constantFromBits(ScalarType type, uint64_t bits) {
         return GraphScalar(type, bits, "");
+    }
+
+    template<class T>
+    static GraphScalar constant(T value) {
+        static_assert(std::is_arithmetic_v<T>, "GraphScalar::constant only supports arithmetic types");
+        return constantFromBits(typeToScalarType<T>(), detail::valueToBits(value));
     }
 
     /**

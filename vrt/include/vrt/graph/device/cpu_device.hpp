@@ -24,50 +24,43 @@
  *
  * Execution model
  * ---------------
- * Nodes run sequentially on the calling thread in the topological order given
- * by DGraph::nodes.  launch() is synchronous and returns only after all nodes
- * have finished; wait() is therefore a no-op.
+ * Nodes run sequentially on a worker thread in the topological order given
+ * by DGraph::nodes. launch() returns immediately; wait() joins the worker.
  *
  * Buffer management
  * -----------------
- * Each GraphBuffer token that appears as an output or RW-output in the graph is
- * backed by a heap-allocated byte array owned by the device.  Graph-level input
- * buffers must be pre-populated by the user before launch() is called (see
- * setInputBuffer()).
+ * Each GraphBuffer that appears as an output or RW-output in the graph is
+ * backed by a heap-allocated byte array owned privately by this device.
+ * Graph-level input buffers must be pre-populated by the user before
+ * launch() via setInputBuffer().
  *
  * Kernel dispatch
  * ---------------
  * CPU kernels are plain C++ functions (or lambdas) registered before launch()
- * via registerKernel().  When a node is executed the device:
- *  1. Builds a CpuKernelArgs from the node's IOMap (resolving buffer names to
- *     void* pointers and scalar names to uint64_t values).
- *  2. Looks up the registered function by KernelDescriptor::name.
- *  3. Calls it.
+ * via registerKernel().
  *
- * Cross-device synchronisation
- * ----------------------------
- * Semaphores are represented as std::atomic<bool> stored in a shared
- * SemaphorePool.  The same pool must be passed to every device participating
- * in the graph so that signal/await pairs across devices work correctly.
- *
- * DMA transfers between devices are implemented as memcpy into/out of this
- * device's buffer store.  The source or destination buffer must have been
- * pre-registered or produced by a node on this device.
+ * Cross-device synchronisation and data movement
+ * ----------------------------------------------
+ * CpuDevice has no built-in notion of either: the compiler synthesises
+ * `BridgeOpNode` entries (each carrying an opaque `std::function<void()>`
+ * closure produced by an `IBridge`) directly into the device's per-device
+ * `DGraph::nodes`. CpuDevice walks the node list with `std::visit` and
+ * runs the closures inline. A typical CPU↔X bridge gives the CPU side a
+ * closure that reads/writes the device's buffer storage via the public
+ * setInputBuffer/getOutputBuffer/bufferSize accessors, capturing whatever
+ * bridge-private staging and synchronisation primitives it owns.
  */
 
 #ifndef VRT_GRAPH_DEVICE_CPU_DEVICE_HPP
 #define VRT_GRAPH_DEVICE_CPU_DEVICE_HPP
 
-#include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <map>
-#include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -78,47 +71,6 @@
 #include <vrt/graph/core/types.hpp>
 
 namespace vrt::graph {
-
-// ---------------------------------------------------------------------------
-// SemaphorePool — shared cross-device semaphore store
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Thread-safe pool of binary semaphores indexed by SemaphoreHandle::id.
- *
- * Pass a shared_ptr to the same SemaphorePool to every device that participates
- * in a graph.  The GraphCompiler allocates semaphore ids; the pool grows on
- * demand.
- *
- * await() busy-waits; this is intentionally naive.  A production implementation
- * would use a condition variable or OS primitive.
- */
-class SemaphorePool {
-   public:
-    void signal(SemaphoreHandle sem) {
-        getFlag(sem.id).store(true, std::memory_order_release);
-    }
-
-    void await(SemaphoreHandle sem) {
-        auto& flag = getFlag(sem.id);
-        while (!flag.load(std::memory_order_acquire)) {
-            // busy-wait — acceptable for a naive single-core backend
-        }
-        flag.store(false, std::memory_order_relaxed);  // reset for reuse
-    }
-
-   private:
-    std::atomic<bool>& getFlag(uint32_t id) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        while (id >= flags_.size()) {
-            flags_.emplace_back(std::make_unique<std::atomic<bool>>(false));
-        }
-        return *flags_[id];
-    }
-
-    std::mutex                                          mutex_;
-    std::vector<std::unique_ptr<std::atomic<bool>>>    flags_;
-};
 
 // ---------------------------------------------------------------------------
 // CpuBufferView — typed view into a buffer passed to kernel functions
@@ -167,9 +119,6 @@ class CpuKernelArgs {
 
     /**
      * @brief Get a scalar argument value by port name.
-     *
-     * The raw uint64_t bits can be reinterpreted by the caller as needed
-     * (e.g. bit_cast to float for ScalarType::F32).
      */
     uint64_t scalar(const std::string& portName) const {
         auto it = scalars_.find(portName);
@@ -195,53 +144,37 @@ class CpuDevice : public IDevice {
     /**
      * @brief Construct a CpuDevice.
      *
-     * @param id     Logical device id, e.g. "cpu" or "cpu:0".
-     * @param pool   Shared semaphore pool; pass the same instance to all
-     *               devices in the graph for cross-device sync to work.
-     *               If nullptr a private pool is created (single-device graphs).
-     * @param buffers Shared buffer store; pass the same instance to all
-     *               devices in the graph for cross-device DMA to work.
-     *               If nullptr a private store is created.
+     * @param id  Logical device id, e.g. "cpu" or "cpu:0".
      */
-    explicit CpuDevice(std::string id,
-                       std::shared_ptr<SemaphorePool> pool = nullptr,
-                       std::shared_ptr<std::map<std::string, std::vector<uint8_t>>> buffers = nullptr);
+    explicit CpuDevice(std::string id);
 
     // --- Kernel registration (call before launch) ---
 
     /**
      * @brief Register a CPU kernel implementation.
-     *
-     * @param kernelName  Must match KernelDescriptor::name for the node(s) that
-     *                    should execute this function.
-     * @param fn          Function called with resolved args on each invocation.
      */
     void registerKernel(std::string kernelName, CpuKernelFn fn);
 
-    // --- Pre-populated input buffers ---
+    // --- Buffer accessors (also used by bridges) ---
 
     /**
      * @brief Supply data for a graph-level input buffer (no producer node).
      *
-     * The backend copies @p sizeBytes bytes from @p data into its internal store
-     * under the given buffer name.  Must be called before launch().
-     *
-     * @param bufferName  Matches GraphBuffer::name() for the token returned by
-     *                    Graph::inputBuffer().
-     * @param data        Source data pointer (host memory).
-     * @param sizeBytes   Number of bytes to copy.
+     * Also used by bridges as the consumer-side write path on the CPU.
      */
     void setInputBuffer(const std::string& bufferName, const void* data, size_t sizeBytes);
 
     /**
-     * @brief Read back an output buffer after launch() completes.
+     * @brief Read back an output buffer.
      *
-     * @param bufferName  GraphBuffer::name() of an output or RW-output buffer.
-     * @param data        Destination pointer (host memory); must hold at least
-     *                    the number of bytes written by the producing kernel.
-     * @param sizeBytes   Number of bytes to copy out.
+     * Also used by bridges as the producer-side read path on the CPU.
      */
     void getOutputBuffer(const std::string& bufferName, void* data, size_t sizeBytes) const;
+
+    /**
+     * @brief Returns the current size of @p bufferName, or 0 if not present.
+     */
+    size_t bufferSize(const std::string& bufferName) const;
 
     // --- IDevice ---
 
@@ -250,58 +183,37 @@ class CpuDevice : public IDevice {
 
     void compile(const DGraph& dg) override;
 
-    void insertSignal(SemaphoreHandle sem, const std::string& afterNodeId) override;
-    void insertAwait(SemaphoreHandle sem, const std::string& beforeNodeId)  override;
-    void insertDMA(DMADescriptor dma, const std::string& beforeNodeId)      override;
-
-    /**
-     * @brief Execute all nodes on a background thread.
-     *
-     * Returns immediately; call wait() to block until completion.
-     */
     void launch() override;
-
-    /**
-     * @brief Block until the background thread completes.
-     */
     void wait() override;
 
    private:
-    // Internal step types injected by the compiler
-    struct SignalStep { SemaphoreHandle sem; };
-    struct AwaitStep  { SemaphoreHandle sem; };
-    struct DMAStep    { DMADescriptor   dma; };
-    struct KernelStep { Node node; };
+    enum class NodeKind { Kernel, ProducerOp, ConsumerOp };
 
-    using Step = std::variant<SignalStep, AwaitStep, DMAStep, KernelStep>;
+    struct NodeRuntime {
+        std::string                id;
+        NodeKind                   kind;
+        size_t                     unmet = 0;
+        std::vector<size_t>        successors;
+        // Kernel payload (only meaningful when kind == Kernel)
+        KernelNode                 kernel;
+        // Op payloads (only meaningful when kind != Kernel)
+        std::function<bool()>      tryReady;
+        std::function<void()>      action;
+    };
 
-    void executeKernel(const Node& node);
-    void executeDMA(const DMADescriptor& dma);
+    void executeKernel(const KernelNode& node);
 
     CpuBufferView resolveBuffer(const std::string& name) const;
-
     std::vector<uint8_t>& ensureBuffer(const std::string& name, size_t sizeBytes);
 
     std::string                                  id_;
-    std::shared_ptr<SemaphorePool>               semPool_;
     std::map<std::string, CpuKernelFn>           kernels_;
-    std::shared_ptr<std::map<std::string, std::vector<uint8_t>>>  buffers_;     // name → heap storage
-    std::map<std::string, uint64_t>              scalarStore_; // named global variables
+    std::map<std::string, std::vector<uint8_t>>  buffers_;
+    std::map<std::string, uint64_t>              scalarStore_;
 
-    // Pending injected steps collected before compile() is called
-    struct PendingSignal { SemaphoreHandle sem; std::string afterNodeId; };
-    struct PendingAwait  { SemaphoreHandle sem; std::string beforeNodeId; };
-    struct PendingDMA    { DMADescriptor   dma; std::string beforeNodeId; };
-
-    std::vector<PendingSignal> pendingSignals_;
-    std::vector<PendingAwait>  pendingAwaits_;
-    std::vector<PendingDMA>    pendingDMAs_;
-
-    // Compiled execution plan (nodes + injected sync/DMA steps in order)
-    std::vector<Step> steps_;
-
-    // Background execution thread
-    std::thread worker_;
+    std::vector<NodeRuntime>                     runtime_;
+    std::unordered_map<std::string, size_t>      idToIdx_;
+    std::thread                                  worker_;
 };
 
 }  // namespace vrt::graph

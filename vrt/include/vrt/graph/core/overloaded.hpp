@@ -19,48 +19,31 @@
  */
 
 /**
- * @file dgraph.hpp
- * @brief DGraph — per-device compiled subgraph produced by GraphCompiler.
+ * @file overloaded.hpp
+ * @brief `overloaded` — the standard C++17 visitor helper for std::variant.
  *
- * A DGraph is the output of the compilation step for a single device.  It
- * contains:
- *  - The ordered list of `Node`s assigned to that device. Each `Node` is a
- *    `std::variant<KernelNode, BridgeOpNode>`; bridge-synthesised ops are
- *    spliced inline among the user kernels by the compiler.
- *  - A pointer to the IDevice responsible for executing the subgraph.
- *
- * DGraph is an internal compiler artifact; it is not part of the user-facing API.
+ * Usage:
+ * @code
+ *   std::visit(overloaded {
+ *       [](const KernelNode& k) { ... },
+ *       [](const BridgeOpNode& b) { ... },
+ *   }, node);
+ * @endcode
  */
 
-#ifndef VRT_GRAPH_DEVICE_DGRAPH_HPP
-#define VRT_GRAPH_DEVICE_DGRAPH_HPP
-
-#include <memory>
-#include <string>
-#include <vector>
-
-#include <vrt/graph/device/device.hpp>
-#include <vrt/graph/node/node.hpp>
+#ifndef VRT_GRAPH_CORE_OVERLOADED_HPP
+#define VRT_GRAPH_CORE_OVERLOADED_HPP
 
 namespace vrt::graph {
 
-struct DGraph {
-    /**
-     * @brief ID of the device this subgraph targets (matches IDevice::id()).
-     */
-    std::string deviceId;
-
-    /**
-     * @brief Nodes assigned to this device, in topological order.
-     */
-    std::vector<Node> nodes;
-
-    /**
-     * @brief The device that will compile and execute this subgraph.
-     */
-    std::shared_ptr<IDevice> device;
+template <class... Ts>
+struct overloaded : Ts... {
+    using Ts::operator()...;
 };
+
+template <class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
 
 }  // namespace vrt::graph
 
-#endif  // VRT_GRAPH_DEVICE_DGRAPH_HPP
+#endif  // VRT_GRAPH_CORE_OVERLOADED_HPP

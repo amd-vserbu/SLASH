@@ -19,48 +19,40 @@
  */
 
 /**
- * @file dgraph.hpp
- * @brief DGraph — per-device compiled subgraph produced by GraphCompiler.
+ * @file bridge_op.hpp
+ * @brief IBridgeOp — opaque bridge-owned cross-device sync/transfer primitive.
  *
- * A DGraph is the output of the compilation step for a single device.  It
- * contains:
- *  - The ordered list of `Node`s assigned to that device. Each `Node` is a
- *    `std::variant<KernelNode, BridgeOpNode>`; bridge-synthesised ops are
- *    spliced inline among the user kernels by the compiler.
- *  - A pointer to the IDevice responsible for executing the subgraph.
+ * Bridges define their own concrete subclasses of IBridgeOp to hold whatever
+ * state they need (semaphore handles, ring indices, HSA signals, CUDA events,
+ * bounce buffer storage, …). The compiler treats each instance as opaque and
+ * pairs the producer- and consumer-side BridgeOpNodes through pointer
+ * identity of the shared `shared_ptr<IBridgeOp>` they hold.
  *
- * DGraph is an internal compiler artifact; it is not part of the user-facing API.
+ * Subclasses may override `label()` to provide a short human-readable
+ * description used by visualisation tooling.
  */
 
-#ifndef VRT_GRAPH_DEVICE_DGRAPH_HPP
-#define VRT_GRAPH_DEVICE_DGRAPH_HPP
+#ifndef VRT_GRAPH_CROSSDEVICE_BRIDGE_OP_HPP
+#define VRT_GRAPH_CROSSDEVICE_BRIDGE_OP_HPP
 
 #include <memory>
 #include <string>
-#include <vector>
-
-#include <vrt/graph/device/device.hpp>
-#include <vrt/graph/node/node.hpp>
 
 namespace vrt::graph {
 
-struct DGraph {
-    /**
-     * @brief ID of the device this subgraph targets (matches IDevice::id()).
-     */
-    std::string deviceId;
+class IBridgeOp {
+   public:
+    virtual ~IBridgeOp() = default;
 
     /**
-     * @brief Nodes assigned to this device, in topological order.
+     * @brief Short human-readable name used by visualisation tooling.
+     *
+     * Default is `"bridge_op"`. Subclasses are encouraged to return
+     * something more descriptive, e.g. `"cpu_gpu_xfer"`.
      */
-    std::vector<Node> nodes;
-
-    /**
-     * @brief The device that will compile and execute this subgraph.
-     */
-    std::shared_ptr<IDevice> device;
+    virtual std::string label() const { return "bridge_op"; }
 };
 
 }  // namespace vrt::graph
 
-#endif  // VRT_GRAPH_DEVICE_DGRAPH_HPP
+#endif  // VRT_GRAPH_CROSSDEVICE_BRIDGE_OP_HPP
