@@ -53,6 +53,7 @@
 #ifndef VRT_GRAPH_GRAPH_HPP
 #define VRT_GRAPH_GRAPH_HPP
 
+#include <cstring>
 #include <map>
 #include <memory>
 #include <set>
@@ -71,6 +72,8 @@
 
 namespace vrt::graph {
 
+class CpuDevice;
+
 class Graph {
    public:
     Graph() = default;
@@ -80,6 +83,16 @@ class Graph {
     Graph& operator=(const Graph&) = delete;
     Graph(Graph&&) = default;
     Graph& operator=(Graph&&) = default;
+
+    /**
+     * @brief Build a graph preloaded with the canonical host CPU device and
+     *        all production bridge factories available in the current build.
+     *
+     * The returned graph contains a CpuDevice registered under the canonical
+     * id `"cpu"`. CPU↔FPGA bridges are always registered. CPU↔GPU bridges are
+     * registered only when the library is built with GPU support.
+     */
+    static Graph withDefaults();
 
     // --- Setup ---
 
@@ -234,6 +247,93 @@ class Graph {
     const std::vector<DGraph>& dgraphs() const { return dgraphs_; }
 
     /**
+     * @brief Returns the registered CpuDevice, preferring the canonical
+     *        `"cpu"` device when present.
+     *
+     * Returns nullptr if no registered device is both a CPU-typed device and
+     * a concrete CpuDevice instance.
+     */
+    std::shared_ptr<CpuDevice> cpuDevice() const;
+
+    /**
+     * @brief Declare a graph-global mutable scalar variable.
+     *
+     * The returned GraphScalar token may be bound as an input scalar or,
+     * when the kernel IOTypeMap declares it as an output scalar, as a result
+     * location written by the kernel.
+     */
+    GraphScalar globalScalar(ScalarType type, std::string name) {
+        if (scalarTypes_.count(name)) {
+            throw std::invalid_argument("Graph::globalScalar: name '" + name + "' already used");
+        }
+        scalarTypes_[name] = type;
+        (*scalarValues_)[name] = 0;
+        compiled_ = false;
+        return GraphScalar::globalVar(type, std::move(name));
+    }
+
+    /**
+     * @brief Set a declared graph-global scalar from raw bits.
+     */
+    void setScalarBits(const std::string& name, uint64_t bits) {
+        auto typeIt = scalarTypes_.find(name);
+        if (typeIt == scalarTypes_.end()) {
+            throw std::out_of_range("Graph::setScalarBits: unknown scalar '" + name + "'");
+        }
+        (*scalarValues_)[name] = bits;
+    }
+
+    /**
+     * @brief Read a declared graph-global scalar as raw bits.
+     */
+    uint64_t scalarBits(const std::string& name) const {
+        auto typeIt = scalarTypes_.find(name);
+        if (typeIt == scalarTypes_.end()) {
+            throw std::out_of_range("Graph::scalarBits: unknown scalar '" + name + "'");
+        }
+        auto valueIt = scalarValues_->find(name);
+        if (valueIt == scalarValues_->end()) {
+            throw std::out_of_range("Graph::scalarBits: scalar '" + name + "' has no value");
+        }
+        return valueIt->second;
+    }
+
+    template <class T>
+    void setScalar(const std::string& name, T value) {
+        static_assert(std::is_arithmetic_v<T>, "Graph::setScalar only supports arithmetic types");
+        auto typeIt = scalarTypes_.find(name);
+        if (typeIt == scalarTypes_.end()) {
+            throw std::out_of_range("Graph::setScalar: unknown scalar '" + name + "'");
+        }
+        if (typeIt->second != typeToScalarType<T>()) {
+            throw std::invalid_argument(
+                "Graph::setScalar: type mismatch for scalar '" + name + "'");
+        }
+        setScalarBits(name, detail::valueToBits(value));
+    }
+
+    template <class T>
+    T getScalar() const = delete;
+
+    template <class T>
+    T getScalar(const std::string& name) const {
+        static_assert(std::is_arithmetic_v<T>, "Graph::getScalar only supports arithmetic types");
+        auto typeIt = scalarTypes_.find(name);
+        if (typeIt == scalarTypes_.end()) {
+            throw std::out_of_range("Graph::getScalar: unknown scalar '" + name + "'");
+        }
+        if (typeIt->second != typeToScalarType<T>()) {
+            throw std::invalid_argument(
+                "Graph::getScalar: type mismatch for scalar '" + name + "'");
+        }
+
+        uint64_t bits = scalarBits(name);
+        T value{};
+        std::memcpy(&value, &bits, sizeof(T));
+        return value;
+    }
+
+    /**
      * @brief Declare a graph-level input buffer (no producer node).
      *
      * @param type  Element type of the buffer.
@@ -295,13 +395,14 @@ class Graph {
      * @throws std::runtime_error  On any structural violation, with a descriptive message.
      */
     void validate() {
+        validateDeclaredScalars();
         // Cycle detection and basic consistency — delegate to compiler logic.
         // Full port-binding validation is backend-specific and deferred to compile().
         GraphCompiler compiler;
         auto lookup = [this](const std::string& s, const std::string& d) -> IBridge& {
             return this->bridgeFor(s, d);
         };
-        compiler.compile(nodes_, devices_, lookup);  // throws on structural errors
+        compiler.compile(nodes_, devices_, lookup, scalarValues_);  // throws on structural errors
         // If compile() succeeds we discard the result; this is a dry-run.
     }
 
@@ -351,14 +452,17 @@ class Graph {
         if (devices_.empty()) {
             throw std::runtime_error("Graph::launch: no devices registered");
         }
+        validateDeclaredScalars();
         validateBridges();
         GraphCompiler compiler;
         auto lookup = [this](const std::string& s, const std::string& d) -> IBridge& {
             return this->bridgeFor(s, d);
         };
-        dgraphs_ = compiler.compile(nodes_, devices_, lookup);
+        dgraphs_ = compiler.compile(nodes_, devices_, lookup, scalarValues_);
         compiled_ = true;
     }
+
+    void validateDeclaredScalars() const;
 
     /**
      * @brief Verify that every non-CPU device type has a {CPU, Type} factory
@@ -396,6 +500,9 @@ class Graph {
     std::map<std::pair<std::string, std::string>,
              std::shared_ptr<IBridge>>                        bridgeInstances_;
     std::set<std::string>                                     bufferNames_; // declared buffer names
+    std::map<std::string, ScalarType>                         scalarTypes_;
+    std::shared_ptr<std::map<std::string, uint64_t>>          scalarValues_ =
+        std::make_shared<std::map<std::string, uint64_t>>();
 
     std::vector<DGraph> dgraphs_;   // populated by ensureCompiled()
     bool                compiled_ = false;

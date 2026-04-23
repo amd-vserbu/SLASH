@@ -91,7 +91,8 @@ class GraphCompiler {
     std::vector<DGraph> compile(
         const std::vector<KernelNode>&                         nodes,
         const std::map<std::string, std::shared_ptr<IDevice>>& devices,
-        const BridgeFor&                                       bridgeFor);
+        const BridgeFor&                                       bridgeFor,
+        const std::shared_ptr<std::map<std::string, uint64_t>>& scalarValues);
 
    private:
     // --- Topology ---
@@ -121,6 +122,15 @@ class GraphCompiler {
      * Graph-level input buffers (no producer) are absent from this map.
      */
     std::map<std::string, std::string> buildProducerMap(
+        const std::vector<KernelNode>& nodes) const;
+
+    /**
+     * @brief Build a map from graph-global scalar name → the kernel-node id
+     *        that writes it.
+     *
+     * Only typed output scalar ports participate.
+     */
+    std::map<std::string, std::string> buildScalarProducerMap(
         const std::vector<KernelNode>& nodes) const;
 };
 

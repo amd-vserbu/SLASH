@@ -61,6 +61,50 @@ static KernelDescriptor mockCpuKernel(std::string name, IOTypeMap ioType = {}) {
     return KernelDescriptor{std::move(name), DeviceType::MOCK_CPU, std::nullopt, std::move(ioType)};
 }
 
+TEST(GraphTest, WithDefaultsRegistersCpuAndKnownBridgeTypes) {
+    Graph graph = Graph::withDefaults();
+
+    auto cpu = graph.cpuDevice();
+    ASSERT_NE(cpu, nullptr);
+    EXPECT_EQ(cpu->id(), "cpu");
+
+    EXPECT_TRUE(graph.hasBridgeFactory(DeviceType::CPU, DeviceType::FPGA));
+    EXPECT_TRUE(graph.hasBridgeFactory(DeviceType::FPGA, DeviceType::CPU));
+#if defined(VRT_HAS_GPU) && (VRT_HAS_GPU == 1)
+    EXPECT_TRUE(graph.hasBridgeFactory(DeviceType::CPU, DeviceType::GPU));
+    EXPECT_TRUE(graph.hasBridgeFactory(DeviceType::GPU, DeviceType::CPU));
+#else
+    EXPECT_FALSE(graph.hasBridgeFactory(DeviceType::CPU, DeviceType::GPU));
+    EXPECT_FALSE(graph.hasBridgeFactory(DeviceType::GPU, DeviceType::CPU));
+#endif
+
+    cpu->registerKernel("copy", [](const CpuKernelArgs& args) {
+        auto in  = args.buffer("in").as<const int32_t>();
+        auto out = args.buffer("out").as<int32_t>();
+        auto n   = args.buffer("in").sizeBytes / sizeof(int32_t);
+        for (size_t i = 0; i < n; ++i) {
+            out[i] = in[i];
+        }
+    });
+
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw");
+
+    IOMap io;
+    GraphBuffer copied;
+    io.bindInputBuffer("in", raw)
+      .bindOutputBuffer("out", BufferType::I32, copied);
+    graph.addNode(cpuKernel("copy"), std::move(io), "cpu");
+
+    std::vector<int32_t> input = {7, 11, 13};
+    cpu->setInputBuffer("raw", input.data(), input.size() * sizeof(int32_t));
+
+    ASSERT_NO_THROW(graph.run());
+
+    std::vector<int32_t> output(input.size(), 0);
+    cpu->getOutputBuffer(copied.name(), output.data(), output.size() * sizeof(int32_t));
+    EXPECT_EQ(output, input);
+}
+
 // ===========================================================================
 // MockCpuDevice — threaded IDevice for cross-device testing
 // ===========================================================================
@@ -546,6 +590,167 @@ TEST(GraphTest, MissingDeviceHintThrows) {
     g.addNode(cpuKernel("k"), std::move(io), "nonexistent");
 
     EXPECT_THROW(g.run(), std::runtime_error);
+}
+
+TEST(GraphTest, DuplicateInputBufferBindThrows) {
+    Graph g;
+    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
+
+    IOMap io;
+    io.bindInputBuffer("in", raw);
+    EXPECT_THROW(io.bindInputBuffer("in", raw), std::invalid_argument);
+}
+
+TEST(GraphTest, MissingMandatoryInputBufferPortThrows) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOTypeMap ioType;
+    ioType.inputBuffers.push_back({"in", BufferType::I32});
+
+    IOMap io;
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.validate(), std::runtime_error);
+}
+
+TEST(GraphTest, UnknownInputBufferPortThrows) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOTypeMap ioType;
+    ioType.inputBuffers.push_back({"in", BufferType::I32});
+
+    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
+    IOMap io;
+    io.bindInputBuffer("in", raw)
+      .bindInputBuffer("extra", raw);
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.validate(), std::runtime_error);
+}
+
+TEST(GraphTest, InputBufferTypeMismatchThrows) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOTypeMap ioType;
+    ioType.inputBuffers.push_back({"in", BufferType::I32});
+
+    GraphBuffer raw = g.inputBuffer(BufferType::U8, "raw");
+    IOMap io;
+    io.bindInputBuffer("in", raw);
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.validate(), std::runtime_error);
+}
+
+TEST(GraphTest, OutputScalarMustUseGlobalVar) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOTypeMap ioType;
+    ioType.outputScalars.push_back({"out", ScalarType::I32});
+
+    IOMap io;
+    io.bindScalar("out", GraphScalar::constant<int32_t>(1));
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.validate(), std::runtime_error);
+}
+
+TEST(GraphTest, InvalidAfterNodesReferenceThrows) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOMap io;
+    g.addNode(cpuKernel("typed"), std::move(io), "cpu", {"missing_node"});
+
+    EXPECT_THROW(g.validate(), std::runtime_error);
+}
+
+TEST(GraphTest, CpuGlobalScalarRoundTrip) {
+    Graph g = Graph::withDefaults();
+    auto cpu = g.cpuDevice();
+    ASSERT_NE(cpu, nullptr);
+
+    IOTypeMap ioType;
+    ioType.inputScalars.push_back({"in", ScalarType::I32});
+    ioType.outputScalars.push_back({"out", ScalarType::I32});
+
+    cpu->registerKernel("scalar_copy", [](const CpuKernelArgs& args) {
+        auto value = static_cast<int32_t>(args.scalar("in"));
+        args.setScalar("out", static_cast<uint64_t>(value + 1));
+    });
+
+    GraphScalar input = g.globalScalar(ScalarType::I32, "input");
+    GraphScalar output = g.globalScalar(ScalarType::I32, "output");
+
+    IOMap io;
+    io.bindScalar("in", input)
+      .bindScalar("out", output);
+    g.addNode(cpuKernel("scalar_copy", ioType), std::move(io), "cpu");
+
+    g.setScalar<int32_t>("input", 41);
+    ASSERT_NO_THROW(g.run());
+
+    EXPECT_EQ(g.getScalar<int32_t>("output"), 42);
+}
+
+TEST(GraphTest, CpuScalarDependencyOrdersNodes) {
+    Graph g = Graph::withDefaults();
+    auto cpu = g.cpuDevice();
+    ASSERT_NE(cpu, nullptr);
+
+    IOTypeMap producerType;
+    producerType.outputScalars.push_back({"value", ScalarType::I32});
+    IOTypeMap consumerType;
+    consumerType.inputScalars.push_back({"value", ScalarType::I32});
+    consumerType.outputScalars.push_back({"result", ScalarType::I32});
+
+    cpu->registerKernel("produce_scalar", [](const CpuKernelArgs& args) {
+        args.setScalar("value", static_cast<uint64_t>(41));
+    });
+    cpu->registerKernel("consume_scalar", [](const CpuKernelArgs& args) {
+        auto value = static_cast<int32_t>(args.scalar("value"));
+        args.setScalar("result", static_cast<uint64_t>(value + 1));
+    });
+
+    GraphScalar value = g.globalScalar(ScalarType::I32, "value");
+    GraphScalar result = g.globalScalar(ScalarType::I32, "result");
+
+    IOMap consumeIo;
+    consumeIo.bindScalar("value", value)
+             .bindScalar("result", result);
+    g.addNode(cpuKernel("consume_scalar", consumerType), std::move(consumeIo), "cpu");
+
+    IOMap produceIo;
+    produceIo.bindScalar("value", value);
+    g.addNode(cpuKernel("produce_scalar", producerType), std::move(produceIo), "cpu");
+
+    ASSERT_NO_THROW(g.run());
+    EXPECT_EQ(g.getScalar<int32_t>("result"), 42);
+}
+
+TEST(GraphTest, UndeclaredGlobalScalarThrows) {
+    Graph g = Graph::withDefaults();
+    auto cpu = g.cpuDevice();
+    ASSERT_NE(cpu, nullptr);
+
+    IOTypeMap ioType;
+    ioType.inputScalars.push_back({"in", ScalarType::I32});
+
+    GraphScalar undeclared = GraphScalar::globalVar(ScalarType::I32, "missing");
+    IOMap io;
+    io.bindScalar("in", undeclared);
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.validate(), std::runtime_error);
 }
 
 // ===========================================================================
@@ -1051,6 +1256,37 @@ TEST(GraphTest, CpuExecutorRunsDiamondAcrossTwoBranches) {
     EXPECT_EQ(out[2], 306);
 }
 
+TEST(GraphTest, CpuExecutorResetsDependencyStateAcrossRuns) {
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+
+    cpu->registerKernel("copy", makeAddKernel(0));
+    cpu->registerKernel("add1", makeAddKernel(1));
+
+    Graph g;
+    g.registerDevice(cpu);
+
+    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer mid, finalBuf;
+
+    IOMap ioA; ioA.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, mid);
+    g.addNode(cpuKernel("copy"), std::move(ioA), "cpu");
+
+    IOMap ioB; ioB.bindInputBuffer("in", mid).bindOutputBuffer("out", BufferType::I32, finalBuf);
+    g.addNode(cpuKernel("add1"), std::move(ioB), "cpu");
+
+    auto runOnce = [&](int32_t value) {
+        cpu->setInputBuffer("raw", &value, sizeof(value));
+        g.run();
+        int32_t out = 0;
+        cpu->getOutputBuffer(finalBuf.name(), &out, sizeof(out));
+        return out;
+    };
+
+    EXPECT_EQ(runOnce(1), 2);
+    EXPECT_EQ(runOnce(5), 6);
+    EXPECT_EQ(runOnce(9), 10);
+}
+
 // Cross-device data flow: CPU consumer kernel must wait on a producer
 // running on MockCpuDevice. If the consumer fires before the producer
 // signals, the read-back will be wrong (zero-init / stale).
@@ -1084,6 +1320,80 @@ TEST(GraphTest, CpuExecutorBlocksConsumerUntilProducerSignals) {
     EXPECT_EQ(out[0], 13);   // 3*2 + 7
     EXPECT_EQ(out[1], 17);   // 5*2 + 7
     EXPECT_EQ(out[2], 25);   // 9*2 + 7
+}
+
+// One remote producer feeds two CpuDevice kernels on the same consumer
+// device. Both consumers must depend on the same consumer-side bridge op;
+// otherwise the dep-driven executor may run one consumer before the bridge
+// has materialised the buffer locally.
+TEST(GraphTest, CpuExecutorSharedRemoteBufferFanoutUsesSameConsumerBridge) {
+    auto cpu  = std::make_shared<CpuDevice>("cpu");
+    auto mcpu = std::make_shared<MockCpuDevice>("mcpu:0");
+
+    mcpu->registerKernel("dbl", makeDblKernel());
+    cpu->registerKernel("add1", makeAddKernel(1));
+    cpu->registerKernel("add2", makeAddKernel(2));
+    cpu->registerKernel("sum", [](const CpuKernelArgs& args) {
+        auto left  = args.buffer("left").as<const int32_t>();
+        auto right = args.buffer("right").as<const int32_t>();
+        auto out   = args.buffer("out").as<int32_t>();
+        auto n     = args.buffer("left").sizeBytes / sizeof(int32_t);
+        for (size_t i = 0; i < n; ++i) out[i] = left[i] + right[i];
+    });
+
+    Graph g;
+    g.registerDevice(cpu);
+    g.registerDevice(mcpu);
+    registerCpuLikeFactory<CpuMockCpuBridge>(g, DeviceType::CPU, DeviceType::MOCK_CPU);
+
+    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer sharedBuf, leftBuf, rightBuf, sumBuf;
+
+    IOMap ioP; ioP.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, sharedBuf);
+    g.addNode(mockCpuKernel("dbl"), std::move(ioP), "mcpu:0");
+
+    IOMap ioL; ioL.bindInputBuffer("in", sharedBuf).bindOutputBuffer("out", BufferType::I32, leftBuf);
+    auto idL = g.addNode(cpuKernel("add1"), std::move(ioL), "cpu");
+
+    IOMap ioR; ioR.bindInputBuffer("in", sharedBuf).bindOutputBuffer("out", BufferType::I32, rightBuf);
+    auto idR = g.addNode(cpuKernel("add2"), std::move(ioR), "cpu");
+
+    IOMap ioS; ioS.bindInputBuffer("left", leftBuf)
+                  .bindInputBuffer("right", rightBuf)
+                  .bindOutputBuffer("out", BufferType::I32, sumBuf);
+    g.addNode(cpuKernel("sum"), std::move(ioS), "cpu");
+
+    std::vector<int32_t> in = {3, 5};
+    mcpu->setInputBuffer("raw", in.data(), in.size() * sizeof(int32_t));
+
+    ASSERT_NO_THROW(g.run());
+
+    std::vector<int32_t> out(2);
+    cpu->getOutputBuffer(sumBuf.name(), out.data(), out.size() * sizeof(int32_t));
+    EXPECT_EQ(out[0], 15);  // (3*2 + 1) + (3*2 + 2)
+    EXPECT_EQ(out[1], 23);  // (5*2 + 1) + (5*2 + 2)
+
+    const auto* dgCpu = findDg(g.dgraphs(), "cpu");
+    ASSERT_NE(dgCpu, nullptr);
+
+    const Node* nL = findNode(*dgCpu, idL);
+    const Node* nR = findNode(*dgCpu, idR);
+    ASSERT_NE(nL, nullptr);
+    ASSERT_NE(nR, nullptr);
+
+    std::string sharedBridgeId;
+    for (const auto& depId : nodeDependsOn(*nL)) {
+        const Node* dep = findNode(*dgCpu, depId);
+        if (!dep || !std::holds_alternative<BridgeOpNode>(*dep)) continue;
+        const auto& bridge = std::get<BridgeOpNode>(*dep);
+        if (bridge.side == BridgeOpNode::Side::Consumer) {
+            sharedBridgeId = bridge.id;
+            break;
+        }
+    }
+
+    ASSERT_FALSE(sharedBridgeId.empty());
+    EXPECT_TRUE(depsContain(*nR, sharedBridgeId));
 }
 
 // Three independent producers on three mock devices feed a single CPU

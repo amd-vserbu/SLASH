@@ -57,6 +57,9 @@ class IOMap {
      * Works for both input and output scalar ports.
      */
     IOMap& bindScalar(std::string portName, GraphScalar scalar) {
+        if (scalars_.count(portName)) {
+            throw std::invalid_argument("bindScalar: port '" + portName + "' already bound");
+        }
         scalars_.emplace(std::move(portName), std::move(scalar));
         return *this;
     }
@@ -67,6 +70,9 @@ class IOMap {
     IOMap& bindInputBuffer(std::string portName, GraphBuffer buf) {
         if (!buf.valid()) {
             throw std::invalid_argument("bindInputBuffer: invalid (default-constructed) GraphBuffer");
+        }
+        if (inputBuffers_.count(portName)) {
+            throw std::invalid_argument("bindInputBuffer: port '" + portName + "' already bound");
         }
         inputBuffers_.emplace(std::move(portName), std::move(buf));
         return *this;
@@ -83,6 +89,9 @@ class IOMap {
      * @param out       Receives the newly created GraphBuffer token.
      */
     IOMap& bindOutputBuffer(std::string portName, BufferType type, GraphBuffer& out) {
+        if (outputBuffers_.count(portName)) {
+            throw std::invalid_argument("bindOutputBuffer: port '" + portName + "' already bound");
+        }
         std::string tokenName = nextTokenName(portName);
         out = GraphBuffer::make(type, tokenName);
         outputBuffers_.emplace(std::move(portName), out);
@@ -105,6 +114,14 @@ class IOMap {
                         GraphBuffer in, GraphBuffer& out) {
         if (!in.valid()) {
             throw std::invalid_argument("bindRWBuffer: invalid (default-constructed) input GraphBuffer");
+        }
+        for (const auto& existing : rwBuffers_) {
+            if (existing.inPort == inPortName) {
+                throw std::invalid_argument("bindRWBuffer: input port '" + inPortName + "' already bound");
+            }
+            if (existing.outPort == outPortName) {
+                throw std::invalid_argument("bindRWBuffer: output port '" + outPortName + "' already bound");
+            }
         }
         std::string tokenName = nextTokenName(outPortName);
         out = GraphBuffer::make(in.type(), tokenName);

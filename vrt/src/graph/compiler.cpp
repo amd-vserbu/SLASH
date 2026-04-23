@@ -28,6 +28,254 @@
 
 namespace vrt::graph {
 
+namespace {
+
+bool hasDeclaredPorts(const IOTypeMap& ioType) {
+    return !ioType.inputScalars.empty() ||
+           !ioType.outputScalars.empty() ||
+           !ioType.inputBuffers.empty() ||
+           !ioType.outputBuffers.empty() ||
+           !ioType.rwBuffers.empty();
+}
+
+const char* scalarTypeName(ScalarType type) {
+    switch (type) {
+        case ScalarType::U8:  return "U8";
+        case ScalarType::U16: return "U16";
+        case ScalarType::U32: return "U32";
+        case ScalarType::U64: return "U64";
+        case ScalarType::I8:  return "I8";
+        case ScalarType::I16: return "I16";
+        case ScalarType::I32: return "I32";
+        case ScalarType::I64: return "I64";
+        case ScalarType::F32: return "F32";
+        case ScalarType::F64: return "F64";
+    }
+    return "unknown";
+}
+
+const char* bufferTypeName(BufferType type) {
+    switch (type) {
+        case BufferType::U8:  return "U8";
+        case BufferType::U16: return "U16";
+        case BufferType::U32: return "U32";
+        case BufferType::U64: return "U64";
+        case BufferType::I8:  return "I8";
+        case BufferType::I16: return "I16";
+        case BufferType::I32: return "I32";
+        case BufferType::I64: return "I64";
+        case BufferType::F32: return "F32";
+        case BufferType::F64: return "F64";
+    }
+    return "unknown";
+}
+
+template <typename PortVec>
+const typename PortVec::value_type* findPortByName(const PortVec& ports,
+                                                   const std::string& name) {
+    auto it = std::find_if(ports.begin(), ports.end(), [&](const auto& port) {
+        return port.name == name;
+    });
+    return (it == ports.end()) ? nullptr : &*it;
+}
+
+const RWBufferPort* findRWPortByNames(const std::vector<RWBufferPort>& ports,
+                                      const std::string& inName,
+                                      const std::string& outName) {
+    auto it = std::find_if(ports.begin(), ports.end(), [&](const RWBufferPort& port) {
+        return port.in.name == inName && port.out.name == outName;
+    });
+    return (it == ports.end()) ? nullptr : &*it;
+}
+
+void validateDeclaredPorts(const KernelNode& node,
+                           const std::map<std::string, const KernelNode*>& nodeById) {
+    for (const auto& after : node.afterNodes) {
+        if (after == node.id) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' cannot depend on itself via afterNodes");
+        }
+        if (!nodeById.count(after)) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' references unknown afterNodes id '" +
+                after + "'");
+        }
+    }
+
+    const IOTypeMap& ioType = node.kernel.ioType;
+    if (!hasDeclaredPorts(ioType)) return;
+
+    for (const auto& expected : ioType.inputScalars) {
+        auto it = node.ioMap.scalars().find(expected.name);
+        if (it == node.ioMap.scalars().end()) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' missing mandatory input scalar port '" +
+                expected.name + "'");
+        }
+        if (it->second.type() != expected.type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' input scalar '" + expected.name +
+                "' type mismatch: declared " + scalarTypeName(expected.type) +
+                ", bound " + scalarTypeName(it->second.type()));
+        }
+    }
+
+    for (const auto& expected : ioType.outputScalars) {
+        auto it = node.ioMap.scalars().find(expected.name);
+        if (it == node.ioMap.scalars().end()) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' missing mandatory output scalar port '" +
+                expected.name + "'");
+        }
+        if (it->second.type() != expected.type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' output scalar '" + expected.name +
+                "' type mismatch: declared " + scalarTypeName(expected.type) +
+                ", bound " + scalarTypeName(it->second.type()));
+        }
+        if (it->second.isConstant()) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' output scalar '" + expected.name +
+                "' must be bound to GraphScalar::globalVar()");
+        }
+    }
+
+    for (const auto& expected : ioType.inputBuffers) {
+        auto it = node.ioMap.inputBuffers().find(expected.name);
+        if (it == node.ioMap.inputBuffers().end()) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' missing mandatory input buffer port '" +
+                expected.name + "'");
+        }
+        if (it->second.type() != expected.type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' input buffer '" + expected.name +
+                "' type mismatch: declared " + bufferTypeName(expected.type) +
+                ", bound " + bufferTypeName(it->second.type()));
+        }
+    }
+
+    for (const auto& expected : ioType.outputBuffers) {
+        auto it = node.ioMap.outputBuffers().find(expected.name);
+        if (it == node.ioMap.outputBuffers().end()) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' missing mandatory output buffer port '" +
+                expected.name + "'");
+        }
+        if (it->second.type() != expected.type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' output buffer '" + expected.name +
+                "' type mismatch: declared " + bufferTypeName(expected.type) +
+                ", bound " + bufferTypeName(it->second.type()));
+        }
+    }
+
+    for (const auto& expected : ioType.rwBuffers) {
+        auto it = std::find_if(node.ioMap.rwBuffers().begin(), node.ioMap.rwBuffers().end(),
+                               [&](const IOMap::RWBinding& binding) {
+                                   return binding.inPort == expected.in.name &&
+                                          binding.outPort == expected.out.name;
+                               });
+        if (it == node.ioMap.rwBuffers().end()) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' missing mandatory RW buffer ports '" +
+                expected.in.name + "'/'" + expected.out.name + "'");
+        }
+        if (it->in.type() != expected.in.type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' RW input buffer '" + expected.in.name +
+                "' type mismatch: declared " + bufferTypeName(expected.in.type) +
+                ", bound " + bufferTypeName(it->in.type()));
+        }
+        if (it->out.type() != expected.out.type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' RW output buffer '" + expected.out.name +
+                "' type mismatch: declared " + bufferTypeName(expected.out.type) +
+                ", bound " + bufferTypeName(it->out.type()));
+        }
+    }
+
+    for (const auto& [name, scalar] : node.ioMap.scalars()) {
+        const auto* input = findPortByName(ioType.inputScalars, name);
+        const auto* output = findPortByName(ioType.outputScalars, name);
+        if (!input && !output) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' binds unknown scalar port '" + name +
+                "'");
+        }
+        if (input && scalar.type() != input->type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' scalar '" + name +
+                "' type mismatch: declared " + scalarTypeName(input->type) +
+                ", bound " + scalarTypeName(scalar.type()));
+        }
+        if (output && scalar.type() != output->type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' scalar '" + name +
+                "' type mismatch: declared " + scalarTypeName(output->type) +
+                ", bound " + scalarTypeName(scalar.type()));
+        }
+        if (output && scalar.isConstant()) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' output scalar '" + name +
+                "' must be bound to GraphScalar::globalVar()");
+        }
+    }
+
+    for (const auto& [name, buffer] : node.ioMap.inputBuffers()) {
+        const auto* port = findPortByName(ioType.inputBuffers, name);
+        if (!port) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' binds unknown input buffer port '" +
+                name + "'");
+        }
+        if (buffer.type() != port->type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' input buffer '" + name +
+                "' type mismatch: declared " + bufferTypeName(port->type) +
+                ", bound " + bufferTypeName(buffer.type()));
+        }
+    }
+
+    for (const auto& [name, buffer] : node.ioMap.outputBuffers()) {
+        const auto* port = findPortByName(ioType.outputBuffers, name);
+        if (!port) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' binds unknown output buffer port '" +
+                name + "'");
+        }
+        if (buffer.type() != port->type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' output buffer '" + name +
+                "' type mismatch: declared " + bufferTypeName(port->type) +
+                ", bound " + bufferTypeName(buffer.type()));
+        }
+    }
+
+    for (const auto& binding : node.ioMap.rwBuffers()) {
+        const auto* port = findRWPortByNames(ioType.rwBuffers, binding.inPort, binding.outPort);
+        if (!port) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' binds unknown RW buffer ports '" +
+                binding.inPort + "'/'" + binding.outPort + "'");
+        }
+        if (binding.in.type() != port->in.type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' RW input buffer '" + binding.inPort +
+                "' type mismatch: declared " + bufferTypeName(port->in.type) +
+                ", bound " + bufferTypeName(binding.in.type()));
+        }
+        if (binding.out.type() != port->out.type) {
+            throw std::runtime_error(
+                "GraphCompiler: node '" + node.id + "' RW output buffer '" + binding.outPort +
+                "' type mismatch: declared " + bufferTypeName(port->out.type) +
+                ", bound " + bufferTypeName(binding.out.type()));
+        }
+    }
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // buildProducerMap
 // ---------------------------------------------------------------------------
@@ -46,6 +294,25 @@ std::map<std::string, std::string> GraphCompiler::buildProducerMap(
     return producers;
 }
 
+std::map<std::string, std::string> GraphCompiler::buildScalarProducerMap(
+    const std::vector<KernelNode>& nodes) const {
+    std::map<std::string, std::string> producers;
+    for (const auto& node : nodes) {
+        for (const auto& port : node.kernel.ioType.outputScalars) {
+            auto it = node.ioMap.scalars().find(port.name);
+            if (it == node.ioMap.scalars().end() || it->second.isConstant()) continue;
+
+            const std::string& varName = it->second.varName();
+            auto [existing, inserted] = producers.emplace(varName, node.id);
+            if (!inserted && existing->second != node.id) {
+                throw std::runtime_error(
+                    "GraphCompiler: multiple nodes write global scalar '" + varName + "'");
+            }
+        }
+    }
+    return producers;
+}
+
 // ---------------------------------------------------------------------------
 // buildAdjacency
 // ---------------------------------------------------------------------------
@@ -53,6 +320,7 @@ std::map<std::string, std::string> GraphCompiler::buildProducerMap(
 std::map<std::string, std::vector<std::string>> GraphCompiler::buildAdjacency(
     const std::vector<KernelNode>& nodes) const {
     auto producers = buildProducerMap(nodes);
+    auto scalarProducers = buildScalarProducerMap(nodes);
 
     std::map<std::string, std::vector<std::string>> adj;
 
@@ -61,6 +329,17 @@ std::map<std::string, std::vector<std::string>> GraphCompiler::buildAdjacency(
     }
 
     for (const auto& node : nodes) {
+        for (const auto& port : node.kernel.ioType.inputScalars) {
+            auto scalarIt = node.ioMap.scalars().find(port.name);
+            if (scalarIt == node.ioMap.scalars().end() || scalarIt->second.isConstant()) {
+                continue;
+            }
+
+            auto producerIt = scalarProducers.find(scalarIt->second.varName());
+            if (producerIt != scalarProducers.end() && producerIt->second != node.id) {
+                adj[producerIt->second].push_back(node.id);
+            }
+        }
         for (const auto& [port, buf] : node.ioMap.inputBuffers()) {
             auto it = producers.find(buf.name());
             if (it != producers.end()) {
@@ -139,17 +418,35 @@ std::vector<std::string> GraphCompiler::topoSort(
 std::vector<DGraph> GraphCompiler::compile(
     const std::vector<KernelNode>& nodes,
     const std::map<std::string, std::shared_ptr<IDevice>>& devices,
-    const BridgeFor&                                       bridgeFor) {
-
-    // 1. Topological sort.
-    auto adj       = buildAdjacency(nodes);
-    auto sortedIds = topoSort(nodes, adj);
+    const BridgeFor&                                       bridgeFor,
+    const std::shared_ptr<std::map<std::string, uint64_t>>& scalarValues) {
 
     // KernelNode lookup by id.
     std::map<std::string, const KernelNode*> nodeById;
     for (const auto& node : nodes) {
         nodeById[node.id] = &node;
     }
+
+    for (const auto& node : nodes) {
+        validateDeclaredPorts(node, nodeById);
+        if (node.kernel.type != DeviceType::CPU) {
+            for (const auto& [portName, scalar] : node.ioMap.scalars()) {
+                (void)portName;
+                if (!scalar.isConstant()) {
+                    throw std::runtime_error(
+                        "GraphCompiler: global scalar bindings are currently supported only on CPU kernels");
+                }
+            }
+            if (!node.kernel.ioType.outputScalars.empty()) {
+                throw std::runtime_error(
+                    "GraphCompiler: output scalar ports are currently supported only on CPU kernels");
+            }
+        }
+    }
+
+    // 1. Topological sort.
+    auto adj       = buildAdjacency(nodes);
+    auto sortedIds = topoSort(nodes, adj);
 
     // 2. Resolve device placement for each kernel.
     std::map<std::string, std::string> nodeDevice;  // node-id → device-id
@@ -193,6 +490,7 @@ std::vector<DGraph> GraphCompiler::compile(
 
     // 4. Synthesise BridgeOpNodes for every cross-device buffer edge.
     auto producerMap = buildProducerMap(nodes);
+    auto scalarProducerMap = buildScalarProducerMap(nodes);
 
     // Find a CPU device for bounce routing (if any).
     IDevice* cpuDevice = nullptr;
@@ -227,8 +525,11 @@ std::vector<DGraph> GraphCompiler::compile(
         return std::numeric_limits<size_t>::max();
     };
 
-    // Track already-handled (buffer, consumer-device) pairs.
-    std::set<std::pair<std::string, std::string>> handledEdges;
+    // Track the terminal consumer-side bridge op for every remote
+    // (buffer, consumer-device) transfer. The transfer itself is still
+    // materialised at most once, but every consumer kernel on that device
+    // must depend on the same consumer-side bridge id.
+    std::map<std::pair<std::string, std::string>, std::string> remoteConsumerBridgeIds;
 
     // Bridge-op id counter.
     uint32_t bridgeCounter = 0;
@@ -299,8 +600,7 @@ std::vector<DGraph> GraphCompiler::compile(
             if (producerDevId == consumerDevId) return;  // same device
 
             auto edgeKey = std::make_pair(bufName, consumerDevId);
-            if (handledEdges.count(edgeKey)) return;
-            handledEdges.insert(edgeKey);
+            if (remoteConsumerBridgeIds.count(edgeKey)) return;
 
             if (!cpuDevice) {
                 throw std::runtime_error(
@@ -318,6 +618,13 @@ std::vector<DGraph> GraphCompiler::compile(
                 auto idsPair = materialiseLeg(leg, prevConsumerId);
                 prevConsumerId = idsPair.second;
             }
+            if (prevConsumerId.empty()) {
+                throw std::runtime_error(
+                    "GraphCompiler: remote transfer of buffer '" + bufName +
+                    "' to device '" + consumerDevId +
+                    "' did not produce a consumer-side bridge op");
+            }
+            remoteConsumerBridgeIds[edgeKey] = prevConsumerId;
         };
 
         for (const auto& [port, buf] : node->ioMap.inputBuffers()) {
@@ -415,7 +722,18 @@ std::vector<DGraph> GraphCompiler::compile(
             auto pushBufferDep = [&](const std::string& bufName) {
                 auto pit = producerMap.find(bufName);
                 if (pit == producerMap.end()) return;
-                if (nodeDevice[pit->second] == did) addDep(pit->second);
+                if (nodeDevice[pit->second] == did) {
+                    addDep(pit->second);
+                    return;
+                }
+
+                auto bridgeIt = remoteConsumerBridgeIds.find({bufName, did});
+                if (bridgeIt == remoteConsumerBridgeIds.end()) {
+                    throw std::runtime_error(
+                        "GraphCompiler: missing consumer-side bridge for remote buffer '" +
+                        bufName + "' on device '" + did + "'");
+                }
+                addDep(bridgeIt->second);
             };
             for (const auto& [port, buf] : k.ioMap.inputBuffers()) {
                 (void)port;
@@ -423,6 +741,22 @@ std::vector<DGraph> GraphCompiler::compile(
             }
             for (const auto& rw : k.ioMap.rwBuffers()) {
                 pushBufferDep(rw.in.name());
+            }
+            for (const auto& port : k.kernel.ioType.inputScalars) {
+                auto scalarIt = k.ioMap.scalars().find(port.name);
+                if (scalarIt == k.ioMap.scalars().end() || scalarIt->second.isConstant()) {
+                    continue;
+                }
+
+                auto producerIt = scalarProducerMap.find(scalarIt->second.varName());
+                if (producerIt == scalarProducerMap.end()) continue;
+                const std::string& producerNodeId = producerIt->second;
+                const std::string& producerDeviceId = nodeDevice.at(producerNodeId);
+                if (producerDeviceId != did) {
+                    throw std::runtime_error(
+                        "GraphCompiler: cross-device global scalar dependencies are not supported yet");
+                }
+                addDep(producerNodeId);
             }
 
             // Cross-device data + barrier deps via consumer-side ops.
@@ -435,7 +769,11 @@ std::vector<DGraph> GraphCompiler::compile(
             // already represented as consumer-side barrier ops above.
             for (const auto& a : k.afterNodes) {
                 auto ndIt = nodeDevice.find(a);
-                if (ndIt == nodeDevice.end()) continue;
+                if (ndIt == nodeDevice.end()) {
+                    throw std::runtime_error(
+                        "GraphCompiler: node '" + k.id +
+                        "' references unknown afterNodes id '" + a + "'");
+                }
                 if (ndIt->second == did) {
                     addDep(a);
                 }
@@ -454,6 +792,7 @@ std::vector<DGraph> GraphCompiler::compile(
         DGraph dg;
         dg.deviceId = did;
         dg.device   = devices.at(did);
+        dg.scalarValues = scalarValues;
 
         for (size_t i = 0; i < kernels.size(); ++i) {
             auto bIt = ins.beforeKernel.find(i);

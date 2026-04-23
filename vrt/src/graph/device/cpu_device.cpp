@@ -26,6 +26,7 @@
 #include <vrt/graph/device/cpu_device.hpp>
 
 #include <cstring>
+#include <set>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -99,6 +100,12 @@ size_t CpuDevice::bufferSize(const std::string& bufferName) const {
 // --- compile ---
 
 void CpuDevice::compile(const DGraph& dg) {
+    if (dg.scalarValues) {
+        scalarStore_ = dg.scalarValues;
+    } else if (!scalarStore_) {
+        scalarStore_ = std::make_shared<std::map<std::string, uint64_t>>();
+    }
+
     runtime_.clear();
     runtime_.reserve(dg.nodes.size());
     idToIdx_.clear();
@@ -127,7 +134,8 @@ void CpuDevice::compile(const DGraph& dg) {
         runtime_.push_back(std::move(rt));
     }
 
-    // Second pass: convert dependsOn ids → indices, build successors + unmet.
+    // Second pass: convert dependsOn ids → indices, build successors + the
+    // immutable initial unmet counts used to seed each launch.
     // dependsOn may legitimately reference ids from other DGraphs (the
     // compiler annotates bounce-leg producers with the original cross-device
     // kernel id). Ids not local to this DGraph are ignored — cross-device
@@ -138,7 +146,7 @@ void CpuDevice::compile(const DGraph& dg) {
             auto it = idToIdx_.find(depId);
             if (it == idToIdx_.end()) continue;
             runtime_[it->second].successors.push_back(i);
-            ++runtime_[i].unmet;
+            ++runtime_[i].initialUnmet;
         }
     }
 }
@@ -148,6 +156,12 @@ void CpuDevice::compile(const DGraph& dg) {
 void CpuDevice::launch() {
     if (worker_.joinable()) worker_.join();
     worker_ = std::thread([this] {
+        std::vector<size_t> unmetCounts;
+        unmetCounts.reserve(runtime_.size());
+        for (const auto& rt : runtime_) {
+            unmetCounts.push_back(rt.initialUnmet);
+        }
+
         // Initial frontier: every node whose dependsOn set is empty.
         std::vector<size_t> readyKP;       // kernels + producer-side ops, FIFO
         std::vector<size_t> pendingCons;   // consumer-side ops awaiting tryReady
@@ -162,7 +176,7 @@ void CpuDevice::launch() {
         };
 
         for (size_t i = 0; i < runtime_.size(); ++i) {
-            if (runtime_[i].unmet == 0) promote(i);
+            if (unmetCounts[i] == 0) promote(i);
         }
 
         auto runIndex = [&](size_t idx) {
@@ -173,7 +187,7 @@ void CpuDevice::launch() {
                 rt.action();
             }
             for (size_t s : rt.successors) {
-                if (--runtime_[s].unmet == 0) promote(s);
+                if (--unmetCounts[s] == 0) promote(s);
             }
         };
 
@@ -257,12 +271,34 @@ void CpuDevice::executeKernel(const KernelNode& node) {
     }
 
     std::map<std::string, uint64_t> scalars;
+    std::map<std::string, uint64_t*> writableScalars;
+    std::set<std::string> outputScalarPorts;
+    for (const auto& port : node.kernel.ioType.outputScalars) {
+        outputScalarPorts.insert(port.name);
+    }
+
     for (const auto& [portName, gs] : node.ioMap.scalars()) {
+        if (outputScalarPorts.count(portName)) {
+            if (gs.isConstant()) {
+                throw std::runtime_error(
+                    "CpuDevice: output scalar port '" + portName +
+                    "' cannot be bound to a constant");
+            }
+            auto sit = scalarStore_->find(gs.varName());
+            if (sit == scalarStore_->end()) {
+                throw std::runtime_error(
+                    "CpuDevice: global scalar '" + gs.varName() +
+                    "' not declared before launch");
+            }
+            writableScalars[portName] = &sit->second;
+            continue;
+        }
+
         if (gs.isConstant()) {
             scalars[portName] = gs.constantBits();
         } else {
-            auto sit = scalarStore_.find(gs.varName());
-            if (sit == scalarStore_.end()) {
+            auto sit = scalarStore_->find(gs.varName());
+            if (sit == scalarStore_->end()) {
                 throw std::runtime_error(
                     "CpuDevice: global scalar '" + gs.varName() + "' not set before launch");
             }
@@ -270,7 +306,7 @@ void CpuDevice::executeKernel(const KernelNode& node) {
         }
     }
 
-    CpuKernelArgs args(std::move(bufViews), std::move(scalars));
+    CpuKernelArgs args(std::move(bufViews), std::move(scalars), std::move(writableScalars));
     it->second(args);
 }
 

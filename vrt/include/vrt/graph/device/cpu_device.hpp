@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -103,8 +104,11 @@ struct CpuBufferView {
 class CpuKernelArgs {
    public:
     CpuKernelArgs(std::map<std::string, CpuBufferView> buffers,
-                  std::map<std::string, uint64_t>       scalars)
-        : buffers_(std::move(buffers)), scalars_(std::move(scalars)) {}
+                                    std::map<std::string, uint64_t>       scalars,
+                                    std::map<std::string, uint64_t*>      writableScalars = {})
+                : buffers_(std::move(buffers)),
+                    scalars_(std::move(scalars)),
+                    writableScalars_(std::move(writableScalars)) {}
 
     /**
      * @brief Get a view of a buffer argument by port name.
@@ -122,15 +126,34 @@ class CpuKernelArgs {
      */
     uint64_t scalar(const std::string& portName) const {
         auto it = scalars_.find(portName);
-        if (it == scalars_.end()) {
-            throw std::out_of_range("CpuKernelArgs: unknown scalar port '" + portName + "'");
+        if (it != scalars_.end()) {
+            return it->second;
         }
-        return it->second;
+
+        auto writableIt = writableScalars_.find(portName);
+        if (writableIt != writableScalars_.end()) {
+            return *writableIt->second;
+        }
+
+        throw std::out_of_range("CpuKernelArgs: unknown scalar port '" + portName + "'");
+    }
+
+    /**
+     * @brief Write an output scalar argument by port name.
+     */
+    void setScalar(const std::string& portName, uint64_t value) const {
+        auto it = writableScalars_.find(portName);
+        if (it == writableScalars_.end()) {
+            throw std::out_of_range(
+                "CpuKernelArgs: unknown writable scalar port '" + portName + "'");
+        }
+        *it->second = value;
     }
 
    private:
     std::map<std::string, CpuBufferView> buffers_;
     std::map<std::string, uint64_t>      scalars_;
+    std::map<std::string, uint64_t*>     writableScalars_;
 };
 
 using CpuKernelFn = std::function<void(const CpuKernelArgs&)>;
@@ -192,7 +215,7 @@ class CpuDevice : public IDevice {
     struct NodeRuntime {
         std::string                id;
         NodeKind                   kind;
-        size_t                     unmet = 0;
+        size_t                     initialUnmet = 0;
         std::vector<size_t>        successors;
         // Kernel payload (only meaningful when kind == Kernel)
         KernelNode                 kernel;
@@ -209,7 +232,8 @@ class CpuDevice : public IDevice {
     std::string                                  id_;
     std::map<std::string, CpuKernelFn>           kernels_;
     std::map<std::string, std::vector<uint8_t>>  buffers_;
-    std::map<std::string, uint64_t>              scalarStore_;
+    std::shared_ptr<std::map<std::string, uint64_t>> scalarStore_ =
+        std::make_shared<std::map<std::string, uint64_t>>();
 
     std::vector<NodeRuntime>                     runtime_;
     std::unordered_map<std::string, size_t>      idToIdx_;

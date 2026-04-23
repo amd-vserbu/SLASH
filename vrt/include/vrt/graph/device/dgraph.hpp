@@ -35,6 +35,7 @@
 #ifndef VRT_GRAPH_DEVICE_DGRAPH_HPP
 #define VRT_GRAPH_DEVICE_DGRAPH_HPP
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -59,6 +60,11 @@ struct DGraph {
      * @brief The device that will compile and execute this subgraph.
      */
     std::shared_ptr<IDevice> device;
+
+    /**
+     * @brief Shared graph-owned scalar state visible to this device runtime.
+     */
+    std::shared_ptr<std::map<std::string, uint64_t>> scalarValues;
 };
 
 }  // namespace vrt::graph
