@@ -129,12 +129,26 @@ rp1.elf/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/build
 .PHONY : rp1.elf/fast
 
+#=============================================================================
+# Target rules for targets named rp1_memtest.elf
+
+# Build rule for target.
+rp1_memtest.elf: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 rp1_memtest.elf
+.PHONY : rp1_memtest.elf
+
+# fast build rule for target.
+rp1_memtest.elf/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/build
+.PHONY : rp1_memtest.elf/fast
+
 src/rp1_boot.obj: src/rp1_boot.S.obj
 .PHONY : src/rp1_boot.obj
 
 # target to build an object file
 src/rp1_boot.S.obj:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_boot.S.obj
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_boot.S.obj
 .PHONY : src/rp1_boot.S.obj
 
 src/rp1_loop.obj: src/rp1_loop.c.obj
@@ -160,6 +174,54 @@ src/rp1_loop.s: src/rp1_loop.c.s
 src/rp1_loop.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_loop.c.s
 .PHONY : src/rp1_loop.c.s
+
+src/rp1_memtest.obj: src/rp1_memtest.c.obj
+.PHONY : src/rp1_memtest.obj
+
+# target to build an object file
+src/rp1_memtest.c.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_memtest.c.obj
+.PHONY : src/rp1_memtest.c.obj
+
+src/rp1_memtest.i: src/rp1_memtest.c.i
+.PHONY : src/rp1_memtest.i
+
+# target to preprocess a source file
+src/rp1_memtest.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_memtest.c.i
+.PHONY : src/rp1_memtest.c.i
+
+src/rp1_memtest.s: src/rp1_memtest.c.s
+.PHONY : src/rp1_memtest.s
+
+# target to generate assembly for a file
+src/rp1_memtest.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_memtest.c.s
+.PHONY : src/rp1_memtest.c.s
+
+src/rp1_memtest_main.obj: src/rp1_memtest_main.c.obj
+.PHONY : src/rp1_memtest_main.obj
+
+# target to build an object file
+src/rp1_memtest_main.c.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_memtest_main.c.obj
+.PHONY : src/rp1_memtest_main.c.obj
+
+src/rp1_memtest_main.i: src/rp1_memtest_main.c.i
+.PHONY : src/rp1_memtest_main.i
+
+# target to preprocess a source file
+src/rp1_memtest_main.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_memtest_main.c.i
+.PHONY : src/rp1_memtest_main.c.i
+
+src/rp1_memtest_main.s: src/rp1_memtest_main.c.s
+.PHONY : src/rp1_memtest_main.s
+
+# target to generate assembly for a file
+src/rp1_memtest_main.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_memtest_main.c.s
+.PHONY : src/rp1_memtest_main.c.s
 
 src/rp1_run.obj: src/rp1_run.c.obj
 .PHONY : src/rp1_run.obj
@@ -242,10 +304,17 @@ help:
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
 	@echo "... rp1.elf"
+	@echo "... rp1_memtest.elf"
 	@echo "... src/rp1_boot.obj"
 	@echo "... src/rp1_loop.obj"
 	@echo "... src/rp1_loop.i"
 	@echo "... src/rp1_loop.s"
+	@echo "... src/rp1_memtest.obj"
+	@echo "... src/rp1_memtest.i"
+	@echo "... src/rp1_memtest.s"
+	@echo "... src/rp1_memtest_main.obj"
+	@echo "... src/rp1_memtest_main.i"
+	@echo "... src/rp1_memtest_main.s"
 	@echo "... src/rp1_run.obj"
 	@echo "... src/rp1_run.i"
 	@echo "... src/rp1_run.s"

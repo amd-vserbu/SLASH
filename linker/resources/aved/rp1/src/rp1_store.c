@@ -6,45 +6,11 @@
  */
 
 #include "rp1_store.h"
-#include "rp1_types.h"
+#include <slash/uapi/rp1_protocol.h>
 #include <stddef.h>
 
-/* -------------------------------------------------------------------------
- * Compile-time size/offset assertions
- * ---------------------------------------------------------------------- */
-
-/* C99 portable static assert via typedef trick (no <assert.h> on baremetal). */
-#define STATIC_ASSERT(cond, name) \
-    typedef char static_assert_##name[(cond) ? 1 : -1]
-
-/* Node packet must be exactly 64 bytes. */
-STATIC_ASSERT(sizeof(rp1_node_t) == 64,          node_size_64);
-
-/* Header is 16 bytes; payload union starts at offset 16. */
-STATIC_ASSERT(offsetof(rp1_node_t, payload) == 16, node_payload_offset_16);
-
-/* Each payload variant must fit in the 48-byte payload union. */
-STATIC_ASSERT(sizeof(rp1_payload_kernel_dispatch_t) == 48, kd_payload_48);
-STATIC_ASSERT(sizeof(rp1_payload_scalar_write_t)    == 48, sw_payload_48);
-STATIC_ASSERT(sizeof(rp1_payload_scalar_read_t)     == 48, sr_payload_48);
-STATIC_ASSERT(sizeof(rp1_payload_signal_t)          == 48, sig_payload_48);
-STATIC_ASSERT(sizeof(rp1_payload_dma_copy_t)        == 48, dma_copy_payload_48);
-STATIC_ASSERT(sizeof(rp1_payload_dma_fill_t)        == 48, dma_fill_payload_48);
-STATIC_ASSERT(sizeof(rp1_payload_loop_t)            == 48, loop_payload_48);
-STATIC_ASSERT(sizeof(rp1_payload_cond_t)            == 48, cond_payload_48);
-STATIC_ASSERT(sizeof(rp1_payload_rerun_t)           == 48, rerun_payload_48);
-
-/* Control block must be exactly 4 KB. */
-STATIC_ASSERT(sizeof(rp1_ctrl_t) == 0x1000,      ctrl_size_4kb);
-
-/* Signal slot must be 16 bytes. */
-STATIC_ASSERT(sizeof(rp1_signal_slot_t) == 16,   signal_slot_16);
-
-/* CQ entry must be 16 bytes. */
-STATIC_ASSERT(sizeof(rp1_cq_entry_t) == 16,      cq_entry_16);
-
-/* Inflight entry: 24 bytes (5 x uint32 + 1 byte + 3 pad = 24). */
-STATIC_ASSERT(sizeof(rp1_inflight_t) == 24,       inflight_24);
+/* All compile-time size/offset assertions for the RP1 protocol live next
+ * to the type definitions in <slash/uapi/rp1_protocol.h>. */
 
 /* -------------------------------------------------------------------------
  * BTCM-resident hot stores
@@ -65,7 +31,7 @@ uint32_t      g_inflight_count             BTCM_SECTION;
  * DDR-backed pointer table (set by rp1_store_init)
  * ---------------------------------------------------------------------- */
 
-rp1_ctrl_t       *g_ctrl    = (rp1_ctrl_t *)0x10000000UL;
+rp1_ctrl_t       *g_ctrl    = (rp1_ctrl_t *)RP1_CTRL_PHYS_ADDR;
 rp1_node_t       *g_nodes   = NULL;
 rp1_cq_entry_t   *g_cq      = NULL;
 rp1_signal_slot_t *g_signals = NULL;

@@ -23,7 +23,7 @@
 #ifndef RP1_STORE_H
 #define RP1_STORE_H
 
-#include "rp1_types.h"
+#include <slash/uapi/rp1_protocol.h>
 
 /* -------------------------------------------------------------------------
  * BTCM-resident hot stores

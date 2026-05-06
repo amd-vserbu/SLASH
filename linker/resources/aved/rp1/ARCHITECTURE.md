@@ -267,21 +267,36 @@ No payload. Immediately stops graph processing. Supplemental -- normal graph com
 
 ## B. Graph Submission Protocol
 
+### Shared UAPI
+
+The on-wire layout described below (control block, node packets, signal
+slots, CQ entries, opcodes, payload structs) is defined once in the
+shared header
+[`driver/libslash/include/slash/uapi/rp1_protocol.h`](../../../driver/libslash/include/slash/uapi/rp1_protocol.h).
+Both the RP1 firmware (Cortex-R5 baremetal) and host code (libslash, SMI,
+VRT FpgaDevice) include this header, and `_Static_assert` checks at the
+bottom of the file enforce all sizes and critical offsets at compile
+time on both sides. Any change to the protocol must land in that header.
+
 ### Memory Layout
+
+The host-visible BAR window is a 64MB aperture at `0x3000_0000`. All
+host/RP1 shared control, queue, argument, and signal structures must live in
+that window. DDR below `0x3000_0000` is available for RP1-private storage.
 
 ```
 DDR Address        Size      Purpose
 ---------------    ----      -------
-0x1000_0000        4KB       Control Block
-0x1000_1000        256KB     Node Array -- up to 4096 x 64-byte nodes
-0x1004_1000        64KB      Completion Queue (CQ) -- 4096 x 16-byte entries
-0x1005_1000        1MB       Argument Buffer -- pre-staged kernel arguments
-0x1015_1000        4KB       Signal Array -- 256 x 16-byte value slots
-0x1015_2000        4KB       Debug/Status Area
-0x1015_3000        ...       Free for future use
+0x3000_0000        4KB       Control Block
+0x3000_1000        256KB     Node Array -- up to 4096 x 64-byte nodes
+0x3004_1000        64KB      Completion Queue (CQ) -- 4096 x 16-byte entries
+0x3005_1000        1MB       Argument Buffer -- pre-staged kernel arguments
+0x3015_1000        4KB       Signal Array -- 256 x 16-byte value slots
+0x3015_2000        4KB       Debug/Status Area
+0x3015_3000        ...       Free for future use within the BAR window
 ```
 
-### Control Block (0x1000_0000, 4KB)
+### Control Block (0x3000_0000, 4KB)
 
 ```
 Offset  Size  Field              Writer  Reader

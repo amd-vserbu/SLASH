@@ -19,7 +19,7 @@
 
 #ifdef QEMU_SEMIHOSTING
 
-#include "rp1_types.h"
+#include <slash/uapi/rp1_protocol.h>
 #include "rp1_store.h"
 #include <stddef.h>
 #include <stdint.h>

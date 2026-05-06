@@ -9,7 +9,7 @@
 
 #include "rp1_loop.h"
 #include "rp1_store.h"
-#include "rp1_types.h"
+#include <slash/uapi/rp1_protocol.h>
 #include <stdint.h>
 
 /* -------------------------------------------------------------------------

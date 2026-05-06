@@ -82,3 +82,6 @@ __pycache__/
 
 # Python test coverage
 .coverage
+
+# Generated graph/render demo artifacts
+/render_demo_out/

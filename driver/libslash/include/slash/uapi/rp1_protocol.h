@@ -1,24 +1,72 @@
-/*
- * Copyright (c) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
- * SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/**
+ * Copyright (C) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
  *
- * RP1 HSA command processor — protocol types.
- *
- * All structures are fixed-size and naturally aligned so they can be placed
- * directly in DDR and accessed over AXI without padding surprises.  Sizes are
- * verified by static assertions in rp1_store.c.
- *
- * See ARCHITECTURE.md for the full specification.
+ * This file is dual-licensed: you may select either the GNU General Public
+ * License version 2 (GPL-2.0-only) or the MIT License.  See the LICENSE
+ * files in the repository root for the full text of each license.
  */
 
-#ifndef RP1_TYPES_H
-#define RP1_TYPES_H
+/**
+ * @file rp1_protocol.h
+ *
+ * Shared protocol definitions for the RP1 HSA command processor.
+ *
+ * This header is the single source of truth for the on-wire layout used by
+ * both the RP1 firmware (Cortex-R5 baremetal, freestanding) and the host
+ * stack (libslash, SMI, VRT FpgaDevice).  It describes:
+ *
+ *   - Opcodes, flags, status codes, and condition operators
+ *   - The 64-byte node packet and its 48-byte payload union
+ *   - The 4 KB control block at the base of the host-visible BAR window
+ *   - The 16-byte signal slot and 16-byte completion-queue entry
+ *   - The in-flight kernel tracking table
+ *   - Recommended default layout offsets within the BAR window
+ *
+ * All structures are fixed-size and naturally aligned so they can live in
+ * DDR and be accessed over AXI without padding surprises.  Sizes and
+ * critical offsets are enforced by static assertions at the bottom of the
+ * file; both firmware and host pick them up at compile time.
+ *
+ * Freestanding-friendly: only `<stdint.h>` and `<stddef.h>` are required.
+ * No libc, no kernel headers, no Linux-only macros.
+ *
+ * See linker/resources/aved/rp1/ARCHITECTURE.md for the full specification.
+ */
+
+#ifndef SLASH_UAPI_RP1_PROTOCOL_H
+#define SLASH_UAPI_RP1_PROTOCOL_H
 
 #include <stdint.h>
+#include <stddef.h>
 
-/* -------------------------------------------------------------------------
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* =========================================================================
+ * Memory layout (host-visible BAR window)
+ *
+ * The host-visible BAR window is a 64 MB aperture that begins at
+ * RP1_CTRL_PHYS_ADDR in the RP1's physical address space and at
+ * RP1_CTRL_BAR_OFFSET in the host's BAR mapping.  The control block sits
+ * at offset 0; the recommended sub-region offsets below are what libslash
+ * programs into the corresponding *_base_lo/_hi control-block fields.
+ * They are conventions, not hard protocol -- firmware reads whatever the
+ * host writes -- but kept here so both sides agree on the default.
+ * ====================================================================== */
+
+#define RP1_CTRL_PHYS_ADDR              0x30000000UL  /* RP1 absolute */
+#define RP1_CTRL_BAR_OFFSET             0x00000000UL  /* host BAR-relative */
+
+#define RP1_DEFAULT_NODE_ARRAY_OFFSET   0x00001000UL  /* 256 KB */
+#define RP1_DEFAULT_CQ_OFFSET           0x00041000UL  /*  64 KB */
+#define RP1_DEFAULT_ARG_BUF_OFFSET      0x00051000UL  /*   1 MB */
+#define RP1_DEFAULT_SIG_ARRAY_OFFSET    0x00151000UL  /*   4 KB */
+
+/* =========================================================================
  * Opcodes
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 typedef enum {
     RP1_OP_NOP             = 0x0000,
@@ -34,17 +82,17 @@ typedef enum {
     RP1_OP_HALT            = 0x00FF,
 } rp1_opcode_t;
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Universal node flags (rp1_node_t.flags)
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 #define RP1_FLAG_HALT_ON_ERROR  (1u << 0)
 #define RP1_FLAG_SILENT         (1u << 1)
 #define RP1_FLAG_INFINITE       (1u << 2)   /* KERNEL_DISPATCH: node DONE immediately */
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Node status (written by RP1 into rp1_node_t.status)
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 typedef enum {
     RP1_NODE_PENDING    = 0x0000,
@@ -53,9 +101,9 @@ typedef enum {
     RP1_NODE_ERROR      = 0x00FF,
 } rp1_node_status_t;
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Condition operators (used by LOOP and COND)
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 typedef enum {
     RP1_COP_EQ     = 0,  /* signal == value  */
@@ -66,9 +114,9 @@ typedef enum {
     RP1_COP_AND_Z  = 5,  /* (signal & value) == 0 */
 } rp1_condop_t;
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * SIGNAL operation (rp1_payload_signal_t.operation)
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 typedef enum {
     RP1_SIGOP_SET = 0,
@@ -77,15 +125,15 @@ typedef enum {
     RP1_SIGOP_AND = 3,
 } rp1_sigop_t;
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * RERUN flags
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 #define RP1_RERUN_CLEAR_STATE  (1u << 0)    /* reset loop_iterations[loop_id] */
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * RP1 state (control block rp1_state field)
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 typedef enum {
     RP1_STATE_INIT    = 0,
@@ -95,9 +143,9 @@ typedef enum {
     RP1_STATE_HALTED  = 4,
 } rp1_state_t;
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Payload structures (each 48 bytes, embedded in rp1_node_t)
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 /* KERNEL_DISPATCH (0x0010) */
 typedef struct {
@@ -109,7 +157,7 @@ typedef struct {
     uint8_t  _reserved[32];
 } rp1_payload_kernel_dispatch_t;
 
-/* SCALAR_WRITE (0x0011) — up to 6 register writes, stop at first addr == 0. */
+/* SCALAR_WRITE (0x0011) -- up to 6 register writes, stop at first addr == 0. */
 typedef struct {
     uint32_t addr;
     uint32_t value;
@@ -198,9 +246,9 @@ typedef struct {
     uint8_t  _reserved1[40];
 } rp1_payload_rerun_t;
 
-/* -------------------------------------------------------------------------
- * Node packet — 64 bytes, 16-byte header + 48-byte payload
- * ---------------------------------------------------------------------- */
+/* =========================================================================
+ * Node packet -- 64 bytes, 16-byte header + 48-byte payload
+ * ====================================================================== */
 
 typedef struct {
     /* Header (16 bytes) */
@@ -227,9 +275,9 @@ typedef struct {
     } payload;
 } rp1_node_t;
 
-/* -------------------------------------------------------------------------
- * Control block — 4KB DDR region, 0x1000_0000
- * ---------------------------------------------------------------------- */
+/* =========================================================================
+ * Control block -- 4 KB DDR region at RP1_CTRL_PHYS_ADDR
+ * ====================================================================== */
 
 #define RP1_CTRL_MAGIC  0x53515231UL  /* "SQR1" */
 
@@ -263,9 +311,9 @@ typedef struct {
     uint8_t _reserved[0x1000 - 0x50];
 } rp1_ctrl_t;
 
-/* -------------------------------------------------------------------------
- * Signal array slot — 16 bytes, 256 slots in DDR
- * ---------------------------------------------------------------------- */
+/* =========================================================================
+ * Signal array slot -- 16 bytes, RP1_MAX_SIGNALS slots in DDR
+ * ====================================================================== */
 
 #define RP1_SIG_FLAG_HOST_VISIBLE  (1u << 0)
 
@@ -276,9 +324,9 @@ typedef struct {
     volatile uint32_t flags;            /* RP1_SIG_FLAG_*                     */
 } rp1_signal_slot_t;
 
-/* -------------------------------------------------------------------------
- * Completion queue entry — 16 bytes
- * ---------------------------------------------------------------------- */
+/* =========================================================================
+ * Completion queue entry -- 16 bytes
+ * ====================================================================== */
 
 typedef enum {
     RP1_CQ_OK      = 0,
@@ -293,9 +341,9 @@ typedef struct {
     volatile uint32_t timestamp;     /* R5 cycle counter at completion     */
 } rp1_cq_entry_t;
 
-/* -------------------------------------------------------------------------
- * In-flight kernel table entry (BTCM, max 32 entries)
- * ---------------------------------------------------------------------- */
+/* =========================================================================
+ * In-flight kernel table entry (BTCM, max RP1_MAX_INFLIGHT entries)
+ * ====================================================================== */
 
 typedef struct {
     uint32_t base_addr;        /* AXI-Lite base address in R5 space  */
@@ -307,9 +355,9 @@ typedef struct {
     uint8_t  _reserved[3];
 } rp1_inflight_t;
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Compile-time size constants
- * ---------------------------------------------------------------------- */
+ * ====================================================================== */
 
 #define RP1_MAX_NODES    4096
 #define RP1_MAX_LOOPS      64
@@ -319,4 +367,74 @@ typedef struct {
 
 #define RP1_PROTOCOL_VERSION  1u
 
-#endif /* RP1_TYPES_H */
+/* =========================================================================
+ * Static assertions -- enforced on every translation unit that includes
+ * this header (firmware and host both).  C11 _Static_assert is used in C;
+ * C++11+ static_assert is used in C++.
+ * ====================================================================== */
+
+#if defined(__cplusplus)
+#  define RP1_STATIC_ASSERT(cond, msg) static_assert((cond), msg)
+#else
+#  define RP1_STATIC_ASSERT(cond, msg) _Static_assert((cond), msg)
+#endif
+
+/* Node packet must be exactly 64 bytes with payload at offset 16. */
+RP1_STATIC_ASSERT(sizeof(rp1_node_t) == 64,
+                  "rp1_node_t must be exactly 64 bytes");
+RP1_STATIC_ASSERT(offsetof(rp1_node_t, payload) == 16,
+                  "rp1_node_t payload must start at byte 16");
+
+/* Each payload variant must fit in the 48-byte payload union. */
+RP1_STATIC_ASSERT(sizeof(rp1_payload_kernel_dispatch_t) == 48,
+                  "kernel_dispatch payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_write_t)    == 48,
+                  "scalar_write payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_read_t)     == 48,
+                  "scalar_read payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_signal_t)          == 48,
+                  "signal payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_copy_t)        == 48,
+                  "dma_copy payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_fill_t)        == 48,
+                  "dma_fill payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_loop_t)            == 48,
+                  "loop payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_cond_t)            == 48,
+                  "cond payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_rerun_t)           == 48,
+                  "rerun payload must be 48 bytes");
+
+/* Control block must be exactly 4 KB. */
+RP1_STATIC_ASSERT(sizeof(rp1_ctrl_t) == 0x1000,
+                  "rp1_ctrl_t must be exactly 4 KB");
+
+/* Critical control-block field offsets (hardware/host ABI). */
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, magic)              == 0x00, "ctrl.magic offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, version)            == 0x04, "ctrl.version offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, node_count)         == 0x08, "ctrl.node_count offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, cq_size)            == 0x0C, "ctrl.cq_size offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, node_base_lo)       == 0x10, "ctrl.node_base_lo offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, cq_base_lo)         == 0x18, "ctrl.cq_base_lo offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, graph_seq)          == 0x20, "ctrl.graph_seq offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, graph_done_seq)     == 0x24, "ctrl.graph_done_seq offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, cq_write_idx)       == 0x28, "ctrl.cq_write_idx offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, cq_read_idx)        == 0x2C, "ctrl.cq_read_idx offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, rp1_state)          == 0x30, "ctrl.rp1_state offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, heartbeat)          == 0x3C, "ctrl.heartbeat offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, arg_buf_base_lo)    == 0x40, "ctrl.arg_buf_base_lo offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, sig_array_base_lo)  == 0x48, "ctrl.sig_array_base_lo offset");
+
+/* Signal slot, CQ entry, inflight tracker sizes. */
+RP1_STATIC_ASSERT(sizeof(rp1_signal_slot_t) == 16,
+                  "rp1_signal_slot_t must be 16 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_cq_entry_t) == 16,
+                  "rp1_cq_entry_t must be 16 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_inflight_t) == 24,
+                  "rp1_inflight_t must be 24 bytes");
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
+
+#endif /* SLASH_UAPI_RP1_PROTOCOL_H */

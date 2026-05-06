@@ -7,7 +7,8 @@
  * Memory regions use R5-1 local addresses:
  *   ATCM at 0x0      (64KB) - boot vectors + code
  *   BTCM at 0x20000  (64KB) - stack + data
- *   DDR  at 0x10000000      - shared data region (within AVED's free 864MB)
+ *   DDR private at 0x10000000 (512MB) - RP1-only scratch/staging region
+ *   DDR shared  at 0x30000000  (64MB) - BAR-visible control/queue region
  */
 
 _STACK_SIZE = 0x1000;   /* 4KB stack - sufficient for baremetal bringup */
@@ -16,7 +17,8 @@ MEMORY
 {
     r5_1_atcm : ORIGIN = 0x00000000, LENGTH = 0x10000    /* 64KB */
     r5_1_btcm : ORIGIN = 0x00020000, LENGTH = 0x10000    /* 64KB */
-    ddr_rp1   : ORIGIN = 0x10000000, LENGTH = 0x26000000 /* 608MB */
+    ddr_private : ORIGIN = 0x10000000, LENGTH = 0x20000000 /* 512MB */
+    ddr_shared  : ORIGIN = 0x30000000, LENGTH = 0x04000000 /* 64MB */
 }
 
 ENTRY(_boot)
@@ -67,10 +69,10 @@ SECTIONS
         __stack_top = .;
     } > r5_1_btcm
 
-    /* Shared data region in DDR - used for heartbeat, future command queues */
+    /* BAR-visible shared DDR region for control/status structures. */
     .rp1_shared (NOLOAD) : {
         *(.rp1_shared)
-    } > ddr_rp1
+    } > ddr_shared
 
     _end = .;
 }

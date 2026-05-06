@@ -10,7 +10,7 @@
 
 #include "rp1_run.h"
 #include "rp1_store.h"
-#include "rp1_types.h"
+#include <slash/uapi/rp1_protocol.h>
 #include <stdint.h>
 
 static inline void dsb(void)

@@ -23,6 +23,12 @@ option(QEMU_SEMIHOSTING "Enable ARM semihosting for QEMU testing" OFF)
 
 set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/src/rp1_lscript.ld")
 
+set(RP1_MEMTEST_SOURCES
+    src/rp1_boot.S
+    src/rp1_memtest.c
+    src/rp1_memtest_main.c
+)
+
 # Common sources: boot stub + stores + dispatch loop + outer loop.
 set(RP1_SOURCES
     src/rp1_boot.S
@@ -40,6 +46,14 @@ endif()
 
 add_executable(rp1.elf ${RP1_SOURCES})
 
+add_executable(rp1_memtest.elf ${RP1_MEMTEST_SOURCES})
+
+# Pick up the shared RP1 protocol UAPI header
+# (driver/libslash/include/slash/uapi/rp1_protocol.h).
+set(SLASH_LIBSLASH_INCLUDE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../driver/libslash/include")
+target_include_directories(rp1.elf PRIVATE "${SLASH_LIBSLASH_INCLUDE}")
+
 if(QEMU_SEMIHOSTING)
     target_compile_definitions(rp1.elf PRIVATE QEMU_SEMIHOSTING)
 endif()
@@ -50,6 +64,16 @@ target_link_libraries(rp1.elf
     "-lgcc"
 )
 
+target_link_libraries(rp1_memtest.elf
+    "-T${LINKER_SCRIPT}"
+    "-nostdlib"
+    "-lgcc"
+)
+
 set_target_properties(rp1.elf PROPERTIES
+    LINK_DEPENDS "${LINKER_SCRIPT}"
+)
+
+set_target_properties(rp1_memtest.elf PROPERTIES
     LINK_DEPENDS "${LINKER_SCRIPT}"
 )
