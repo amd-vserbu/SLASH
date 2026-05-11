@@ -60,7 +60,7 @@ EQUALS = =
 CMAKE_SOURCE_DIR = /home/vserbu/SLASH-fw/linker/resources/aved/rp1
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-qemu
+CMAKE_BINARY_DIR = /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-bringup
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,9 +87,9 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-qemu/CMakeFiles /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-qemu//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-bringup/CMakeFiles /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-bringup//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-qemu/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-bringup/CMakeFiles 0
 .PHONY : all
 
 # The main clean target
@@ -151,30 +151,6 @@ src/rp1_boot.S.obj:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_boot.S.obj
 .PHONY : src/rp1_boot.S.obj
 
-src/rp1_graph_test.obj: src/rp1_graph_test.c.obj
-.PHONY : src/rp1_graph_test.obj
-
-# target to build an object file
-src/rp1_graph_test.c.obj:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_graph_test.c.obj
-.PHONY : src/rp1_graph_test.c.obj
-
-src/rp1_graph_test.i: src/rp1_graph_test.c.i
-.PHONY : src/rp1_graph_test.i
-
-# target to preprocess a source file
-src/rp1_graph_test.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_graph_test.c.i
-.PHONY : src/rp1_graph_test.c.i
-
-src/rp1_graph_test.s: src/rp1_graph_test.c.s
-.PHONY : src/rp1_graph_test.s
-
-# target to generate assembly for a file
-src/rp1_graph_test.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_graph_test.c.s
-.PHONY : src/rp1_graph_test.c.s
-
 src/rp1_loop.obj: src/rp1_loop.c.obj
 .PHONY : src/rp1_loop.obj
 
@@ -198,6 +174,30 @@ src/rp1_loop.s: src/rp1_loop.c.s
 src/rp1_loop.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_loop.c.s
 .PHONY : src/rp1_loop.c.s
+
+src/rp1_main.obj: src/rp1_main.c.obj
+.PHONY : src/rp1_main.obj
+
+# target to build an object file
+src/rp1_main.c.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_main.c.obj
+.PHONY : src/rp1_main.c.obj
+
+src/rp1_main.i: src/rp1_main.c.i
+.PHONY : src/rp1_main.i
+
+# target to preprocess a source file
+src/rp1_main.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_main.c.i
+.PHONY : src/rp1_main.c.i
+
+src/rp1_main.s: src/rp1_main.c.s
+.PHONY : src/rp1_main.s
+
+# target to generate assembly for a file
+src/rp1_main.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_main.c.s
+.PHONY : src/rp1_main.c.s
 
 src/rp1_memtest.obj: src/rp1_memtest.c.obj
 .PHONY : src/rp1_memtest.obj
@@ -295,30 +295,6 @@ src/rp1_store.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_store.c.s
 .PHONY : src/rp1_store.c.s
 
-src/rp1_test.obj: src/rp1_test.c.obj
-.PHONY : src/rp1_test.obj
-
-# target to build an object file
-src/rp1_test.c.obj:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_test.c.obj
-.PHONY : src/rp1_test.c.obj
-
-src/rp1_test.i: src/rp1_test.c.i
-.PHONY : src/rp1_test.i
-
-# target to preprocess a source file
-src/rp1_test.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_test.c.i
-.PHONY : src/rp1_test.c.i
-
-src/rp1_test.s: src/rp1_test.c.s
-.PHONY : src/rp1_test.s
-
-# target to generate assembly for a file
-src/rp1_test.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_test.c.s
-.PHONY : src/rp1_test.c.s
-
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -330,12 +306,12 @@ help:
 	@echo "... rp1.elf"
 	@echo "... rp1_memtest.elf"
 	@echo "... src/rp1_boot.obj"
-	@echo "... src/rp1_graph_test.obj"
-	@echo "... src/rp1_graph_test.i"
-	@echo "... src/rp1_graph_test.s"
 	@echo "... src/rp1_loop.obj"
 	@echo "... src/rp1_loop.i"
 	@echo "... src/rp1_loop.s"
+	@echo "... src/rp1_main.obj"
+	@echo "... src/rp1_main.i"
+	@echo "... src/rp1_main.s"
 	@echo "... src/rp1_memtest.obj"
 	@echo "... src/rp1_memtest.i"
 	@echo "... src/rp1_memtest.s"
@@ -348,9 +324,6 @@ help:
 	@echo "... src/rp1_store.obj"
 	@echo "... src/rp1_store.i"
 	@echo "... src/rp1_store.s"
-	@echo "... src/rp1_test.obj"
-	@echo "... src/rp1_test.i"
-	@echo "... src/rp1_test.s"
 .PHONY : help
 
 

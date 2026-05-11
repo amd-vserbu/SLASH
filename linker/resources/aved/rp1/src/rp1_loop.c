@@ -31,7 +31,7 @@ static inline void dsb(void)
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
-#ifndef QEMU_SEMIHOSTING
+#if !defined(QEMU_SEMIHOSTING) && !defined(RP1_POLLING_BRINGUP)
 static inline void wfi(void)
 {
     __asm__ volatile("wfi" ::: "memory");
@@ -405,7 +405,7 @@ int rp1_loop(void)
             if (!has_dispatched)
                 return 0; /* graph complete */
 
-#ifndef QEMU_SEMIHOSTING
+#if !defined(QEMU_SEMIHOSTING) && !defined(RP1_POLLING_BRINGUP)
             wfi();
 #endif
         }

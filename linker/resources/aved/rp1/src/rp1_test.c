@@ -19,72 +19,14 @@
 
 #ifdef QEMU_SEMIHOSTING
 
-#include <slash/uapi/rp1_protocol.h>
+#include "rp1_test.h"
 #include "rp1_store.h"
+#include <slash/uapi/rp1_protocol.h>
 #include <stddef.h>
 #include <stdint.h>
 
-/* -------------------------------------------------------------------------
- * Semihosting primitives (same as rp1_main.c)
- * ---------------------------------------------------------------------- */
-
-#define SEMI_SYS_WRITE0  0x04
-#define SEMI_SYS_EXIT    0x18
-
-static inline int semi_call(int op, void *arg)
-{
-    register int    r0 __asm__("r0") = op;
-    register void  *r1 __asm__("r1") = arg;
-    __asm__ volatile("svc 0x00123456" : "+r"(r0) : "r"(r1) : "memory");
-    return r0;
-}
-
-static void semi_puts(const char *s)
-{
-    semi_call(SEMI_SYS_WRITE0, (void *)s);
-}
-
-static void semi_exit(int code)
-{
-    uint32_t args[2] = { 0x20026, (uint32_t)code };
-    semi_call(SEMI_SYS_EXIT, args);
-}
-
-static void semi_print_u32(uint32_t v)
-{
-    char buf[11] = "0x00000000";
-    const char hex[] = "0123456789abcdef";
-    for (int i = 9; i >= 2; i--) { buf[i] = hex[v & 0xf]; v >>= 4; }
-    semi_puts(buf);
-}
-
-/* -------------------------------------------------------------------------
- * Test framework helpers
- * ---------------------------------------------------------------------- */
-
-static int g_failures;
-
-#define CHECK(cond, msg) do {                       \
-    if (!(cond)) {                                  \
-        semi_puts("  FAIL: " msg "\n");             \
-        g_failures++;                               \
-        return 1;                                   \
-    }                                               \
-} while (0)
-
-#define CHECK_EQ32(a, b, msg) do {                  \
-    uint32_t _a = (uint32_t)(a);                    \
-    uint32_t _b = (uint32_t)(b);                    \
-    if (_a != _b) {                                 \
-        semi_puts("  FAIL: " msg " got ");          \
-        semi_print_u32(_a);                         \
-        semi_puts(" expected ");                    \
-        semi_print_u32(_b);                         \
-        semi_puts("\n");                            \
-        g_failures++;                               \
-        return 1;                                   \
-    }                                               \
-} while (0)
+/* Failure counter, shared with rp1_graph_test.c via rp1_test.h. */
+int g_failures;
 
 static int run(const char *name, int (*fn)(void))
 {
@@ -412,6 +354,9 @@ void rp1_main(void)
     run("condops",             test_condops);
     run("node_header",         test_node_header);
     run("node_alignment",      test_node_alignment);
+
+    semi_puts("\n=== RP1 graph tests ===\n");
+    rp1_graph_test_run();
 
     semi_puts("\n=== ");
     if (g_failures == 0) {
