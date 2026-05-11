@@ -43,24 +43,35 @@
 #include <vrt/graph/node/io_map.hpp>
 #include <vrt/graph/node/io_type_map.hpp>
 #include <vrt/graph/node/kernel_descriptor.hpp>
-#include <vrt/graph/node/node.hpp>
+#include <vrt/graph/node/compiled_node.hpp>
 #include <vrt/graph/render/dot.hpp>
 
+#include "test_support/control_specs.hpp"
+
 using namespace vrt::graph;
+using namespace vrt::graph::test_support;
 
 namespace {
 
-KernelDescriptor cpuKernel(std::string name, IOTypeMap io = {}) {
-    return KernelDescriptor{std::move(name), DeviceType::CPU, std::nullopt, std::move(io)};
-}
+class CopyKernel : public CpuKernel {
+   public:
+    CopyKernel(std::string name, IOTypeMap ioType)
+        : name_(std::move(name)), ioType_(std::move(ioType)) {}
 
-// Small CPU kernel that copies its input into its output (1:1 byte copy).
-void copyKernel(const CpuKernelArgs& args) {
-    const auto& in  = args.buffer("in");
-    const auto& out = args.buffer("out");
-    auto bytes      = std::min(in.sizeBytes, out.sizeBytes);
-    std::memcpy(out.data, in.data, bytes);
-}
+    const std::string& name() const override { return name_; }
+    const IOTypeMap& ioTypeMap() const override { return ioType_; }
+
+    void call(const CpuKernelArgs& args) override {
+        const auto& in  = args.buffer("in");
+        const auto& out = args.buffer("out");
+        auto bytes      = std::min(in.sizeBytes, out.sizeBytes);
+        std::memcpy(out.data, in.data, bytes);
+    }
+
+   private:
+    std::string name_;
+    IOTypeMap   ioType_;
+};
 
 // Build a 3-node chain on a single CpuDevice and return the Graph.
 // Node IDs (auto): kA_0, kB_1, kC_2
@@ -73,14 +84,15 @@ struct ChainGraph {
 ChainGraph buildChain() {
     ChainGraph c;
     c.cpu = std::make_shared<CpuDevice>("cpu");
-    c.cpu->registerKernel("kA", copyKernel);
-    c.cpu->registerKernel("kB", copyKernel);
-    c.cpu->registerKernel("kC", copyKernel);
-    c.g.registerDevice(c.cpu);
 
     IOTypeMap io;
     io.inputBuffers.push_back({"in", BufferType::U8});
     io.outputBuffers.push_back({"out", BufferType::U8});
+
+    c.cpu->registerKernel(std::make_shared<CopyKernel>("kA", io));
+    c.cpu->registerKernel(std::make_shared<CopyKernel>("kB", io));
+    c.cpu->registerKernel(std::make_shared<CopyKernel>("kC", io));
+    c.g.registerDevice(c.cpu);
 
     GraphBuffer raw = c.g.inputBuffer(BufferType::U8, "raw");
 
@@ -151,6 +163,69 @@ TEST(RenderDotTest, GraphLabelsCpuCluster) {
     EXPECT_TRUE(contains(dot, "cpu [CPU]"));
 }
 
+TEST(RenderDotTest, GraphRendersAuthoredLoopRegion) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
+
+    auto body = graph.rootRegion().createChild();
+    std::string bodyKernelId = body->addKernel(cpuKernel("loopBody"), IOMap{}, "cpu");
+    std::string loopId = graph.addLoop(
+        fixedLoopSpec(LoopTripCount::constant<int32_t>(3), body));
+
+    auto dot = render::renderToDot(graph);
+    dumpSection("Graph DOT (authored loop)", dot);
+
+    EXPECT_TRUE(contains(dot, loopId));
+    EXPECT_TRUE(contains(dot, bodyKernelId));
+    EXPECT_TRUE(contains(dot, "[Loop]"));
+    EXPECT_TRUE(contains(dot, "FixedCount"));
+    EXPECT_TRUE(contains(dot, loopId + " loop body"));
+}
+
+TEST(RenderDotTest, GraphRendersAuthoredConditionalRegions) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
+
+    auto thenRegion = graph.rootRegion().createChild();
+    auto elseRegion = graph.rootRegion().createChild();
+    std::string thenKernelId = thenRegion->addKernel(cpuKernel("then"), IOMap{}, "cpu");
+    std::string elseKernelId = elseRegion->addKernel(cpuKernel("else"), IOMap{}, "cpu");
+    std::string conditionalId = graph.addConditional(
+        ifElseSpec(Condition::alwaysTrue(), thenRegion, elseRegion));
+
+    auto dot = render::renderToDot(graph);
+    dumpSection("Graph DOT (authored conditional)", dot);
+
+    EXPECT_TRUE(contains(dot, conditionalId));
+    EXPECT_TRUE(contains(dot, thenKernelId));
+    EXPECT_TRUE(contains(dot, elseKernelId));
+    EXPECT_TRUE(contains(dot, "[Conditional]"));
+    EXPECT_TRUE(contains(dot, conditionalId + " then"));
+    EXPECT_TRUE(contains(dot, conditionalId + " else"));
+}
+
+TEST(RenderDotTest, GraphRendersAuthoredBoundaryNodes) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
+
+    GraphScalar parentCounter = graph.globalScalar(ScalarType::I32, "counter");
+    auto body = graph.rootRegion().createChild();
+    GraphScalar localCounter = body->scalar(ScalarType::I32, "counter");
+    std::string startId = body->importFromParent({{parentCounter, localCounter}});
+    std::string endId = body->exportToParent({{localCounter, parentCounter}}, {startId});
+    graph.addLoop(fixedLoopSpec(LoopTripCount::constant<int32_t>(1), body));
+
+    auto dot = render::renderToDot(graph);
+    dumpSection("Graph DOT (authored boundaries)", dot);
+
+    EXPECT_TRUE(contains(dot, startId));
+    EXPECT_TRUE(contains(dot, endId));
+    EXPECT_TRUE(contains(dot, "[Boundary]"));
+    EXPECT_TRUE(contains(dot, "(Start)"));
+    EXPECT_TRUE(contains(dot, "(End)"));
+    EXPECT_TRUE(contains(dot, "\"" + startId + "\" -> \"" + endId + "\""));
+}
+
 // ---------------------------------------------------------------------------
 // renderToDot(DGraph)
 // ---------------------------------------------------------------------------
@@ -159,7 +234,8 @@ TEST(RenderDotTest, DGraphRendersAfterCompile) {
     auto c = buildChain();
     std::vector<uint8_t> data(16, 0xAB);
     c.cpu->setInputBuffer("raw", data.data(), data.size());
-    c.g.run();  // compile + execute
+    c.g.compile();
+    c.g.run();
 
     ASSERT_FALSE(c.g.dgraphs().empty());
     bool sawCpuDg = false;
@@ -178,6 +254,131 @@ TEST(RenderDotTest, DGraphRendersAfterCompile) {
     EXPECT_TRUE(sawCpuDg);
 }
 
+TEST(RenderDotTest, DGraphIncludesCompiledBoundaryMetadata) {
+    CompiledBoundaryNode start;
+    start.id = "boundary_start";
+    start.deviceId = "cpu";
+    start.side = CompiledBoundaryNode::Side::Start;
+    start.scalarCopies.push_back(CompiledScalarBoundaryCopy{"parent_count", 0,
+                                                            "local_count", 1});
+    start.bufferCopies.push_back(CompiledBufferBoundaryCopy{"parent_in", 0,
+                                                            "local_in", 1});
+    start.bufferCopies.push_back(CompiledBufferBoundaryCopy{"parent_aux", 0,
+                                                            "local_aux", 1});
+
+    CompiledBoundaryNode end;
+    end.id = "boundary_end";
+    end.deviceId = "cpu";
+    end.side = CompiledBoundaryNode::Side::End;
+    end.bufferCopies.push_back(CompiledBufferBoundaryCopy{"local_out", 1,
+                                                          "parent_out", 0});
+
+    DGraph dg;
+    dg.deviceId = "cpu";
+    dg.nodes.emplace_back(std::move(start));
+    dg.nodes.emplace_back(std::move(end));
+
+    auto dot = render::renderToDot(dg);
+    dumpSection("DGraph DOT (compiled boundary metadata)", dot);
+
+    EXPECT_TRUE(contains(dot, "boundary_start"));
+    EXPECT_TRUE(contains(dot, "boundary_end"));
+    EXPECT_TRUE(contains(dot, "[Boundary]"));
+    EXPECT_TRUE(contains(dot, "(Start)"));
+    EXPECT_TRUE(contains(dot, "(End)"));
+    EXPECT_TRUE(contains(dot, "copies: 2 buffers, 1 scalar"));
+    EXPECT_TRUE(contains(dot, "copies: 1 buffer, 0 scalars"));
+}
+
+TEST(RenderDotTest, DGraphIncludesCompiledFixedLoopMetadata) {
+    CompiledLoopNode loop;
+    loop.id = "loop_0";
+    loop.deviceId = "cpu";
+    loop.loopKind = CompiledLoopKind::FixedCount;
+    loop.tripCount = LoopTripCount::constant<int32_t>(3);
+    loop.outputBufferPlacements["out"] = "cpu";
+    loop.outputScalarPlacements["count"] = "cpu";
+
+    CompiledLoopBufferPublication bufferPublication;
+    bufferPublication.portName = "out";
+    bufferPublication.parentTokenName = "parent_out";
+    loop.outputBufferPublications.push_back(std::move(bufferPublication));
+
+    CompiledLoopScalarPublication scalarPublication;
+    scalarPublication.portName = "count";
+    scalarPublication.parentTokenName = "parent_count";
+    loop.outputScalarPublications.push_back(std::move(scalarPublication));
+
+    DGraph dg;
+    dg.deviceId = "cpu";
+    dg.nodes.emplace_back(std::move(loop));
+
+    auto dot = render::renderToDot(dg);
+    dumpSection("DGraph DOT (compiled fixed loop metadata)", dot);
+
+    EXPECT_TRUE(contains(dot, "loop_0"));
+    EXPECT_TRUE(contains(dot, "[Loop]"));
+    EXPECT_TRUE(contains(dot, "(FixedCount)"));
+    EXPECT_TRUE(contains(dot, "trip: const"));
+    EXPECT_TRUE(contains(dot, "outputs: 1 buffer, 1 scalar"));
+    EXPECT_TRUE(contains(dot, "placements: 1 buffer, 1 scalar"));
+}
+
+TEST(RenderDotTest, DGraphIncludesCompiledWhileLoopConditionMetadata) {
+    CompiledLoopNode loop;
+    loop.id = "while_0";
+    loop.deviceId = "cpu";
+    loop.loopKind = CompiledLoopKind::WhileCondition;
+    loop.condition = Condition::compare(
+        CompareOp::LT,
+        ConditionOperand::scalar(ScalarType::I32, "counter", 7),
+        ConditionOperand::constant<int32_t>(10));
+
+    DGraph dg;
+    dg.deviceId = "cpu";
+    dg.nodes.emplace_back(std::move(loop));
+
+    auto dot = render::renderToDot(dg);
+    dumpSection("DGraph DOT (compiled while metadata)", dot);
+
+    EXPECT_TRUE(contains(dot, "while_0"));
+    EXPECT_TRUE(contains(dot, "[Loop]"));
+    EXPECT_TRUE(contains(dot, "(WhileCondition)"));
+    EXPECT_TRUE(contains(dot, "condition: LT"));
+    EXPECT_TRUE(contains(dot, "1 scalar"));
+}
+
+TEST(RenderDotTest, DGraphIncludesCompiledConditionalMetadata) {
+    CompiledConditionalNode conditional;
+    conditional.id = "conditional_0";
+    conditional.deviceId = "cpu";
+    conditional.condition = Condition::alwaysFalse();
+    conditional.outputBufferPlacements["out"] = "cpu";
+
+    CompiledConditionalBufferPublication bufferPublication;
+    bufferPublication.portName = "out";
+    bufferPublication.parentTokenName = "parent_out";
+    conditional.outputBufferPublications.push_back(std::move(bufferPublication));
+
+    CompiledConditionalScalarPublication scalarPublication;
+    scalarPublication.portName = "flag";
+    scalarPublication.parentTokenName = "parent_flag";
+    conditional.outputScalarPublications.push_back(std::move(scalarPublication));
+
+    DGraph dg;
+    dg.deviceId = "cpu";
+    dg.nodes.emplace_back(std::move(conditional));
+
+    auto dot = render::renderToDot(dg);
+    dumpSection("DGraph DOT (compiled conditional metadata)", dot);
+
+    EXPECT_TRUE(contains(dot, "conditional_0"));
+    EXPECT_TRUE(contains(dot, "[Conditional]"));
+    EXPECT_TRUE(contains(dot, "condition: always false"));
+    EXPECT_TRUE(contains(dot, "outputs: 1 buffer, 1 scalar"));
+    EXPECT_TRUE(contains(dot, "placements: 1 buffer, 0 scalars"));
+}
+
 // ---------------------------------------------------------------------------
 // writeToDotFile: writes the DOT source to disk verbatim.
 // ---------------------------------------------------------------------------
@@ -186,6 +387,7 @@ TEST(RenderDotTest, WriteToDotFileWritesGraphAndDGraph) {
     auto c = buildChain();
     std::vector<uint8_t> data(8, 0xCD);
     c.cpu->setInputBuffer("raw", data.data(), data.size());
+    c.g.compile();
     c.g.run();
 
     char gpath[]  = "/tmp/vrt_render_test_graph_XXXXXX.dot";
@@ -225,28 +427,28 @@ TEST(RenderDotTest, WriteToDotFileThrowsOnBadPath) {
 }
 
 // ---------------------------------------------------------------------------
-// DGraph rendering: BridgeOpNodes appear as dashed ellipses with the
+// DGraph rendering: CompiledBridgeOpNodes appear as dashed ellipses with the
 // bridge-supplied label.
 // ---------------------------------------------------------------------------
 
 TEST(RenderDotTest, DGraphIncludesBridgeOpNodes) {
-    // Build a DGraph by hand containing one KernelNode and one BridgeOpNode
+    // Build a DGraph by hand containing one CompiledKernelNode and one CompiledBridgeOpNode
     // (Producer side). This bypasses the compiler so we don't need a full
     // cross-device pipeline just to exercise the renderer.
     struct StubBridgeOp : IBridgeOp {
         std::string label() const override { return "stub_xfer"; }
     };
 
-    KernelNode k;
+    CompiledKernelNode k;
     k.id     = "kA_0";
     k.kernel = cpuKernel("kA");
 
-    BridgeOpNode b;
+    CompiledBridgeOpNode b;
     b.id              = "_bridge_0_p";
-    b.deviceHint      = "cpu";
+    b.deviceId        = "cpu";
     b.op              = std::make_shared<StubBridgeOp>();
     b.action          = []{};
-    b.side            = BridgeOpNode::Side::Producer;
+    b.side            = CompiledBridgeOpNode::Side::Producer;
     b.pairedKernelId  = "kA_0";
     b.dependsOn       = {"kA_0"};  // Phase 1: explicit predecessor.
 
@@ -276,20 +478,20 @@ TEST(RenderDotTest, DGraphRendersEveryDependsOnAsEdge) {
         std::string label() const override { return "stub"; }
     };
 
-    KernelNode kA; kA.id = "kA"; kA.kernel = cpuKernel("kA");
-    KernelNode kB; kB.id = "kB"; kB.kernel = cpuKernel("kB");
+    CompiledKernelNode kA; kA.id = "kA"; kA.kernel = cpuKernel("kA");
+    CompiledKernelNode kB; kB.id = "kB"; kB.kernel = cpuKernel("kB");
     kB.dependsOn = {"kA"};
 
-    BridgeOpNode bp;
-    bp.id = "_bridge_p"; bp.deviceHint = "cpu";
+    CompiledBridgeOpNode bp;
+    bp.id = "_bridge_p"; bp.deviceId = "cpu";
     bp.op = std::make_shared<StubBridgeOp>(); bp.action = []{};
-    bp.side = BridgeOpNode::Side::Producer; bp.pairedKernelId = "kB";
+    bp.side = CompiledBridgeOpNode::Side::Producer; bp.pairedKernelId = "kB";
     bp.dependsOn = {"kB"};
 
-    BridgeOpNode bc;
-    bc.id = "_bridge_c"; bc.deviceHint = "cpu";
+    CompiledBridgeOpNode bc;
+    bc.id = "_bridge_c"; bc.deviceId = "cpu";
     bc.op = std::make_shared<StubBridgeOp>(); bc.action = []{};
-    bc.side = BridgeOpNode::Side::Consumer; bc.pairedKernelId = "kA";
+    bc.side = CompiledBridgeOpNode::Side::Consumer; bc.pairedKernelId = "kA";
     bc.dependsOn = {"_bridge_p"};  // arbitrary cross-bridge dep, e.g. bounce chain
 
     DGraph dg;
@@ -314,11 +516,11 @@ TEST(RenderDotTest, BarrierOpRendersInDot) {
         std::string label() const override { return "barrier"; }
     };
 
-    KernelNode kT; kT.id = "kTarget"; kT.kernel = cpuKernel("kT");
-    BridgeOpNode bc;
-    bc.id = "_barrier_0_c"; bc.deviceHint = "cpu";
+    CompiledKernelNode kT; kT.id = "kTarget"; kT.kernel = cpuKernel("kT");
+    CompiledBridgeOpNode bc;
+    bc.id = "_barrier_0_c"; bc.deviceId = "cpu";
     bc.op = std::make_shared<BarrierStub>(); bc.action = []{};
-    bc.side = BridgeOpNode::Side::Consumer; bc.pairedKernelId = "kTarget";
+    bc.side = CompiledBridgeOpNode::Side::Consumer; bc.pairedKernelId = "kTarget";
     kT.dependsOn = {"_barrier_0_c"};
 
     DGraph dg;

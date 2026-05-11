@@ -26,14 +26,21 @@
  * Graph::launch() which invoke the compiler transparently.
  *
  * Compilation steps:
- *  1. Topological sort of all KernelNodes using data-dependency edges (derived
- *     from IOMap buffer tokens) and explicit afterNodes edges.
- *  2. Group kernels by deviceHint → one DGraph per device.
- *  3. For each cross-device buffer edge: ask BridgeRouter for a `RoutedLeg`
- *     (one direct hop or two via the CPU bounce). Each leg's `BridgeStepPair`
- *     is materialised as a producer-side and a consumer-side `BridgeOpNode`
- *     and spliced into the corresponding DGraphs.
- *  4. Call backend.compile(dg) for each DGraph.
+ *  1. Topologically sort authored operations within each GraphRegion using
+ *     data-dependency edges (derived from IOMap tokens) and explicit afterOps
+ *     edges. Nested control-flow bodies are compiled as child regions instead
+ *     of participating in the parent region's sort.
+ *  2. Group compiled nodes by their resolved deviceId → one DGraph per
+ *     device. Loop and conditional operations become parent-level
+ *     CompiledLoopNodes / CompiledConditionalNodes with child DGraphs for
+ *     their bodies / branches.
+ *  3. For each cross-device buffer edge inside one region: ask BridgeRouter for
+ *     a `RoutedLeg` (one direct hop or two via the CPU bounce). Each leg's
+ *     `BridgeStepPair` is materialised as producer-side and consumer-side
+ *     `CompiledBridgeOpNode`s and spliced into the corresponding DGraphs.
+ *  4. Return the top-level per-device DGraphs. Graph owns the follow-up
+ *     conversion from each top-level DGraph into a backend-specific
+ *     IDevicePlan; control-flow execution is implemented by device runtimes.
  */
 
 #ifndef VRT_GRAPH_COMPILER_HPP
@@ -48,9 +55,10 @@
 
 #include <vrt/graph/crossdevice/bridge.hpp>
 #include <vrt/graph/crossdevice/bridge_router.hpp>
+#include <vrt/graph/control/graph_region.hpp>
 #include <vrt/graph/device/device.hpp>
 #include <vrt/graph/device/dgraph.hpp>
-#include <vrt/graph/node/node.hpp>
+#include <vrt/graph/node/compiled_node.hpp>
 
 namespace vrt::graph {
 
@@ -62,76 +70,60 @@ class GraphCompiler {
      * @brief Lookup callback used by the compiler to obtain a bridge
      *        instance for a concrete (srcDeviceId, dstDeviceId) pair.
      *
-     * Implementations are expected to lazily instantiate one bridge per
-     * pair from registered factories and cache the result. `Graph` wraps
-     * its `bridgeFor()` method as this callback.
+     * Implementations lazily instantiate one bridge per pair from
+     * registered factories and cache the result. Returns @c nullptr when no
+     * factory is registered for the underlying device-type pair so callers
+     * can branch between direct and fall-back paths without
+     * exception-as-control-flow. `Graph` wraps its `bridgeFor()` method as
+     * this callback.
      */
     using BridgeFor =
-        std::function<IBridge&(const std::string& srcDevId,
+        std::function<IBridge*(const std::string& srcDevId,
                                const std::string& dstDevId)>;
 
     /**
      * @brief Compile a Graph given the registered backends.
      *
-     * @param nodes     Kernel nodes in insertion order (will be topologically
-     *                  sorted internally).
+     * The compiler is the single validator: it runs all structural checks
+     * (graph not empty, devices registered, bridge factories present, root-
+     * scope buffer/scalar references resolvable, port bindings well-typed,
+     * scopes valid, no cycles) before lowering each region into per-device
+     * DGraphs. Callers should treat any thrown error as a fatal authoring
+     * problem.
+     *
+     * @param rootRegion The authored root region of the graph. Nested control
+     *                   regions are compiled recursively.
      * @param devices   Map of device-id → device, as registered with Graph.
+     * @param bridgeFactories Map of `(srcType, dstType)` → factory, as
+     *                  registered with Graph. Used to verify that every non-
+     *                  CPU device has matching `{CPU, T}` and `{T, CPU}`
+     *                  factories.
      * @param bridgeFor Lookup that returns (lazily creating if needed) the
      *                  bridge instance handling a concrete pair of device ids.
      *                  The compiler invokes this once per cross-device edge it
      *                  materialises.
+     * @param scalarValues Shared scalar value store threaded through every
+     *                     compiled DGraph for runtime scalar bookkeeping.
      * @return          One DGraph per device, each with its nodes (kernel +
      *                  bridge ops) in execution order.
      *
-     * @throws std::runtime_error  If the graph contains a cycle, an unbound
-     *                             mandatory port, a deviceHint with no
+     * @throws std::runtime_error  If the graph is empty, has no registered
+     *                             devices, is missing a required bridge
+     *                             factory, contains a cycle, has an unbound
+     *                             mandatory port, has a deviceHint with no
      *                             matching device, or `bridgeFor` rejects a
      *                             needed pair.
      */
     std::vector<DGraph> compile(
-        const std::vector<KernelNode>&                         nodes,
+        const GraphRegion&                                      rootRegion,
         const std::map<std::string, std::shared_ptr<IDevice>>& devices,
+        const std::map<std::pair<DeviceType, DeviceType>,
+                       BridgeFactory>&                         bridgeFactories,
         const BridgeFor&                                       bridgeFor,
         const std::shared_ptr<std::map<std::string, uint64_t>>& scalarValues);
 
    private:
-    // --- Topology ---
-
-    /**
-     * @brief Build the adjacency list (node-id → set of successor node-ids) from
-     *        data-dependency edges and explicit afterNodes edges.
-     */
-    std::map<std::string, std::vector<std::string>> buildAdjacency(
-        const std::vector<KernelNode>& nodes) const;
-
-    /**
-     * @brief Kahn's algorithm topological sort.
-     *
-     * @throws std::runtime_error on cycle detection.
-     */
-    std::vector<std::string> topoSort(
-        const std::vector<KernelNode>&                           nodes,
-        const std::map<std::string, std::vector<std::string>>&   adj) const;
-
-    // --- Buffer token → producer node mapping ---
-
-    /**
-     * @brief Build a map from GraphBuffer name → the kernel-node id that
-     *        produced it.
-     *
-     * Graph-level input buffers (no producer) are absent from this map.
-     */
-    std::map<std::string, std::string> buildProducerMap(
-        const std::vector<KernelNode>& nodes) const;
-
-    /**
-     * @brief Build a map from graph-global scalar name → the kernel-node id
-     *        that writes it.
-     *
-     * Only typed output scalar ports participate.
-     */
-    std::map<std::string, std::string> buildScalarProducerMap(
-        const std::vector<KernelNode>& nodes) const;
+    void validateRegionScopes(const GraphRegion& region) const;
 };
 
 }  // namespace vrt::graph

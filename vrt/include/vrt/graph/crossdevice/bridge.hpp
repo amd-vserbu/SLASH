@@ -25,7 +25,7 @@
  *
  * A bridge produces a pair of closures (producer-side + consumer-side) plus
  * an opaque `IBridgeOp` that owns whatever shared state the two closures
- * need. The compiler then synthesises a pair of `BridgeOpNode`s in the
+ * need. The compiler then synthesises a pair of `CompiledBridgeOpNode`s in the
  * relevant DGraphs from this returned data.
  */
 
@@ -97,7 +97,7 @@ class IBridge {
      *
      * The compiler is responsible for splicing the resulting closures into
      * the correct positions in the producer and consumer DGraphs as
-     * BridgeOpNodes; the bridge does not touch the devices directly.
+     * CompiledBridgeOpNodes; the bridge does not touch the devices directly.
      */
     virtual BridgeStepPair makeTransfer(IDevice&            src,
                                          IDevice&            dst,

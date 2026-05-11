@@ -48,6 +48,46 @@ void hipCheck(hipError_t err, const char* context) {
 
 }  // namespace
 
+class GpuDevicePlan : public IDevicePlan {
+   public:
+    struct HostCallbackData {
+        std::function<bool()> tryReady;
+        std::function<void()> action;
+    };
+
+    GpuDevicePlan(GpuDevice& device, const DGraph& dg);
+    ~GpuDevicePlan() override;
+
+    void launch() override;
+    void wait() override;
+
+   private:
+    struct KernelParamStore {
+        std::vector<void*> argPtrs;
+        std::vector<uint64_t> scalarVals;
+        std::vector<void*> devicePtrVals;
+    };
+
+    void destroyHipGraph();
+
+    hipGraphNode_t addKernelNode(const CompiledKernelNode& node,
+                                 const std::vector<hipGraphNode_t>& deps);
+    hipGraphNode_t addOpHostNode(std::function<bool()> tryReady,
+                                 std::function<void()> action,
+                                 const std::vector<hipGraphNode_t>& deps);
+    hipGraphNode_t addMemcpyH2DNode(const std::string& bufferName, size_t sizeBytes,
+                                    const std::vector<hipGraphNode_t>& deps);
+    hipGraphNode_t addMemcpyD2HNode(const std::string& bufferName, size_t sizeBytes,
+                                    const std::vector<hipGraphNode_t>& deps);
+
+    GpuDevice& device_;
+    hipGraph_t hipGraph_ = nullptr;
+    hipGraphExec_t hipExec_ = nullptr;
+    std::map<std::string, hipGraphNode_t> hipNodeById_;
+    std::vector<std::unique_ptr<KernelParamStore>> paramStores_;
+    std::vector<std::unique_ptr<HostCallbackData>> callbackDatas_;
+};
+
 // ---------------------------------------------------------------------------
 // GpuDevice construction / destruction
 // ---------------------------------------------------------------------------
@@ -60,7 +100,6 @@ GpuDevice::GpuDevice(std::string id, int hipDeviceIdx)
 }
 
 GpuDevice::~GpuDevice() {
-    destroyHipGraph();
     freeDeviceBuffers();
     if (stream_) {
         hipStreamDestroy(stream_);
@@ -68,7 +107,19 @@ GpuDevice::~GpuDevice() {
     }
 }
 
-void GpuDevice::destroyHipGraph() {
+std::unique_ptr<IDevicePlan> GpuDevice::compilePlan(const DGraph& dg) {
+    return std::make_unique<GpuDevicePlan>(*this, dg);
+}
+
+GpuDevicePlan::~GpuDevicePlan() {
+    if (hipExec_ && device_.stream_) {
+        hipSetDevice(device_.hipDeviceIdx_);
+        hipStreamSynchronize(device_.stream_);
+    }
+    destroyHipGraph();
+}
+
+void GpuDevicePlan::destroyHipGraph() {
     if (hipExec_) {
         hipGraphExecDestroy(hipExec_);
         hipExec_ = nullptr;
@@ -169,7 +220,7 @@ void* GpuDevice::ensureDeviceBuffer(const std::string& name, size_t sizeBytes) {
 namespace {
 
 void hipHostOpCallback(void* userData) {
-    auto* cbd = static_cast<GpuDevice::HostCallbackData*>(userData);
+    auto* cbd = static_cast<GpuDevicePlan::HostCallbackData*>(userData);
     // Poll the bridge readiness probe before firing the action.
     // tryReady defaults to always-true on producer ops.
     while (!cbd->tryReady()) {}
@@ -182,9 +233,9 @@ void hipHostOpCallback(void* userData) {
 // HIP Graph node builders
 // ---------------------------------------------------------------------------
 
-hipGraphNode_t GpuDevice::addOpHostNode(std::function<bool()> tryReady,
-                                        std::function<void()> action,
-                                        const std::vector<hipGraphNode_t>& deps) {
+hipGraphNode_t GpuDevicePlan::addOpHostNode(std::function<bool()> tryReady,
+                                            std::function<void()> action,
+                                            const std::vector<hipGraphNode_t>& deps) {
     auto cbd = std::make_unique<HostCallbackData>();
     cbd->tryReady = std::move(tryReady);
     cbd->action   = std::move(action);
@@ -202,14 +253,14 @@ hipGraphNode_t GpuDevice::addOpHostNode(std::function<bool()> tryReady,
     return node;
 }
 
-hipGraphNode_t GpuDevice::addMemcpyH2DNode(const std::string& bufferName, size_t sizeBytes,
-                                           const std::vector<hipGraphNode_t>& deps) {
+hipGraphNode_t GpuDevicePlan::addMemcpyH2DNode(const std::string& bufferName, size_t sizeBytes,
+                                               const std::vector<hipGraphNode_t>& deps) {
     // Ensure the device buffer exists
-    void* dptr = ensureDeviceBuffer(bufferName, sizeBytes);
+    void* dptr = device_.ensureDeviceBuffer(bufferName, sizeBytes);
 
     // Source is the private host store
-    auto hostIt = hostBuffers_.find(bufferName);
-    if (hostIt == hostBuffers_.end()) {
+    auto hostIt = device_.hostBuffers_.find(bufferName);
+    if (hostIt == device_.hostBuffers_.end()) {
         throw std::runtime_error(
             "GpuDevice: H2D memcpy source buffer '" + bufferName + "' not found in host store");
     }
@@ -232,16 +283,16 @@ hipGraphNode_t GpuDevice::addMemcpyH2DNode(const std::string& bufferName, size_t
     return node;
 }
 
-hipGraphNode_t GpuDevice::addMemcpyD2HNode(const std::string& bufferName, size_t sizeBytes,
-                                           const std::vector<hipGraphNode_t>& deps) {
-    auto devIt = deviceBuffers_.find(bufferName);
-    if (devIt == deviceBuffers_.end()) {
+hipGraphNode_t GpuDevicePlan::addMemcpyD2HNode(const std::string& bufferName, size_t sizeBytes,
+                                               const std::vector<hipGraphNode_t>& deps) {
+    auto devIt = device_.deviceBuffers_.find(bufferName);
+    if (devIt == device_.deviceBuffers_.end()) {
         throw std::runtime_error(
             "GpuDevice: D2H memcpy source device buffer '" + bufferName + "' not found");
     }
 
     // Ensure host-side destination exists
-    auto& hostBuf = hostBuffers_[bufferName];
+    auto& hostBuf = device_.hostBuffers_[bufferName];
     if (hostBuf.size() < sizeBytes) hostBuf.resize(sizeBytes);
 
     hipGraphNode_t node;
@@ -262,11 +313,11 @@ hipGraphNode_t GpuDevice::addMemcpyD2HNode(const std::string& bufferName, size_t
     return node;
 }
 
-hipGraphNode_t GpuDevice::addKernelNode(const KernelNode& node,
-                                        const std::vector<hipGraphNode_t>& deps) {
+hipGraphNode_t GpuDevicePlan::addKernelNode(const CompiledKernelNode& node,
+                                            const std::vector<hipGraphNode_t>& deps) {
     const std::string& kname = node.kernel.name;
-    auto it = kernels_.find(kname);
-    if (it == kernels_.end()) {
+    auto it = device_.kernels_.find(kname);
+    if (it == device_.kernels_.end()) {
         throw std::runtime_error("GpuDevice: no kernel registered for '" + kname + "'");
     }
     const GpuKernelBinding& binding = it->second;
@@ -278,8 +329,8 @@ hipGraphNode_t GpuDevice::addKernelNode(const KernelNode& node,
     size_t firstInputElements = 1;
     if (!node.ioMap.inputBuffers().empty()) {
         const std::string& firstName = node.ioMap.inputBuffers().begin()->second.name();
-        auto sit = deviceBufferSizes_.find(firstName);
-        if (sit != deviceBufferSizes_.end()) {
+        auto sit = device_.deviceBufferSizes_.find(firstName);
+        if (sit != device_.deviceBufferSizes_.end()) {
             // Default to sizeof(float) elements if unknown
             firstInputElements = sit->second / sizeof(float);
         }
@@ -291,24 +342,24 @@ hipGraphNode_t GpuDevice::addKernelNode(const KernelNode& node,
     std::map<std::string, uint64_t> scalarVals;
 
     for (const auto& [portName, gbuf] : node.ioMap.inputBuffers()) {
-        auto dit = deviceBuffers_.find(gbuf.name());
-        if (dit != deviceBuffers_.end()) {
+        auto dit = device_.deviceBuffers_.find(gbuf.name());
+        if (dit != device_.deviceBuffers_.end()) {
             bufferPtrs[portName] = dit->second;
         }
     }
     for (const auto& [portName, gbuf] : node.ioMap.outputBuffers()) {
-        auto dit = deviceBuffers_.find(gbuf.name());
-        if (dit != deviceBuffers_.end()) {
+        auto dit = device_.deviceBuffers_.find(gbuf.name());
+        if (dit != device_.deviceBuffers_.end()) {
             bufferPtrs[portName] = dit->second;
         }
     }
     for (const auto& rwb : node.ioMap.rwBuffers()) {
-        auto inIt = deviceBuffers_.find(rwb.in.name());
-        if (inIt != deviceBuffers_.end()) {
+        auto inIt = device_.deviceBuffers_.find(rwb.in.name());
+        if (inIt != device_.deviceBuffers_.end()) {
             bufferPtrs[rwb.inPort] = inIt->second;
         }
-        auto outIt = deviceBuffers_.find(rwb.out.name());
-        if (outIt != deviceBuffers_.end()) {
+        auto outIt = device_.deviceBuffers_.find(rwb.out.name());
+        if (outIt != device_.deviceBuffers_.end()) {
             bufferPtrs[rwb.outPort] = outIt->second;
         }
     }
@@ -369,38 +420,36 @@ hipGraphNode_t GpuDevice::addKernelNode(const KernelNode& node,
 // compile
 // ---------------------------------------------------------------------------
 
-void GpuDevice::compile(const DGraph& dg) {
-    hipCheck(hipSetDevice(hipDeviceIdx_), "hipSetDevice in compile");
-
-    // Destroy previous graph if any
-    destroyHipGraph();
+GpuDevicePlan::GpuDevicePlan(GpuDevice& device, const DGraph& dg)
+    : device_(device) {
+    hipCheck(hipSetDevice(device_.hipDeviceIdx_), "hipSetDevice in compilePlan");
 
     // --- Pre-allocate device buffers based on IOMap analysis (kernels only) ---
 
-    for (const Node& node : dg.nodes) {
-        if (!std::holds_alternative<KernelNode>(node)) continue;
-        const KernelNode& k = std::get<KernelNode>(node);
+    for (const CompiledNode& node : dg.nodes) {
+        if (!std::holds_alternative<CompiledKernelNode>(node)) continue;
+        const CompiledKernelNode& k = std::get<CompiledKernelNode>(node);
         size_t defaultSize = 0;
 
         for (const auto& [portName, gbuf] : k.ioMap.inputBuffers()) {
-            auto hostIt = hostBuffers_.find(gbuf.name());
-            if (hostIt != hostBuffers_.end()) {
+            auto hostIt = device_.hostBuffers_.find(gbuf.name());
+            if (hostIt != device_.hostBuffers_.end()) {
                 size_t sz = hostIt->second.size();
-                ensureDeviceBuffer(gbuf.name(), sz);
+                device_.ensureDeviceBuffer(gbuf.name(), sz);
                 if (defaultSize == 0) defaultSize = sz;
             }
         }
 
         for (const auto& [portName, gbuf] : k.ioMap.outputBuffers()) {
             size_t sz = (defaultSize > 0) ? defaultSize : 1024;
-            ensureDeviceBuffer(gbuf.name(), sz);
+            device_.ensureDeviceBuffer(gbuf.name(), sz);
         }
 
         for (const auto& rwb : k.ioMap.rwBuffers()) {
-            auto hostIt = hostBuffers_.find(rwb.in.name());
-            size_t sz = (hostIt != hostBuffers_.end()) ? hostIt->second.size() : defaultSize;
-            ensureDeviceBuffer(rwb.in.name(), sz);
-            ensureDeviceBuffer(rwb.out.name(), sz);
+            auto hostIt = device_.hostBuffers_.find(rwb.in.name());
+            size_t sz = (hostIt != device_.hostBuffers_.end()) ? hostIt->second.size() : defaultSize;
+            device_.ensureDeviceBuffer(rwb.in.name(), sz);
+            device_.ensureDeviceBuffer(rwb.out.name(), sz);
         }
     }
 
@@ -409,9 +458,9 @@ void GpuDevice::compile(const DGraph& dg) {
     // for an input or a D2H copy for an output.
     std::set<std::string> producedHere;
     std::set<std::string> consumedHere;
-    for (const Node& node : dg.nodes) {
-        if (!std::holds_alternative<KernelNode>(node)) continue;
-        const KernelNode& k = std::get<KernelNode>(node);
+    for (const CompiledNode& node : dg.nodes) {
+        if (!std::holds_alternative<CompiledKernelNode>(node)) continue;
+        const CompiledKernelNode& k = std::get<CompiledKernelNode>(node);
         for (const auto& [_, gbuf] : k.ioMap.outputBuffers()) producedHere.insert(gbuf.name());
         for (const auto& rwb : k.ioMap.rwBuffers())           producedHere.insert(rwb.out.name());
         for (const auto& [_, gbuf] : k.ioMap.inputBuffers())  consumedHere.insert(gbuf.name());
@@ -442,21 +491,21 @@ void GpuDevice::compile(const DGraph& dg) {
     // graph-level input share one H2D copy instead of re-staging it.
     std::map<std::string, hipGraphNode_t> h2dByBuffer;
 
-    for (const Node& node : dg.nodes) {
+    for (const CompiledNode& node : dg.nodes) {
         std::visit(
             [&](const auto& n) {
                 using T = std::decay_t<decltype(n)>;
                 std::vector<hipGraphNode_t> deps = translateDeps(n.dependsOn);
 
-                if constexpr (std::is_same_v<T, KernelNode>) {
+                if constexpr (std::is_same_v<T, CompiledKernelNode>) {
                     // For each input buffer NOT produced locally and present
                     // in the host store, inject (or reuse) an H2D copy and
                     // chain the kernel after it.
                     for (const auto& [_, gbuf] : n.ioMap.inputBuffers()) {
                         const std::string& bn = gbuf.name();
                         if (producedHere.count(bn)) continue;
-                        auto hostIt = hostBuffers_.find(bn);
-                        if (hostIt == hostBuffers_.end() || hostIt->second.empty()) continue;
+                        auto hostIt = device_.hostBuffers_.find(bn);
+                        if (hostIt == device_.hostBuffers_.end() || hostIt->second.empty()) continue;
                         auto h2dIt = h2dByBuffer.find(bn);
                         if (h2dIt == h2dByBuffer.end()) {
                             hipGraphNode_t h2d = addMemcpyH2DNode(bn, hostIt->second.size(),
@@ -471,9 +520,12 @@ void GpuDevice::compile(const DGraph& dg) {
                     hipGraphNode_t kn = addKernelNode(n, deps);
                     hipNodeById_[n.id] = kn;
 
-                } else if constexpr (std::is_same_v<T, BridgeOpNode>) {
+                } else if constexpr (std::is_same_v<T, CompiledBridgeOpNode>) {
                     hipGraphNode_t hn = addOpHostNode(n.tryReady, n.action, deps);
                     hipNodeById_[n.id] = hn;
+                } else {
+                    throw std::runtime_error(
+                        "GpuDevice: compiled control/boundary nodes are not executable yet");
                 }
             },
             node);
@@ -483,16 +535,16 @@ void GpuDevice::compile(const DGraph& dg) {
     // not consumed by another local kernel. These leaf outputs are either
     // graph-level outputs (read back via getOutputBuffer) or producer-side
     // staging for a cross-device bridge (which uses host-side buffers).
-    for (const Node& node : dg.nodes) {
-        if (!std::holds_alternative<KernelNode>(node)) continue;
-        const KernelNode& k = std::get<KernelNode>(node);
+    for (const CompiledNode& node : dg.nodes) {
+        if (!std::holds_alternative<CompiledKernelNode>(node)) continue;
+        const CompiledKernelNode& k = std::get<CompiledKernelNode>(node);
         auto knIt = hipNodeById_.find(k.id);
         if (knIt == hipNodeById_.end()) continue;
         for (const auto& [_, gbuf] : k.ioMap.outputBuffers()) {
             const std::string& bn = gbuf.name();
             if (consumedHere.count(bn)) continue;
-            auto sit = deviceBufferSizes_.find(bn);
-            if (sit == deviceBufferSizes_.end()) continue;
+            auto sit = device_.deviceBufferSizes_.find(bn);
+            if (sit == device_.deviceBufferSizes_.end()) continue;
             addMemcpyD2HNode(bn, sit->second, /*deps=*/{ knIt->second });
         }
     }
@@ -506,14 +558,14 @@ void GpuDevice::compile(const DGraph& dg) {
 // launch / wait
 // ---------------------------------------------------------------------------
 
-void GpuDevice::launch() {
-    hipCheck(hipSetDevice(hipDeviceIdx_), "hipSetDevice in launch");
-    hipCheck(hipGraphLaunch(hipExec_, stream_), "hipGraphLaunch");
+void GpuDevicePlan::launch() {
+    hipCheck(hipSetDevice(device_.hipDeviceIdx_), "hipSetDevice in launch");
+    hipCheck(hipGraphLaunch(hipExec_, device_.stream_), "hipGraphLaunch");
 }
 
-void GpuDevice::wait() {
-    hipCheck(hipSetDevice(hipDeviceIdx_), "hipSetDevice in wait");
-    hipCheck(hipStreamSynchronize(stream_), "hipStreamSynchronize");
+void GpuDevicePlan::wait() {
+    hipCheck(hipSetDevice(device_.hipDeviceIdx_), "hipSetDevice in wait");
+    hipCheck(hipStreamSynchronize(device_.stream_), "hipStreamSynchronize");
 }
 
 }  // namespace vrt::graph

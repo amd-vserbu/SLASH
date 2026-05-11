@@ -25,13 +25,587 @@
 
 #include <vrt/graph/device/cpu_device.hpp>
 
+#include <cmath>
+#include <cstddef>
 #include <cstring>
+#include <deque>
+#include <exception>
+#include <limits>
 #include <set>
 #include <stdexcept>
+#include <thread>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
 namespace vrt::graph {
+
+namespace {
+
+template <typename T>
+T bitsAs(uint64_t bits) {
+    T value{};
+    std::memcpy(&value, &bits, sizeof(T));
+    return value;
+}
+
+int64_t signedScalarValue(ScalarType type, uint64_t bits) {
+    switch (type) {
+        case ScalarType::I8:  return bitsAs<int8_t>(bits);
+        case ScalarType::I16: return bitsAs<int16_t>(bits);
+        case ScalarType::I32: return bitsAs<int32_t>(bits);
+        case ScalarType::I64: return bitsAs<int64_t>(bits);
+        default:
+            throw std::invalid_argument("CpuDevice: scalar type is not signed integer");
+    }
+}
+
+uint64_t unsignedScalarValue(ScalarType type, uint64_t bits) {
+    switch (type) {
+        case ScalarType::U8:  return bitsAs<uint8_t>(bits);
+        case ScalarType::U16: return bitsAs<uint16_t>(bits);
+        case ScalarType::U32: return bitsAs<uint32_t>(bits);
+        case ScalarType::U64: return bitsAs<uint64_t>(bits);
+        default:
+            throw std::invalid_argument("CpuDevice: scalar type is not unsigned integer");
+    }
+}
+
+long double floatingScalarValue(ScalarType type, uint64_t bits) {
+    switch (type) {
+        case ScalarType::F32: return bitsAs<float>(bits);
+        case ScalarType::F64: return bitsAs<double>(bits);
+        default:
+            throw std::invalid_argument("CpuDevice: scalar type is not floating point");
+    }
+}
+
+template <typename T>
+bool compareValues(CompareOp op, T lhs, T rhs) {
+    switch (op) {
+        case CompareOp::LT: return lhs < rhs;
+        case CompareOp::LE: return lhs <= rhs;
+        case CompareOp::EQ: return lhs == rhs;
+        case CompareOp::GT: return lhs > rhs;
+        case CompareOp::GE: return lhs >= rhs;
+        case CompareOp::NE: return lhs != rhs;
+        default:
+            throw std::runtime_error("CpuDevice: unsupported comparison operator");
+    }
+}
+
+}  // namespace
+
+class CpuDevicePlan : public IDevicePlan {
+   public:
+    CpuDevicePlan(CpuDevice& device, const DGraph& dg)
+        : device_(device),
+          scalarValues_(dg.scalarValues
+                            ? dg.scalarValues
+                            : std::make_shared<std::map<std::string, uint64_t>>()) {
+        runtime_.reserve(dg.nodes.size());
+        idToIdx_.reserve(dg.nodes.size());
+
+        // First pass: build per-node runtime records, keyed by id.
+        for (const CompiledNode& node : dg.nodes) {
+            NodeRuntime rt;
+            std::visit(
+                [&](const auto& n) {
+                    using T = std::decay_t<decltype(n)>;
+                    rt.id = n.id;
+                    if constexpr (std::is_same_v<T, CompiledKernelNode>) {
+                        rt.kind = NodeKind::Kernel;
+                        rt.kernel = n;
+                    } else if constexpr (std::is_same_v<T, CompiledBridgeOpNode>) {
+                        rt.kind = (n.side == CompiledBridgeOpNode::Side::Producer)
+                                      ? NodeKind::ProducerOp
+                                      : NodeKind::ConsumerOp;
+                        rt.tryReady = n.tryReady;
+                        rt.action = n.action;
+                    } else if constexpr (std::is_same_v<T, CompiledBoundaryNode>) {
+                        rt.kind = NodeKind::Boundary;
+                        rt.boundary = n;
+                    } else if constexpr (std::is_same_v<T, CompiledLoopNode>) {
+                        rt.kind = NodeKind::Loop;
+                        rt.loop = n;
+                    } else if constexpr (std::is_same_v<T, CompiledConditionalNode>) {
+                        rt.kind = NodeKind::Conditional;
+                        rt.conditional = n;
+                    } else {
+                        static_assert(sizeof(T) == 0, "Unhandled compiled node type");
+                    }
+                },
+                node);
+            idToIdx_[rt.id] = runtime_.size();
+            runtime_.push_back(std::move(rt));
+        }
+
+        // Second pass: convert dependsOn ids to indices, build successors and
+        // the immutable initial unmet counts used to seed each launch.
+        // dependsOn may legitimately reference ids from other DGraphs. Ids not
+        // local to this DGraph are ignored; bridge readiness handles cross-device
+        // synchronization.
+        for (size_t i = 0; i < dg.nodes.size(); ++i) {
+            const auto& deps = compiledNodeDependsOn(dg.nodes[i]);
+            for (const std::string& depId : deps) {
+                auto it = idToIdx_.find(depId);
+                if (it == idToIdx_.end()) continue;
+                runtime_[it->second].successors.push_back(i);
+                ++runtime_[i].initialUnmet;
+            }
+        }
+
+        for (const DGraphChild& child : dg.childDGraphs) {
+            auto& plans = childPlans_[child.parentNodeId][child.role];
+            plans.reserve(child.dgraphs.size());
+            for (const auto& childDGraph : child.dgraphs) {
+                if (!childDGraph) continue;
+                if (!childDGraph->device) {
+                    throw std::runtime_error(
+                        "CpuDevice: control-flow child DGraph is missing its target device");
+                }
+                auto plan = childDGraph->device->compilePlan(*childDGraph);
+                if (!plan) {
+                    throw std::runtime_error(
+                        "CpuDevice: target device returned a null control-flow child plan");
+                }
+                plans.push_back(std::move(plan));
+            }
+        }
+    }
+
+    ~CpuDevicePlan() override {
+        try {
+            wait();
+        } catch (...) {
+        }
+    }
+
+    void launch() override {
+        wait();
+        workerException_ = nullptr;
+        worker_ = std::thread([this] {
+            try {
+                runOnce();
+            } catch (...) {
+                workerException_ = std::current_exception();
+            }
+        });
+    }
+
+    void wait() override {
+        if (worker_.joinable()) worker_.join();
+        if (workerException_) {
+            std::exception_ptr ex = workerException_;
+            workerException_ = nullptr;
+            std::rethrow_exception(ex);
+        }
+    }
+
+   private:
+    enum class NodeKind { Kernel, ProducerOp, ConsumerOp, Boundary, Loop, Conditional };
+
+    struct NodeRuntime {
+        std::string id;
+        NodeKind kind = NodeKind::Boundary;
+        size_t initialUnmet = 0;
+        std::vector<size_t> successors;
+        CompiledKernelNode kernel;
+        CompiledBoundaryNode boundary;
+        CompiledLoopNode loop;
+        CompiledConditionalNode conditional;
+        std::function<bool()> tryReady;
+        std::function<void()> action;
+    };
+
+    void runOnce() {
+        std::vector<size_t> unmetCounts;
+        unmetCounts.reserve(runtime_.size());
+        for (const auto& rt : runtime_) {
+            unmetCounts.push_back(rt.initialUnmet);
+        }
+
+        std::deque<size_t> readyKP;
+        std::vector<size_t> pendingCons;
+
+        auto promote = [&](size_t idx) {
+            if (runtime_[idx].kind == NodeKind::ConsumerOp) {
+                pendingCons.push_back(idx);
+            } else {
+                readyKP.push_back(idx);
+            }
+        };
+
+        for (size_t i = 0; i < runtime_.size(); ++i) {
+            if (unmetCounts[i] == 0) promote(i);
+        }
+
+        auto runIndex = [&](size_t idx) {
+            NodeRuntime& rt = runtime_[idx];
+            switch (rt.kind) {
+                case NodeKind::Kernel:
+                    executeKernel(rt.kernel);
+                    break;
+                case NodeKind::ProducerOp:
+                case NodeKind::ConsumerOp:
+                    rt.action();
+                    break;
+                case NodeKind::Boundary:
+                    executeBoundary(rt.boundary);
+                    break;
+                case NodeKind::Loop:
+                    executeLoop(rt.loop);
+                    break;
+                case NodeKind::Conditional:
+                    executeConditional(rt.conditional);
+                    break;
+            }
+            for (size_t successor : rt.successors) {
+                if (--unmetCounts[successor] == 0) promote(successor);
+            }
+        };
+
+        size_t rrCursor = 0;
+        for (;;) {
+            while (!readyKP.empty()) {
+                size_t idx = readyKP.front();
+                readyKP.pop_front();
+                runIndex(idx);
+            }
+            if (pendingCons.empty()) break;
+
+            bool fired = false;
+            for (size_t step = 0; step < pendingCons.size(); ++step) {
+                if (rrCursor >= pendingCons.size()) rrCursor = 0;
+                size_t idx = pendingCons[rrCursor];
+                if (runtime_[idx].tryReady && runtime_[idx].tryReady()) {
+                    pendingCons.erase(pendingCons.begin() +
+                                      static_cast<std::ptrdiff_t>(rrCursor));
+                    runIndex(idx);
+                    fired = true;
+                    break;
+                }
+                ++rrCursor;
+            }
+            if (!fired) {
+                std::this_thread::yield();
+            }
+        }
+    }
+
+    uint64_t scalarBits(const std::string& name, uint64_t scopeId) const {
+        auto it = scalarValues_->find(scopedScalarKey(scopeId, name));
+        if (it == scalarValues_->end() && scopeId == 0) {
+            it = scalarValues_->find(name);
+        }
+        if (it == scalarValues_->end()) {
+            throw std::runtime_error(
+                "CpuDevice: scalar '" + name + "' is not set before control-flow evaluation");
+        }
+        return it->second;
+    }
+
+    uint64_t operandBits(const ConditionOperand& operand) const {
+        if (operand.isConstant()) return operand.constantBits();
+        return scalarBits(operand.name(), operand.scopeId());
+    }
+
+    uint64_t evaluateTripCount(const LoopTripCount& tripCount) const {
+        const uint64_t bits = (tripCount.kind() == LoopTripCount::Kind::Constant)
+                                  ? tripCount.constantBits()
+                                  : scalarBits(tripCount.name(), tripCount.scopeId());
+        if (isSignedIntegerScalarType(tripCount.type())) {
+            const int64_t value = signedScalarValue(tripCount.type(), bits);
+            if (value < 0) {
+                throw std::runtime_error("CpuDevice: loop trip count cannot be negative");
+            }
+            return static_cast<uint64_t>(value);
+        }
+        return unsignedScalarValue(tripCount.type(), bits);
+    }
+
+    bool evaluateCondition(const Condition& condition) const {
+        switch (condition.op()) {
+            case CompareOp::AlwaysTrue:
+                return true;
+            case CompareOp::AlwaysFalse:
+                return false;
+            default:
+                break;
+        }
+
+        if (!condition.lhs() || !condition.rhs()) {
+            throw std::runtime_error("CpuDevice: condition is missing comparison operands");
+        }
+
+        const ScalarType type = condition.lhs()->type();
+        const uint64_t lhsBits = operandBits(*condition.lhs());
+        const uint64_t rhsBits = operandBits(*condition.rhs());
+
+        if (condition.isEpsilonCompare()) {
+            if (!condition.epsilon()) {
+                throw std::runtime_error("CpuDevice: epsilon comparison is missing epsilon");
+            }
+            const long double lhs = floatingScalarValue(type, lhsBits);
+            const long double rhs = floatingScalarValue(type, rhsBits);
+            const long double epsilon = floatingScalarValue(type, operandBits(*condition.epsilon()));
+            const bool equal = std::fabs(lhs - rhs) <= epsilon;
+            return condition.op() == CompareOp::EQE ? equal : !equal;
+        }
+
+        if (isFloatingScalarType(type)) {
+            return compareValues(condition.op(), floatingScalarValue(type, lhsBits),
+                                 floatingScalarValue(type, rhsBits));
+        }
+        if (isSignedIntegerScalarType(type)) {
+            return compareValues(condition.op(), signedScalarValue(type, lhsBits),
+                                 signedScalarValue(type, rhsBits));
+        }
+        return compareValues(condition.op(), unsignedScalarValue(type, lhsBits),
+                             unsignedScalarValue(type, rhsBits));
+    }
+
+    template <typename ControlNodeT>
+    bool hasMaterializedOutputs(const ControlNodeT& control) const {
+        return !control.outputBufferPublications.empty() ||
+               !control.outputScalarPublications.empty() ||
+               !control.outputBufferPlacements.empty() ||
+               !control.outputScalarPlacements.empty();
+    }
+
+    std::vector<std::unique_ptr<IDevicePlan>>& childPlansFor(
+        const std::string& controlId,
+        DGraphChildRole role) {
+        auto parentIt = childPlans_.find(controlId);
+        if (parentIt == childPlans_.end()) {
+            throw std::runtime_error(
+                "CpuDevice: control node '" + controlId + "' is missing child DGraphs");
+        }
+        auto roleIt = parentIt->second.find(role);
+        if (roleIt == parentIt->second.end()) {
+            throw std::runtime_error(
+                "CpuDevice: control node '" + controlId + "' is missing child DGraphs");
+        }
+        return roleIt->second;
+    }
+
+    void runChildPlans(const std::string& controlId, DGraphChildRole role) {
+        auto& plans = childPlansFor(controlId, role);
+        std::exception_ptr firstException;
+        size_t launched = 0;
+
+        for (auto& plan : plans) {
+            try {
+                plan->launch();
+                ++launched;
+            } catch (...) {
+                firstException = std::current_exception();
+                break;
+            }
+        }
+
+        for (size_t i = 0; i < launched; ++i) {
+            try {
+                plans[i]->wait();
+            } catch (...) {
+                if (!firstException) firstException = std::current_exception();
+            }
+        }
+
+        if (firstException) {
+            std::rethrow_exception(firstException);
+        }
+    }
+
+    template <typename ControlNodeT>
+    void requireParentBufferPlacement(const ControlNodeT& control,
+                                      const std::string& tokenName) const {
+        auto placementIt = control.outputBufferPlacements.find(tokenName);
+        if (placementIt != control.outputBufferPlacements.end() &&
+            placementIt->second != device_.id()) {
+            throw std::runtime_error(
+                "CpuDevice: cross-device control-flow output buffer publication is not executable yet");
+        }
+    }
+
+    template <typename ControlNodeT>
+    void requireParentScalarPlacement(const ControlNodeT& control,
+                                      const std::string& tokenName) const {
+        auto placementIt = control.outputScalarPlacements.find(tokenName);
+        if (placementIt != control.outputScalarPlacements.end() &&
+            placementIt->second != device_.id()) {
+            throw std::runtime_error(
+                "CpuDevice: cross-device control-flow output scalar publication is not executable yet");
+        }
+    }
+
+    void executeBoundary(const CompiledBoundaryNode& boundary) {
+        for (const auto& copy : boundary.scalarCopies) {
+            const std::string sourceKey = scopedScalarKey(copy.sourceScopeId, copy.sourceName);
+            auto sourceIt = scalarValues_->find(sourceKey);
+            if (sourceIt == scalarValues_->end() && copy.sourceScopeId == 0) {
+                sourceIt = scalarValues_->find(copy.sourceName);
+            }
+            if (sourceIt == scalarValues_->end()) {
+                throw std::runtime_error(
+                    "CpuDevice: boundary scalar source '" + copy.sourceName +
+                    "' was not set before boundary execution");
+            }
+            (*scalarValues_)[scopedScalarKey(copy.targetScopeId, copy.targetName)] =
+                sourceIt->second;
+        }
+        for (const auto& copy : boundary.bufferCopies) {
+            const std::string sourceKey = scopedBufferKey(copy.sourceScopeId, copy.sourceName);
+            auto sourceIt = device_.buffers_.find(sourceKey);
+            if (sourceIt == device_.buffers_.end() && copy.sourceScopeId == 0) {
+                sourceIt = device_.buffers_.find(copy.sourceName);
+            }
+            if (sourceIt == device_.buffers_.end()) {
+                throw std::runtime_error(
+                    "CpuDevice: boundary buffer source '" + copy.sourceName +
+                    "' was not produced before boundary execution");
+            }
+            device_.buffers_[scopedBufferKey(copy.targetScopeId, copy.targetName)] =
+                sourceIt->second;
+        }
+    }
+
+    template <typename ControlNodeT, typename PublicationT>
+    void publishBuffer(const ControlNodeT& control,
+                       const PublicationT& publication,
+                       const std::string& sourceTokenName,
+                       uint64_t sourceScopeId,
+                       const std::string& sourceDeviceId) {
+        if (!sourceDeviceId.empty() && sourceDeviceId != device_.id()) {
+            throw std::runtime_error(
+                "CpuDevice: cross-device control-flow output buffer publication is not executable yet");
+        }
+        const std::string parentKey = scopedBufferKey(publication.parentScopeId,
+                                                      publication.parentTokenName);
+        requireParentBufferPlacement(control, parentKey);
+        const std::string sourceKey = scopedBufferKey(sourceScopeId, sourceTokenName);
+        auto sourceIt = device_.buffers_.find(sourceKey);
+        if (sourceIt == device_.buffers_.end() && sourceScopeId == 0) {
+            sourceIt = device_.buffers_.find(sourceTokenName);
+        }
+        if (sourceIt == device_.buffers_.end()) {
+            throw std::runtime_error(
+                "CpuDevice: control-flow output buffer source '" + sourceTokenName +
+                "' was not produced");
+        }
+        device_.buffers_[parentKey] = sourceIt->second;
+    }
+
+    template <typename ControlNodeT, typename PublicationT>
+    void publishScalar(const ControlNodeT& control,
+                       const PublicationT& publication,
+                       const std::string& sourceTokenName,
+                       uint64_t sourceScopeId,
+                       const std::string& sourceDeviceId) {
+        if (!sourceDeviceId.empty() && sourceDeviceId != device_.id()) {
+            throw std::runtime_error(
+                "CpuDevice: cross-device control-flow output scalar publication is not executable yet");
+        }
+        requireParentScalarPlacement(
+            control, scopedScalarKey(publication.parentScopeId, publication.parentTokenName));
+        auto sourceIt = scalarValues_->find(scopedScalarKey(sourceScopeId, sourceTokenName));
+        if (sourceIt == scalarValues_->end()) {
+            throw std::runtime_error(
+                "CpuDevice: control-flow output scalar source '" + sourceTokenName +
+                "' was not produced");
+        }
+        (*scalarValues_)[scopedScalarKey(publication.parentScopeId,
+                                         publication.parentTokenName)] = sourceIt->second;
+    }
+
+    void publishLoopOutputs(const CompiledLoopNode& loop) {
+        for (const auto& publication : loop.outputBufferPublications) {
+            publishBuffer(loop, publication, publication.sourceTokenName,
+                          publication.sourceScopeId,
+                          publication.sourceDeviceId);
+        }
+        for (const auto& publication : loop.outputScalarPublications) {
+            publishScalar(loop, publication, publication.sourceTokenName,
+                          publication.sourceScopeId,
+                          publication.sourceDeviceId);
+        }
+    }
+
+    void publishConditionalOutputs(const CompiledConditionalNode& cond, bool thenBranch) {
+        for (const auto& publication : cond.outputBufferPublications) {
+            publishBuffer(cond, publication,
+                          thenBranch ? publication.thenSourceTokenName
+                                     : publication.elseSourceTokenName,
+                          thenBranch ? publication.thenSourceScopeId
+                                     : publication.elseSourceScopeId,
+                          thenBranch ? publication.thenSourceDeviceId
+                                     : publication.elseSourceDeviceId);
+        }
+        for (const auto& publication : cond.outputScalarPublications) {
+            publishScalar(cond, publication,
+                          thenBranch ? publication.thenSourceTokenName
+                                     : publication.elseSourceTokenName,
+                          thenBranch ? publication.thenSourceScopeId
+                                     : publication.elseSourceScopeId,
+                          thenBranch ? publication.thenSourceDeviceId
+                                     : publication.elseSourceDeviceId);
+        }
+    }
+
+    void executeLoop(const CompiledLoopNode& loop) {
+        bool completedIteration = false;
+        if (loop.loopKind == CompiledLoopKind::FixedCount) {
+            if (!loop.tripCount) {
+                throw std::runtime_error("CpuDevice: compiled fixed-count loop is missing trip count");
+            }
+            const uint64_t count = evaluateTripCount(*loop.tripCount);
+            if (count == 0) {
+                if (hasMaterializedOutputs(loop)) {
+                    throw std::runtime_error(
+                        "CpuDevice: zero-iteration loop cannot materialize outputs");
+                }
+                return;
+            }
+            for (uint64_t i = 0; i < count; ++i) {
+                runChildPlans(loop.id, DGraphChildRole::LoopBody);
+                completedIteration = true;
+            }
+        } else {
+            if (!loop.condition) {
+                throw std::runtime_error("CpuDevice: compiled while loop is missing condition");
+            }
+            while (evaluateCondition(*loop.condition)) {
+                runChildPlans(loop.id, DGraphChildRole::LoopBody);
+                completedIteration = true;
+            }
+        }
+
+        if (!completedIteration && hasMaterializedOutputs(loop)) {
+            throw std::runtime_error("CpuDevice: zero-iteration loop cannot materialize outputs");
+        }
+        if (completedIteration) publishLoopOutputs(loop);
+    }
+
+    void executeConditional(const CompiledConditionalNode& cond) {
+        const bool thenBranch = evaluateCondition(cond.condition);
+        runChildPlans(cond.id, thenBranch ? DGraphChildRole::ConditionalThen
+                                          : DGraphChildRole::ConditionalElse);
+        publishConditionalOutputs(cond, thenBranch);
+    }
+
+    void executeKernel(const CompiledKernelNode& node);
+    CpuBufferView resolveBuffer(const GraphBuffer& buffer) const;
+    std::vector<uint8_t>& ensureBuffer(const GraphBuffer& buffer, size_t sizeBytes);
+
+    CpuDevice& device_;
+    std::shared_ptr<std::map<std::string, uint64_t>> scalarValues_;
+    std::vector<NodeRuntime> runtime_;
+    std::unordered_map<std::string, size_t> idToIdx_;
+    std::map<std::string, std::map<DGraphChildRole, std::vector<std::unique_ptr<IDevicePlan>>>>
+        childPlans_;
+    std::thread worker_;
+    std::exception_ptr workerException_;
+};
 
 // ---------------------------------------------------------------------------
 // CpuBufferView helpers
@@ -62,14 +636,34 @@ size_t CpuBufferView::elementCount() const {
 
 CpuDevice::CpuDevice(std::string id) : id_(std::move(id)) {}
 
-void CpuDevice::registerKernel(std::string kernelName, CpuKernelFn fn) {
-    kernels_[std::move(kernelName)] = std::move(fn);
+void CpuDevice::registerKernel(std::shared_ptr<CpuKernel> kernel) {
+    if (!kernel) {
+        throw std::invalid_argument("CpuDevice::registerKernel: kernel must not be null");
+    }
+    std::string kernelName = kernel->name();
+    if (kernelName.empty()) {
+        throw std::invalid_argument("CpuDevice::registerKernel: kernel name must not be empty");
+    }
+    kernels_[std::move(kernelName)] = std::move(kernel);
 }
+
+// Buffer keys are always scoped ("scope:N:name"). The user-facing setters and
+// getters accept a plain buffer name — the declared root-scope name — and
+// internally normalize to the scope-0 storage key. Cross-device bridges that
+// already pass a scoped key (e.g. "scope:1:state" for a buffer published from
+// a loop body) continue to work because we leave keys with the "scope:"
+// prefix untouched.
+namespace {
+inline std::string normalizeUserBufferKey(const std::string& bufferName) {
+    if (bufferName.rfind("scope:", 0) == 0) return bufferName;
+    return scopedBufferKey(0, bufferName);
+}
+}  // namespace
 
 void CpuDevice::setInputBuffer(const std::string& bufferName,
                                 const void*        data,
                                 size_t             sizeBytes) {
-    auto& buf = buffers_[bufferName];
+    auto& buf = buffers_[normalizeUserBufferKey(bufferName)];
     buf.resize(sizeBytes);
     if (data && sizeBytes > 0) {
         std::memcpy(buf.data(), data, sizeBytes);
@@ -79,7 +673,7 @@ void CpuDevice::setInputBuffer(const std::string& bufferName,
 void CpuDevice::getOutputBuffer(const std::string& bufferName,
                                 void*              data,
                                 size_t             sizeBytes) const {
-    auto it = buffers_.find(bufferName);
+    auto it = buffers_.find(normalizeUserBufferKey(bufferName));
     if (it == buffers_.end()) {
         throw std::runtime_error("CpuDevice::getOutputBuffer: unknown buffer '" + bufferName + "'");
     }
@@ -93,145 +687,20 @@ void CpuDevice::getOutputBuffer(const std::string& bufferName,
 }
 
 size_t CpuDevice::bufferSize(const std::string& bufferName) const {
-    auto it = buffers_.find(bufferName);
+    auto it = buffers_.find(normalizeUserBufferKey(bufferName));
     return (it == buffers_.end()) ? 0 : it->second.size();
 }
 
-// --- compile ---
-
-void CpuDevice::compile(const DGraph& dg) {
-    if (dg.scalarValues) {
-        scalarStore_ = dg.scalarValues;
-    } else if (!scalarStore_) {
-        scalarStore_ = std::make_shared<std::map<std::string, uint64_t>>();
-    }
-
-    runtime_.clear();
-    runtime_.reserve(dg.nodes.size());
-    idToIdx_.clear();
-    idToIdx_.reserve(dg.nodes.size());
-
-    // First pass: build per-node runtime records, keyed by id.
-    for (const Node& node : dg.nodes) {
-        NodeRuntime rt;
-        std::visit(
-            [&](const auto& n) {
-                using T = std::decay_t<decltype(n)>;
-                rt.id = n.id;
-                if constexpr (std::is_same_v<T, KernelNode>) {
-                    rt.kind   = NodeKind::Kernel;
-                    rt.kernel = n;
-                } else if constexpr (std::is_same_v<T, BridgeOpNode>) {
-                    rt.kind = (n.side == BridgeOpNode::Side::Producer)
-                                  ? NodeKind::ProducerOp
-                                  : NodeKind::ConsumerOp;
-                    rt.tryReady = n.tryReady;
-                    rt.action   = n.action;
-                }
-            },
-            node);
-        idToIdx_[rt.id] = runtime_.size();
-        runtime_.push_back(std::move(rt));
-    }
-
-    // Second pass: convert dependsOn ids → indices, build successors + the
-    // immutable initial unmet counts used to seed each launch.
-    // dependsOn may legitimately reference ids from other DGraphs (the
-    // compiler annotates bounce-leg producers with the original cross-device
-    // kernel id). Ids not local to this DGraph are ignored — cross-device
-    // synchronisation is enforced by the bridge's tryReady probe instead.
-    for (size_t i = 0; i < dg.nodes.size(); ++i) {
-        const auto& deps = nodeDependsOn(dg.nodes[i]);
-        for (const std::string& depId : deps) {
-            auto it = idToIdx_.find(depId);
-            if (it == idToIdx_.end()) continue;
-            runtime_[it->second].successors.push_back(i);
-            ++runtime_[i].initialUnmet;
-        }
-    }
+std::unique_ptr<IDevicePlan> CpuDevice::compilePlan(const DGraph& dg) {
+    return std::make_unique<CpuDevicePlan>(*this, dg);
 }
 
-// --- launch ---
+// --- CpuDevicePlan kernel execution helpers ---
 
-void CpuDevice::launch() {
-    if (worker_.joinable()) worker_.join();
-    worker_ = std::thread([this] {
-        std::vector<size_t> unmetCounts;
-        unmetCounts.reserve(runtime_.size());
-        for (const auto& rt : runtime_) {
-            unmetCounts.push_back(rt.initialUnmet);
-        }
-
-        // Initial frontier: every node whose dependsOn set is empty.
-        std::vector<size_t> readyKP;       // kernels + producer-side ops, FIFO
-        std::vector<size_t> pendingCons;   // consumer-side ops awaiting tryReady
-        readyKP.reserve(runtime_.size());
-
-        auto promote = [&](size_t idx) {
-            if (runtime_[idx].kind == NodeKind::ConsumerOp) {
-                pendingCons.push_back(idx);
-            } else {
-                readyKP.push_back(idx);
-            }
-        };
-
-        for (size_t i = 0; i < runtime_.size(); ++i) {
-            if (unmetCounts[i] == 0) promote(i);
-        }
-
-        auto runIndex = [&](size_t idx) {
-            NodeRuntime& rt = runtime_[idx];
-            if (rt.kind == NodeKind::Kernel) {
-                executeKernel(rt.kernel);
-            } else {
-                rt.action();
-            }
-            for (size_t s : rt.successors) {
-                if (--unmetCounts[s] == 0) promote(s);
-            }
-        };
-
-        size_t rrCursor = 0;
-        for (;;) {
-            // Drain all currently-ready kernels and producer-side ops.
-            while (!readyKP.empty()) {
-                size_t idx = readyKP.front();
-                readyKP.erase(readyKP.begin());
-                runIndex(idx);
-            }
-            if (pendingCons.empty()) break;
-
-            // Round-robin poll the consumer-side ops.
-            bool fired = false;
-            for (size_t step = 0; step < pendingCons.size(); ++step) {
-                if (rrCursor >= pendingCons.size()) rrCursor = 0;
-                size_t idx = pendingCons[rrCursor];
-                if (runtime_[idx].tryReady && runtime_[idx].tryReady()) {
-                    pendingCons.erase(pendingCons.begin() +
-                                      static_cast<std::ptrdiff_t>(rrCursor));
-                    runIndex(idx);
-                    fired = true;
-                    break;
-                }
-                ++rrCursor;
-            }
-            if (!fired) {
-                std::this_thread::yield();
-            }
-        }
-    });
-}
-
-void CpuDevice::wait() {
-    if (worker_.joinable()) worker_.join();
-}
-
-// --- private helpers ---
-
-void CpuDevice::executeKernel(const KernelNode& node) {
+void CpuDevicePlan::executeKernel(const CompiledKernelNode& node) {
     const std::string& kname = node.kernel.name;
-    auto it = kernels_.find(kname);
-    if (it == kernels_.end()) {
+    auto it = device_.kernels_.find(kname);
+    if (it == device_.kernels_.end()) {
         throw std::runtime_error(
             "CpuDevice: no kernel registered for '" + kname + "'");
     }
@@ -239,7 +708,7 @@ void CpuDevice::executeKernel(const KernelNode& node) {
     std::map<std::string, CpuBufferView> bufViews;
 
     for (const auto& [portName, gbuf] : node.ioMap.inputBuffers()) {
-        CpuBufferView v = resolveBuffer(gbuf.name());
+        CpuBufferView v = resolveBuffer(gbuf);
         v.elementType   = gbuf.type();
         bufViews[portName] = v;
     }
@@ -247,25 +716,28 @@ void CpuDevice::executeKernel(const KernelNode& node) {
     const auto& inBufs = node.ioMap.inputBuffers();
     size_t defaultOutputSize = 0;
     if (!inBufs.empty()) {
-        const std::string& firstName = inBufs.begin()->second.name();
-        auto fit = buffers_.find(firstName);
-        if (fit != buffers_.end()) {
+        const GraphBuffer& firstBuffer = inBufs.begin()->second;
+        const std::string firstKey = scopedBufferKey(firstBuffer.scopeId(), firstBuffer.name());
+        auto fit = device_.buffers_.find(firstKey);
+        if (fit != device_.buffers_.end()) {
             defaultOutputSize = fit->second.size();
         }
     }
 
     for (const auto& [portName, gbuf] : node.ioMap.outputBuffers()) {
-        auto& storage = ensureBuffer(gbuf.name(), defaultOutputSize);
+        auto& storage = ensureBuffer(gbuf, defaultOutputSize);
         bufViews[portName] = CpuBufferView{storage.data(), storage.size(), gbuf.type()};
     }
 
     for (const auto& rwb : node.ioMap.rwBuffers()) {
-        bufViews[rwb.inPort] = resolveBuffer(rwb.in.name());
-        auto& inStorage = buffers_.at(rwb.in.name());
-        buffers_[rwb.out.name()] = inStorage;
+        bufViews[rwb.inPort] = resolveBuffer(rwb.in);
+        const std::string inKey = scopedBufferKey(rwb.in.scopeId(), rwb.in.name());
+        const std::string outKey = scopedBufferKey(rwb.out.scopeId(), rwb.out.name());
+        auto& inStorage = device_.buffers_.at(inKey);
+        device_.buffers_[outKey] = inStorage;
         bufViews[rwb.outPort] = CpuBufferView{
-            buffers_[rwb.out.name()].data(),
-            buffers_[rwb.out.name()].size(),
+            device_.buffers_[outKey].data(),
+            device_.buffers_[outKey].size(),
             rwb.out.type()
         };
     }
@@ -284,21 +756,19 @@ void CpuDevice::executeKernel(const KernelNode& node) {
                     "CpuDevice: output scalar port '" + portName +
                     "' cannot be bound to a constant");
             }
-            auto sit = scalarStore_->find(gs.varName());
-            if (sit == scalarStore_->end()) {
-                throw std::runtime_error(
-                    "CpuDevice: global scalar '" + gs.varName() +
-                    "' not declared before launch");
-            }
-            writableScalars[portName] = &sit->second;
+            writableScalars[portName] =
+                &(*scalarValues_)[scopedScalarKey(gs.scopeId(), gs.varName())];
             continue;
         }
 
         if (gs.isConstant()) {
             scalars[portName] = gs.constantBits();
         } else {
-            auto sit = scalarStore_->find(gs.varName());
-            if (sit == scalarStore_->end()) {
+            auto sit = scalarValues_->find(scopedScalarKey(gs.scopeId(), gs.varName()));
+            if (sit == scalarValues_->end() && gs.scopeId() == 0) {
+                sit = scalarValues_->find(gs.varName());
+            }
+            if (sit == scalarValues_->end()) {
                 throw std::runtime_error(
                     "CpuDevice: global scalar '" + gs.varName() + "' not set before launch");
             }
@@ -307,14 +777,15 @@ void CpuDevice::executeKernel(const KernelNode& node) {
     }
 
     CpuKernelArgs args(std::move(bufViews), std::move(scalars), std::move(writableScalars));
-    it->second(args);
+    it->second->call(args);
 }
 
-CpuBufferView CpuDevice::resolveBuffer(const std::string& name) const {
-    auto it = buffers_.find(name);
-    if (it == buffers_.end()) {
+CpuBufferView CpuDevicePlan::resolveBuffer(const GraphBuffer& buffer) const {
+    const std::string key = scopedBufferKey(buffer.scopeId(), buffer.name());
+    auto it = device_.buffers_.find(key);
+    if (it == device_.buffers_.end()) {
         throw std::runtime_error(
-            "CpuDevice: buffer '" + name + "' not found; "
+            "CpuDevice: buffer '" + buffer.name() + "' not found; "
             "did you forget to call setInputBuffer()?");
     }
     return CpuBufferView{
@@ -324,8 +795,8 @@ CpuBufferView CpuDevice::resolveBuffer(const std::string& name) const {
     };
 }
 
-std::vector<uint8_t>& CpuDevice::ensureBuffer(const std::string& name, size_t sizeBytes) {
-    auto& buf = buffers_[name];
+std::vector<uint8_t>& CpuDevicePlan::ensureBuffer(const GraphBuffer& buffer, size_t sizeBytes) {
+    auto& buf = device_.buffers_[scopedBufferKey(buffer.scopeId(), buffer.name())];
     if (buf.size() < sizeBytes) {
         buf.resize(sizeBytes);
     }

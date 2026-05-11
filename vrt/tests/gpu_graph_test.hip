@@ -48,7 +48,7 @@
 #include <vrt/graph/node/io_map.hpp>
 #include <vrt/graph/node/io_type_map.hpp>
 #include <vrt/graph/node/kernel_descriptor.hpp>
-#include <vrt/graph/node/node.hpp>
+#include <vrt/graph/node/compiled_node.hpp>
 
 using namespace vrt::graph;
 
@@ -127,6 +127,25 @@ static GpuKernelBinding makeBinding(const void* func, std::vector<std::string> p
     return b;
 }
 
+class CpuAddKernel : public CpuKernel {
+   public:
+    const std::string& name() const override { return name_; }
+    const IOTypeMap& ioTypeMap() const override { return ioType_; }
+
+    void call(const CpuKernelArgs& args) override {
+        auto in  = args.buffer("in").as<const float>();
+        auto out = args.buffer("out").as<float>();
+        auto n   = args.buffer("in").sizeBytes / sizeof(float);
+        for (size_t i = 0; i < n; ++i) {
+            out[i] = in[i] + 10.0f;
+        }
+    }
+
+   private:
+    std::string name_ = "cpu_add";
+    IOTypeMap   ioType_;
+};
+
 // ---------------------------------------------------------------------------
 // Test: Single GPU kernel (vector add)
 // ---------------------------------------------------------------------------
@@ -158,7 +177,7 @@ TEST(GpuGraphTest, SingleGpuKernel) {
     gpu->setInputBuffer("a", a.data(), a.size() * sizeof(float));
     gpu->setInputBuffer("b", b.data(), b.size() * sizeof(float));
 
-    g.run();
+    g.compile(); g.run();
 
     // Read output
     std::vector<float> c(4);
@@ -224,7 +243,7 @@ TEST(GpuGraphTest, GpuPipeline) {
     gpu->setInputBuffer("a", a.data(), a.size() * sizeof(float));
     gpu->setInputBuffer("b", b.data(), b.size() * sizeof(float));
 
-    g.run();
+    g.compile(); g.run();
 
     // Expected: -((a + b) * 2) = {-22, -44, -66, -88}
     std::vector<float> result(4);
@@ -245,14 +264,7 @@ TEST(GpuGraphTest, CpuToGpuCrossDevice) {
     auto gpu = std::make_shared<GpuDevice>("gpu:0", 0);
 
     // CPU kernel: add 10 to each element
-    cpu->registerKernel("cpu_add", [](const CpuKernelArgs& args) {
-        auto in  = args.buffer("in").as<const float>();
-        auto out = args.buffer("out").as<float>();
-        auto n   = args.buffer("in").sizeBytes / sizeof(float);
-        for (size_t i = 0; i < n; ++i) {
-            out[i] = in[i] + 10.0f;
-        }
-    });
+    cpu->registerKernel(std::make_shared<CpuAddKernel>());
 
     // GPU kernel: double each element
     gpu->registerKernel("gpu_dbl", makeBinding(
@@ -286,7 +298,7 @@ TEST(GpuGraphTest, CpuToGpuCrossDevice) {
     std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f};
     cpu->setInputBuffer("input", data.data(), data.size() * sizeof(float));
 
-    g.run();
+    g.compile(); g.run();
 
     // Expected: (x + 10) * 2 = {22, 24, 26, 28}
     std::vector<float> result(4);
@@ -361,7 +373,7 @@ TEST(GpuGraphTest, GpuDiamondDag) {
     std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f};
     gpu->setInputBuffer("input", data.data(), data.size() * sizeof(float));
 
-    g.run();
+    g.compile(); g.run();
 
     // split:  left = x+1 = {2,3,4,5},  right = x*10 = {10,20,30,40}
     // dbl:    left*2 = {4,6,8,10}
@@ -399,5 +411,5 @@ TEST(GpuGraphTest, MissingKernelThrows) {
     std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f};
     gpu->setInputBuffer("input", data.data(), data.size() * sizeof(float));
 
-    EXPECT_THROW(g.run(), std::runtime_error);
+    EXPECT_THROW(g.compile(), std::runtime_error);
 }

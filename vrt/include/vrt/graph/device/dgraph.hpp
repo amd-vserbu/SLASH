@@ -24,9 +24,12 @@
  *
  * A DGraph is the output of the compilation step for a single device.  It
  * contains:
- *  - The ordered list of `Node`s assigned to that device. Each `Node` is a
- *    `std::variant<KernelNode, BridgeOpNode>`; bridge-synthesised ops are
- *    spliced inline among the user kernels by the compiler.
+ *  - The ordered list of `CompiledNode`s assigned to that device.
+ *    Bridge-synthesised ops are spliced inline among compiled kernels by the
+ *    compiler.
+ *  - Optional child DGraph groups owned by parent-level compiled control nodes.
+ *    Device runtimes use these groups to execute nested loop bodies and
+ *    conditional branches once structured control-flow execution is enabled.
  *  - A pointer to the IDevice responsible for executing the subgraph.
  *
  * DGraph is an internal compiler artifact; it is not part of the user-facing API.
@@ -41,9 +44,23 @@
 #include <vector>
 
 #include <vrt/graph/device/device.hpp>
-#include <vrt/graph/node/node.hpp>
+#include <vrt/graph/node/compiled_node.hpp>
 
 namespace vrt::graph {
+
+struct DGraph;
+
+enum class DGraphChildRole {
+    LoopBody,
+    ConditionalThen,
+    ConditionalElse,
+};
+
+struct DGraphChild {
+    std::string parentNodeId;
+    DGraphChildRole role = DGraphChildRole::LoopBody;
+    std::vector<std::shared_ptr<DGraph>> dgraphs;
+};
 
 struct DGraph {
     /**
@@ -52,9 +69,9 @@ struct DGraph {
     std::string deviceId;
 
     /**
-     * @brief Nodes assigned to this device, in topological order.
+    * @brief Compiled nodes assigned to this device, in topological order.
      */
-    std::vector<Node> nodes;
+    std::vector<CompiledNode> nodes;
 
     /**
      * @brief The device that will compile and execute this subgraph.
@@ -65,6 +82,11 @@ struct DGraph {
      * @brief Shared graph-owned scalar state visible to this device runtime.
      */
     std::shared_ptr<std::map<std::string, uint64_t>> scalarValues;
+
+    /**
+     * @brief Nested per-device DGraphs owned by compiled control nodes in this DGraph.
+     */
+    std::vector<DGraphChild> childDGraphs;
 };
 
 }  // namespace vrt::graph

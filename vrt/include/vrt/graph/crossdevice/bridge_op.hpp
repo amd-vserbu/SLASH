@@ -25,7 +25,7 @@
  * Bridges define their own concrete subclasses of IBridgeOp to hold whatever
  * state they need (semaphore handles, ring indices, HSA signals, CUDA events,
  * bounce buffer storage, …). The compiler treats each instance as opaque and
- * pairs the producer- and consumer-side BridgeOpNodes through pointer
+ * pairs the producer- and consumer-side CompiledBridgeOpNodes through pointer
  * identity of the shared `shared_ptr<IBridgeOp>` they hold.
  *
  * Subclasses may override `label()` to provide a short human-readable

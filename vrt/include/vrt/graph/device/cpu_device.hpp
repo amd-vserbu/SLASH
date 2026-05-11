@@ -22,10 +22,28 @@
  * @file cpu_device.hpp
  * @brief CpuDevice — naive single-core CPU implementation of IDevice.
  *
+ * Storage ownership
+ * -----------------
+ * `CpuDevice` is split between two concerns:
+ *   - The device itself owns *device-resident* state: the registered
+ *     `CpuKernel` table and the per-buffer-name byte storage. Both are
+ *     *shared across every plan compiled by this device*. Per-scope buffer
+ *     keys (`scope:N:name`) keep different graph regions from colliding;
+ *     two plans for the same Graph naturally observe the same logical
+ *     buffer when they reference the same scoped name, which mirrors
+ *     accelerator hardware (a buffer "lives on" the device).
+ *   - Each `CpuDevicePlan` owns its own *graph-level scalar map*, taken
+ *     from `DGraph::scalarValues` at compile time. Scalar state is owned
+ *     by the `Graph` and threaded into every device plan, so two plans
+ *     for the same Graph see one shared scalar map and two plans for
+ *     different Graphs see independent maps.
+ *
  * Execution model
  * ---------------
- * Nodes run sequentially on a worker thread in the topological order given
- * by DGraph::nodes. launch() returns immediately; wait() joins the worker.
+ * Nodes run sequentially on a worker thread owned by the compiled CPU plan.
+ * launch() returns immediately; wait() joins the worker. The plan also
+ * runs kernel dispatch, boundary copies, and control-flow execution; the
+ * device is consulted only as a kernel registry and a buffer store.
  *
  * Buffer management
  * -----------------
@@ -36,15 +54,16 @@
  *
  * Kernel dispatch
  * ---------------
- * CPU kernels are plain C++ functions (or lambdas) registered before launch()
- * via registerKernel().
+ * CPU kernels are CpuKernel objects registered before launch() via
+ * registerKernel(). Each kernel owns its name, typed IO signature, and call
+ * implementation.
  *
  * Cross-device synchronisation and data movement
  * ----------------------------------------------
  * CpuDevice has no built-in notion of either: the compiler synthesises
- * `BridgeOpNode` entries (each carrying an opaque `std::function<void()>`
+ * `CompiledBridgeOpNode` entries (each carrying an opaque `std::function<void()>`
  * closure produced by an `IBridge`) directly into the device's per-device
- * `DGraph::nodes`. CpuDevice walks the node list with `std::visit` and
+ * `DGraph::nodes`. CpuDevicePlan walks the node list with `std::visit` and
  * runs the closures inline. A typical CPU↔X bridge gives the CPU side a
  * closure that reads/writes the device's buffer storage via the public
  * setInputBuffer/getOutputBuffer/bufferSize accessors, capturing whatever
@@ -58,17 +77,17 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <unordered_map>
 #include <variant>
 #include <vector>
 
 #include <vrt/graph/device/device.hpp>
 #include <vrt/graph/device/dgraph.hpp>
 #include <vrt/graph/node/io_map.hpp>
-#include <vrt/graph/node/node.hpp>
+#include <vrt/graph/node/kernel_descriptor.hpp>
+#include <vrt/graph/node/compiled_node.hpp>
 #include <vrt/graph/core/types.hpp>
 
 namespace vrt::graph {
@@ -156,11 +175,34 @@ class CpuKernelArgs {
     std::map<std::string, uint64_t*>     writableScalars_;
 };
 
-using CpuKernelFn = std::function<void(const CpuKernelArgs&)>;
+// ---------------------------------------------------------------------------
+// CpuKernel — polymorphic CPU kernel implementation
+// ---------------------------------------------------------------------------
+
+class CpuKernel {
+   public:
+    virtual ~CpuKernel() = default;
+
+    /** @brief Logical kernel name used to match KernelDescriptor::name. */
+    virtual const std::string& name() const = 0;
+
+    /** @brief Typed I/O signature for this CPU kernel. */
+    virtual const IOTypeMap& ioTypeMap() const = 0;
+
+    /** @brief Execute one graph node invocation. */
+    virtual void call(const CpuKernelArgs& args) = 0;
+
+    /** @brief Convenience descriptor for Graph::addNode(). */
+    KernelDescriptor descriptor() const {
+        return KernelDescriptor{name(), DeviceType::CPU, std::nullopt, ioTypeMap()};
+    }
+};
 
 // ---------------------------------------------------------------------------
 // CpuDevice
 // ---------------------------------------------------------------------------
+
+class CpuDevicePlan;
 
 class CpuDevice : public IDevice {
    public:
@@ -176,7 +218,7 @@ class CpuDevice : public IDevice {
     /**
      * @brief Register a CPU kernel implementation.
      */
-    void registerKernel(std::string kernelName, CpuKernelFn fn);
+    void registerKernel(std::shared_ptr<CpuKernel> kernel);
 
     // --- Buffer accessors (also used by bridges) ---
 
@@ -204,40 +246,14 @@ class CpuDevice : public IDevice {
     DeviceType  type() const override { return DeviceType::CPU; }
     std::string id()   const override { return id_; }
 
-    void compile(const DGraph& dg) override;
-
-    void launch() override;
-    void wait() override;
+    std::unique_ptr<IDevicePlan> compilePlan(const DGraph& dg) override;
 
    private:
-    enum class NodeKind { Kernel, ProducerOp, ConsumerOp };
-
-    struct NodeRuntime {
-        std::string                id;
-        NodeKind                   kind;
-        size_t                     initialUnmet = 0;
-        std::vector<size_t>        successors;
-        // Kernel payload (only meaningful when kind == Kernel)
-        KernelNode                 kernel;
-        // Op payloads (only meaningful when kind != Kernel)
-        std::function<bool()>      tryReady;
-        std::function<void()>      action;
-    };
-
-    void executeKernel(const KernelNode& node);
-
-    CpuBufferView resolveBuffer(const std::string& name) const;
-    std::vector<uint8_t>& ensureBuffer(const std::string& name, size_t sizeBytes);
+    friend class CpuDevicePlan;
 
     std::string                                  id_;
-    std::map<std::string, CpuKernelFn>           kernels_;
+    std::map<std::string, std::shared_ptr<CpuKernel>> kernels_;
     std::map<std::string, std::vector<uint8_t>>  buffers_;
-    std::shared_ptr<std::map<std::string, uint64_t>> scalarStore_ =
-        std::make_shared<std::map<std::string, uint64_t>>();
-
-    std::vector<NodeRuntime>                     runtime_;
-    std::unordered_map<std::string, size_t>      idToIdx_;
-    std::thread                                  worker_;
 };
 
 }  // namespace vrt::graph

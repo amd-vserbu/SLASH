@@ -20,10 +20,10 @@
 
 /**
  * @file render_demo/main.cpp
- * @brief Demo: build a multi-device pipeline (CPU + 2× MockCpu), run it, and
- *        write the rendered Graph + per-device DGraphs as Graphviz `.dot`
- *        files. Visualise the produced files with e.g. `dot`, `xdot`, or any
- *        Graphviz-compatible viewer.
+ * @brief Demo: build a multi-device pipeline with CPU/mock-CPU control flow,
+ *        run it, and write the rendered Graph + per-device DGraphs as Graphviz
+ *        `.dot` files. Visualise the produced files with e.g. `dot`, `xdot`,
+ *        or any Graphviz-compatible viewer.
  */
 
 #include <algorithm>
@@ -54,7 +54,7 @@
 #include <vrt/graph/node/io_map.hpp>
 #include <vrt/graph/node/io_type_map.hpp>
 #include <vrt/graph/node/kernel_descriptor.hpp>
-#include <vrt/graph/node/node.hpp>
+#include <vrt/graph/node/compiled_node.hpp>
 #include <vrt/graph/render/dot.hpp>
 
 using namespace vrt::graph;
@@ -64,17 +64,16 @@ using namespace vrt::graph;
 // ============================================================================
 
 class MockCpuDevice : public IDevice {
-   public:
-    using KernelFn = std::function<void(const CpuKernelArgs&)>;
+    class Plan;
 
+   public:
     explicit MockCpuDevice(std::string id) : id_(std::move(id)) {}
 
-    ~MockCpuDevice() override {
-        if (worker_.joinable()) worker_.join();
-    }
+    ~MockCpuDevice() override = default;
 
-    void registerKernel(std::string name, KernelFn fn) {
-        kernels_[std::move(name)] = std::move(fn);
+    void registerKernel(std::shared_ptr<CpuKernel> kernel) {
+        if (!kernel) throw std::invalid_argument("MockCpu: kernel must not be null");
+        kernels_[kernel->name()] = std::move(kernel);
     }
 
     void setInputBuffer(const std::string& n, const void* d, size_t s) {
@@ -95,75 +94,123 @@ class MockCpuDevice : public IDevice {
     DeviceType  type() const override { return DeviceType::MOCK_CPU; }
     std::string id()   const override { return id_; }
 
-    void compile(const DGraph& dg) override {
-        steps_.clear();
-        for (const Node& n : dg.nodes) {
-            std::visit(
-                [&](const auto& x) {
-                    using T = std::decay_t<decltype(x)>;
-                    if constexpr (std::is_same_v<T, KernelNode>) {
-                        steps_.push_back(KernelStep{x});
-                    } else if constexpr (std::is_same_v<T, BridgeOpNode>) {
-                        steps_.push_back(OpStep{x.tryReady, x.action});
-                    }
-                },
-                n);
-        }
-    }
-
-    void launch() override {
-        if (worker_.joinable()) worker_.join();
-        worker_ = std::thread([this] {
-            for (auto& s : steps_) {
-                if (std::holds_alternative<KernelStep>(s)) {
-                    execKernel(std::get<KernelStep>(s).node);
-                } else {
-                    const auto& op = std::get<OpStep>(s);
-                    while (!op.tryReady()) {}
-                    op.action();
-                }
-            }
-        });
-    }
-    void wait() override {
-        if (worker_.joinable()) worker_.join();
-    }
+    std::unique_ptr<IDevicePlan> compilePlan(const DGraph& dg) override;
 
    private:
     struct OpStep {
         std::function<bool()> tryReady;
         std::function<void()> action;
     };
-    struct KernelStep { KernelNode node; };
+    struct KernelStep { CompiledKernelNode node; };
     using Step = std::variant<OpStep, KernelStep>;
 
-    void execKernel(const KernelNode& node) {
+    class Plan : public IDevicePlan {
+       public:
+        Plan(MockCpuDevice& device, const DGraph& dg)
+            : device_(device) {
+            steps_.reserve(dg.nodes.size());
+            for (const CompiledNode& n : dg.nodes) {
+                std::visit(
+                    [&](const auto& x) {
+                        using T = std::decay_t<decltype(x)>;
+                        if constexpr (std::is_same_v<T, CompiledKernelNode>) {
+                            steps_.push_back(KernelStep{x});
+                        } else if constexpr (std::is_same_v<T, CompiledBridgeOpNode>) {
+                            steps_.push_back(OpStep{x.tryReady, x.action});
+                        } else {
+                            throw std::runtime_error(
+                                "MockCpu: compiled control/boundary nodes are not executable yet");
+                        }
+                    },
+                    n);
+            }
+        }
+
+        ~Plan() override { wait(); }
+
+        void launch() override {
+            if (worker_.joinable()) worker_.join();
+            worker_ = std::thread([this] {
+                for (auto& s : steps_) {
+                    if (std::holds_alternative<KernelStep>(s)) {
+                        device_.execKernel(std::get<KernelStep>(s).node);
+                    } else {
+                        const auto& op = std::get<OpStep>(s);
+                        while (!op.tryReady()) {}
+                        op.action();
+                    }
+                }
+            });
+        }
+
+        void wait() override {
+            if (worker_.joinable()) worker_.join();
+        }
+
+       private:
+        MockCpuDevice& device_;
+        std::vector<Step> steps_;
+        std::thread worker_;
+    };
+
+    void execKernel(const CompiledKernelNode& node) {
         auto it = kernels_.find(node.kernel.name);
         if (it == kernels_.end()) throw std::runtime_error("MockCpu: no kernel " + node.kernel.name);
 
         std::map<std::string, CpuBufferView> bv;
         size_t defSize = 0;
         for (const auto& [p, b] : node.ioMap.inputBuffers()) {
-            auto fit = buffers_.find(b.name());
-            if (fit == buffers_.end()) throw std::runtime_error("MockCpu: missing input " + b.name());
-            if (defSize == 0) defSize = fit->second.size();
-            bv[p] = CpuBufferView{fit->second.data(), fit->second.size(), b.type()};
+            CpuBufferView view = resolveBuffer(b);
+            view.elementType = b.type();
+            if (defSize == 0) defSize = view.sizeBytes;
+            bv[p] = view;
         }
         for (const auto& [p, b] : node.ioMap.outputBuffers()) {
-            auto& s = buffers_[b.name()];
-            if (s.size() < defSize) s.resize(defSize);
+            auto& s = ensureBuffer(b, defSize);
             bv[p] = CpuBufferView{s.data(), s.size(), b.type()};
         }
+        for (const auto& rw : node.ioMap.rwBuffers()) {
+            bv[rw.inPort] = resolveBuffer(rw.in);
+            bv[rw.inPort].elementType = rw.in.type();
+            auto& inputStorage = buffers_.at(bufferStorageKey(rw.in));
+            const std::string outKey = scopedBufferKey(rw.out.scopeId(), rw.out.name());
+            buffers_[outKey] = inputStorage;
+            bv[rw.outPort] = CpuBufferView{buffers_[outKey].data(), buffers_[outKey].size(),
+                                           rw.out.type()};
+        }
         CpuKernelArgs args(std::move(bv), {});
-        it->second(args);
+        it->second->call(args);
+    }
+
+    std::string bufferStorageKey(const GraphBuffer& buffer) const {
+        const std::string key = scopedBufferKey(buffer.scopeId(), buffer.name());
+        if (buffers_.count(key)) return key;
+        if (buffer.scopeId() == 0 && buffers_.count(buffer.name())) return buffer.name();
+        return key;
+    }
+
+    CpuBufferView resolveBuffer(const GraphBuffer& buffer) const {
+        const std::string key = bufferStorageKey(buffer);
+        auto it = buffers_.find(key);
+        if (it == buffers_.end()) throw std::runtime_error("MockCpu: missing input " + buffer.name());
+        return CpuBufferView{const_cast<void*>(static_cast<const void*>(it->second.data())),
+                             it->second.size(), buffer.type()};
+    }
+
+    std::vector<uint8_t>& ensureBuffer(const GraphBuffer& buffer, size_t sizeBytes) {
+        auto& buf = buffers_[scopedBufferKey(buffer.scopeId(), buffer.name())];
+        if (buf.size() < sizeBytes) buf.resize(sizeBytes);
+        return buf;
     }
 
     std::string                                  id_;
-    std::map<std::string, KernelFn>              kernels_;
+    std::map<std::string, std::shared_ptr<CpuKernel>> kernels_;
     std::map<std::string, std::vector<uint8_t>>  buffers_;
-    std::vector<Step>                            steps_;
-    std::thread                                  worker_;
 };
+
+std::unique_ptr<IDevicePlan> MockCpuDevice::compilePlan(const DGraph& dg) {
+    return std::make_unique<Plan>(*this, dg);
+}
 
 // ============================================================================
 // Bridge between any pair of cpu-like devices (CpuDevice + MockCpuDevice).
@@ -188,7 +235,7 @@ BridgeStepPair makeCpuLikeTransfer(SemaphorePool&     pool,
     op->pool = &pool;
     op->sem  = pool.allocate();
 
-    const std::string n = buffer.name();
+    const std::string n = scopedBufferKey(buffer.scopeId(), buffer.name());
     auto* sc = dynamic_cast<CpuDevice*>(&src);
     auto* sm = dynamic_cast<MockCpuDevice*>(&src);
     auto* dc = dynamic_cast<CpuDevice*>(&dst);
@@ -279,6 +326,12 @@ static void copyKernel(const CpuKernelArgs& a) {
     std::memcpy(out.data, in.data, std::min(in.sizeBytes, out.sizeBytes));
 }
 
+static void stageKernel(const CpuKernelArgs& a) {
+    const auto& in  = a.buffer("in");
+    const auto& out = a.buffer("stage");
+    std::memcpy(out.data, in.data, std::min(in.sizeBytes, out.sizeBytes));
+}
+
 // 2-in, 1-out: XOR-merge (just to exercise multi-input wiring)
 static void mergeKernel(const CpuKernelArgs& a) {
     const auto& a_buf = a.buffer("in_a");
@@ -291,6 +344,23 @@ static void mergeKernel(const CpuKernelArgs& a) {
     for (size_t i = 0; i < n; ++i) op[i] = ap[i] ^ bp[i];
 }
 
+class DemoCpuKernel : public CpuKernel {
+   public:
+    using Fn = std::function<void(const CpuKernelArgs&)>;
+
+    DemoCpuKernel(std::string name, Fn fn, IOTypeMap ioType)
+        : name_(std::move(name)), fn_(std::move(fn)), ioType_(std::move(ioType)) {}
+
+    const std::string& name() const override { return name_; }
+    const IOTypeMap& ioTypeMap() const override { return ioType_; }
+    void call(const CpuKernelArgs& args) override { fn_(args); }
+
+   private:
+    std::string name_;
+    Fn          fn_;
+    IOTypeMap   ioType_;
+};
+
 // ============================================================================
 // Helpers to build kernel descriptors with fixed I/O signatures
 // ============================================================================
@@ -302,10 +372,23 @@ static IOTypeMap io1in1out() {
     return io;
 }
 
+static IOTypeMap io1in1stage() {
+    IOTypeMap io;
+    io.inputBuffers.push_back({"in",    BufferType::U8});
+    io.outputBuffers.push_back({"stage", BufferType::U8});
+    return io;
+}
+
 static IOTypeMap io2in1out() {
     IOTypeMap io;
     io.inputBuffers.push_back({"in_a", BufferType::U8});
     io.inputBuffers.push_back({"in_b", BufferType::U8});
+    io.outputBuffers.push_back({"out", BufferType::U8});
+    return io;
+}
+
+static IOTypeMap io1out() {
+    IOTypeMap io;
     io.outputBuffers.push_back({"out", BufferType::U8});
     return io;
 }
@@ -328,28 +411,43 @@ int main(int argc, char** argv) {
 
     // --- Register kernels (all use copyKernel except merge) ---
 
-    auto regCpu  = [&](const std::string& n, auto fn) { cpu   ->registerKernel(n, fn); };
-    auto regA    = [&](const std::string& n, auto fn) { mock_a->registerKernel(n, fn); };
-    auto regB    = [&](const std::string& n, auto fn) { mock_b->registerKernel(n, fn); };
+    auto makeKernel = [](std::string n, DemoCpuKernel::Fn fn, IOTypeMap io) {
+        return std::make_shared<DemoCpuKernel>(std::move(n), std::move(fn), std::move(io));
+    };
+    auto regCpu = [&](std::string n, DemoCpuKernel::Fn fn, IOTypeMap io = io1in1out()) {
+        cpu->registerKernel(makeKernel(std::move(n), std::move(fn), std::move(io)));
+    };
+    auto regA = [&](std::string n, DemoCpuKernel::Fn fn, IOTypeMap io = io1in1out()) {
+        mock_a->registerKernel(makeKernel(std::move(n), std::move(fn), std::move(io)));
+    };
+    auto regB = [&](std::string n, DemoCpuKernel::Fn fn, IOTypeMap io = io1in1out()) {
+        mock_b->registerKernel(makeKernel(std::move(n), std::move(fn), std::move(io)));
+    };
 
     regCpu("ingest",     copyKernel);
     regCpu("normalize",  copyKernel);
     regCpu("enhanceA",   copyKernel);
     regCpu("postA",      copyKernel);
     regCpu("postB",      copyKernel);
-    regCpu("merge",      mergeKernel);
+    regCpu("merge",      mergeKernel, io2in1out());
     regCpu("encode",     copyKernel);
     regCpu("finalize",   copyKernel);
+    regCpu("loop_prepare", stageKernel, io1in1stage());
+    regCpu("condition_then_copy", copyKernel);
+    regCpu("condition_else_prepare", stageKernel, io1in1stage());
+    regCpu("control_sink", copyKernel);
 
     regA  ("filterA1",   copyKernel);
     regA  ("filterA2",   copyKernel);
     regA  ("sharpenA",   copyKernel);
     regA  ("featuresB",  copyKernel);  // bounces from mock_b to mock_a
+    regA  ("loop_refine_remote", copyKernel);
 
     regB  ("filterB1",   copyKernel);
     regB  ("detectB",    copyKernel);
     regB  ("denoiseA",   copyKernel);  // bounces from cpu to mock_b
     regB  ("classifyB",  copyKernel);
+    regB  ("condition_else_remote", copyKernel);
 
     // --- Build the graph ---
 
@@ -365,11 +463,12 @@ int main(int argc, char** argv) {
         [](IDevice& s, IDevice& d){ return std::make_shared<MockMockBridge>(s, d); });
 
     GraphBuffer raw = g.inputBuffer(BufferType::U8, "raw");
+    GraphScalar renderBranchFlag = g.globalScalar(ScalarType::I32, "render_branch_flag");
 
     GraphBuffer bIngest, bNorm,
                 bA1, bA2, bA3, bEnhA, bDenA, bPostA,
                 bB1, bDetB, bFeatB, bClsB, bPostB,
-                bMerged, bEnc, bFinal;
+                bMerged, bEnc, bFinal, bLoop, bConditional, bControlFinal;
 
     auto add1 = [&](std::string name, DeviceType dt, const std::string& did,
                     const GraphBuffer& in, GraphBuffer& out,
@@ -409,14 +508,102 @@ int main(int argc, char** argv) {
     // Merge + tail (cpu only); merge depends on both branches
     /*nMg =*/ add2("merge",    DeviceType::CPU, "cpu", bPostA, bPostB, bMerged);
     /*nEn =*/ add1("encode",   DeviceType::CPU, "cpu", bMerged, bEnc);
-    /*nFi =*/ add1("finalize", DeviceType::CPU, "cpu", bEnc,    bFinal,
-                    /*after=*/{nPostA, nPostB});
+    auto nFinalize = add1("finalize", DeviceType::CPU, "cpu", bEnc, bFinal,
+                          /*after=*/{nPostA, nPostB});
+
+    // Control-flow coverage for the rendered demo: a fixed loop imports the
+    // finalized CPU buffer, runs CPU -> mock-CPU work inside the body, then
+    // materializes the declared loop output back at CPU placement.
+    auto loopBody = g.rootRegion().createChild();
+    GraphBuffer loopInput = loopBody->inputBuffer(BufferType::U8, "loop_input");
+    std::string loopStart = loopBody->importFromParent(
+        std::vector<BufferBoundaryMapping>{{bFinal, loopInput}});
+
+    IOMap loopPrepareIo;
+    GraphBuffer loopCpuStage;
+    loopPrepareIo.bindInputBuffer("in", loopInput)
+                 .bindOutputBuffer("stage", BufferType::U8, loopCpuStage,
+                                   loopBody->scopeId());
+    loopBody->addKernel(kd("loop_prepare", DeviceType::CPU, io1in1stage()),
+                        std::move(loopPrepareIo), "cpu", {loopStart});
+
+    IOMap loopRemoteIo;
+    GraphBuffer loopRemoteOutput;
+    loopRemoteIo.bindInputBuffer("in", loopCpuStage)
+                .bindOutputBuffer("out", BufferType::U8, loopRemoteOutput,
+                                  loopBody->scopeId());
+    loopBody->addKernel(kd("loop_refine_remote", DeviceType::MOCK_CPU),
+                        std::move(loopRemoteIo), "mock_a");
+
+    LoopSpec loopSpec;
+    loopSpec.ioType = io1out();
+    loopSpec.ioMap.bindOutputBuffer("out", BufferType::U8, bLoop,
+                                    g.rootRegion().scopeId());
+    loopSpec.tripCount = LoopTripCount::constant<int32_t>(2);
+    loopSpec.body = loopBody;
+    loopSpec.outputPlacement.buffers["out"] = "cpu";
+    loopSpec.afterOps = {nFinalize};
+    std::string nLoop = g.addLoop(std::move(loopSpec));
+
+    // The conditional has a CPU-only selected branch and a CPU -> mock-CPU else
+    // branch so both authored branches and remote-output placement bridges show
+    // up in the DOT tree.
+    auto thenRegion = g.rootRegion().createChild();
+    GraphBuffer thenInput = thenRegion->inputBuffer(BufferType::U8, "then_input");
+    std::string thenStart = thenRegion->importFromParent(
+        std::vector<BufferBoundaryMapping>{{bLoop, thenInput}});
+    IOMap thenIo;
+    GraphBuffer thenOutput;
+    thenIo.bindInputBuffer("in", thenInput)
+          .bindOutputBuffer("out", BufferType::U8, thenOutput,
+                            thenRegion->scopeId());
+    thenRegion->addKernel(kd("condition_then_copy", DeviceType::CPU),
+                          std::move(thenIo), "cpu", {thenStart});
+
+    auto elseRegion = g.rootRegion().createChild();
+    GraphBuffer elseInput = elseRegion->inputBuffer(BufferType::U8, "else_input");
+    std::string elseStart = elseRegion->importFromParent(
+        std::vector<BufferBoundaryMapping>{{bLoop, elseInput}});
+    IOMap elsePrepareIo;
+    GraphBuffer elseCpuStage;
+    elsePrepareIo.bindInputBuffer("in", elseInput)
+                 .bindOutputBuffer("stage", BufferType::U8, elseCpuStage,
+                                   elseRegion->scopeId());
+    elseRegion->addKernel(kd("condition_else_prepare", DeviceType::CPU, io1in1stage()),
+                          std::move(elsePrepareIo), "cpu", {elseStart});
+    IOMap elseRemoteIo;
+    GraphBuffer elseOutput;
+    elseRemoteIo.bindInputBuffer("in", elseCpuStage)
+                .bindOutputBuffer("out", BufferType::U8, elseOutput,
+                                  elseRegion->scopeId());
+    elseRegion->addKernel(kd("condition_else_remote", DeviceType::MOCK_CPU),
+                          std::move(elseRemoteIo), "mock_b");
+
+    Condition renderCondition = Condition::compare(
+        CompareOp::EQ,
+        ConditionOperand::scalar(ScalarType::I32, renderBranchFlag.varName(),
+                                 renderBranchFlag.scopeId()),
+        ConditionOperand::constant<int32_t>(1));
+        ConditionalSpec conditionalSpec;
+        conditionalSpec.ioType = io1out();
+        conditionalSpec.ioMap.bindOutputBuffer("out", BufferType::U8, bConditional,
+                                       g.rootRegion().scopeId());
+        conditionalSpec.condition = std::move(renderCondition);
+        conditionalSpec.thenRegion = thenRegion;
+        conditionalSpec.elseRegion = elseRegion;
+        conditionalSpec.outputPlacement.buffers["out"] = "cpu";
+        conditionalSpec.afterOps = {nLoop};
+        std::string nConditional = g.addConditional(std::move(conditionalSpec));
+
+        add1("control_sink", DeviceType::CPU, "cpu", bConditional, bControlFinal,
+            {nConditional});
 
     // --- Run the pipeline (so the renderer can show the populated DGraphs) ---
 
     std::vector<uint8_t> data(64, 0xAA);
     cpu->setInputBuffer("raw", data.data(), data.size());
-    g.run();
+    g.setScalar<int32_t>("render_branch_flag", 1);
+    g.compile(); g.run();
 
     // --- Render: write full Graph + every per-device DGraph as .dot files ---
 
@@ -432,12 +619,46 @@ int main(int argc, char** argv) {
     render::writeToDotFile(g, graphPath.string());
     std::cout << "wrote " << graphPath << "\n";
 
+    auto sanitizeStem = [](std::string stem) {
+        for (char& c : stem) {
+            const bool keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                              (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (!keep) c = '_';
+        }
+        return stem;
+    };
+
+    auto childRoleName = [](DGraphChildRole role) {
+        switch (role) {
+            case DGraphChildRole::LoopBody:        return std::string{"loop_body"};
+            case DGraphChildRole::ConditionalThen: return std::string{"then"};
+            case DGraphChildRole::ConditionalElse: return std::string{"else"};
+        }
+        return std::string{"child"};
+    };
+
     std::vector<fs::path> dotFiles{graphPath};
-    for (const auto& dg : g.dgraphs()) {
-        const fs::path p = outDir / ("dgraph_" + dg.deviceId + ".dot");
+    std::function<void(const DGraph&, std::string)> writeDGraphTree =
+        [&](const DGraph& dg, std::string stem) {
+        const fs::path p = outDir / (sanitizeStem(std::move(stem)) + ".dot");
         render::writeToDotFile(dg, p.string());
         std::cout << "wrote " << p << "\n";
         dotFiles.push_back(p);
+
+        for (const auto& child : dg.childDGraphs) {
+            for (size_t i = 0; i < child.dgraphs.size(); ++i) {
+                if (!child.dgraphs[i]) continue;
+                writeDGraphTree(
+                    *child.dgraphs[i],
+                    p.stem().string() + "_" + child.parentNodeId + "_" +
+                        childRoleName(child.role) + "_" + std::to_string(i) + "_" +
+                        child.dgraphs[i]->deviceId);
+            }
+        }
+    };
+
+    for (const auto& dg : g.dgraphs()) {
+        writeDGraphTree(dg, "dgraph_" + dg.deviceId);
     }
 
     // If `dot` (Graphviz) is on PATH, also render PNGs alongside the .dot files.

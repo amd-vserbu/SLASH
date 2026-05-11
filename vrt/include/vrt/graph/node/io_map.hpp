@@ -87,13 +87,15 @@ class IOMap {
      * @param portName  Port name matching an outputBuffers entry in the IOTypeMap.
      * @param type      Element type of the produced buffer.
      * @param out       Receives the newly created GraphBuffer token.
+     * @param scopeId   Graph-region namespace for the produced token.
      */
-    IOMap& bindOutputBuffer(std::string portName, BufferType type, GraphBuffer& out) {
+    IOMap& bindOutputBuffer(std::string portName, BufferType type, GraphBuffer& out,
+                            uint64_t scopeId = 0) {
         if (outputBuffers_.count(portName)) {
             throw std::invalid_argument("bindOutputBuffer: port '" + portName + "' already bound");
         }
         std::string tokenName = nextTokenName(portName);
-        out = GraphBuffer::make(type, tokenName);
+        out = GraphBuffer::make(type, tokenName, scopeId);
         outputBuffers_.emplace(std::move(portName), out);
         return *this;
     }
@@ -109,9 +111,10 @@ class IOMap {
      * @param outPortName  Port name of the produced (output) side.
      * @param in           Existing token to consume.
      * @param out          Receives the newly created output token.
+     * @param scopeId      Graph-region namespace for the produced token.
      */
     IOMap& bindRWBuffer(std::string inPortName, std::string outPortName,
-                        GraphBuffer in, GraphBuffer& out) {
+                        GraphBuffer in, GraphBuffer& out, uint64_t scopeId = 0) {
         if (!in.valid()) {
             throw std::invalid_argument("bindRWBuffer: invalid (default-constructed) input GraphBuffer");
         }
@@ -124,7 +127,7 @@ class IOMap {
             }
         }
         std::string tokenName = nextTokenName(outPortName);
-        out = GraphBuffer::make(in.type(), tokenName);
+        out = GraphBuffer::make(in.type(), tokenName, scopeId);
         rwBuffers_.emplace_back(RWBinding{std::move(inPortName), std::move(outPortName),
                                           std::move(in), out});
         return *this;

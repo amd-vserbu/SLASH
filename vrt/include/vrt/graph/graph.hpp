@@ -25,27 +25,78 @@
  * Usage overview:
  *
  *  1. Register one IDevice per physical device.
- *  2. Declare graph-level input buffers with inputBuffer().
+ *  2. Declare graph-level input buffers with inputBuffer() and graph-global
+ *     mutable scalars with globalScalar().
  *  3. Add kernel nodes with addNode(), capturing output buffer tokens from IOMap.
- *  4. Call validate() to catch structural errors early (optional but recommended).
+ *  4. Call compile() to validate the structure and lower the graph into
+ *     per-device DGraphs and IDevicePlans.
  *  5. Call run() (blocking) or launch() + wait() (async).
  *
- * The Graph is compiled lazily on the first call to launch() or run().
- * Re-running a Graph after structural changes (addNode / registerBackend) resets
- * the compiled state and recompiles on the next launch.
+ * Compilation is explicit and required before execution: launch(), wait(), and
+ * run() throw if the graph has not been compiled. Authoring helpers (addNode,
+ * addLoop, addConditional, registerDevice, registerBridgeFactory, …)
+ * invalidate the compiled state, so re-running a Graph after structural
+ * changes requires another compile().
+ *
+ * Nested authoring (kernels, scalars, and buffers inside a loop body or a
+ * conditional branch) does NOT go through the `Graph` itself. Use the
+ * `GraphRegion` returned by `rootRegion().createChild()` (or by an inner
+ * region's `createChild()`) and call `addKernel()`, `inputBuffer()`,
+ * `scalar()`, `addLoop()`, `addConditional()`, etc. on it directly. The
+ * region pointer is then handed to `Graph::addLoop` / `Graph::addConditional`
+ * (or `GraphRegion::addLoop` / `GraphRegion::addConditional` for deeper
+ * nesting) so the compiler can wire it up as a child of the surrounding
+ * control-flow op.
+ *
+ * # CPU device invariant
+ *
+ * A Graph hosts at most one CPU-typed `IDevice` (see `DeviceType::CPU`).
+ * Production code obtains it from `Graph::withDefaults()`, which registers a
+ * canonical `CpuDevice` under the id `"cpu"`; users should not register their
+ * own `CpuDevice` on top of that. Heterogeneous host-side compute that wants
+ * its own placement domain (e.g. NUMA-affine workers, an accelerator-side
+ * helper CPU) should declare a separate `DeviceType` rather than a second
+ * CPU device.
+ *
+ * The compiler relies on this invariant to:
+ *   - host every control-flow op (loop / conditional) on the CPU, since the
+ *     CPU device is the only backend that owns control-flow execution today;
+ *   - route cross-device transfers through a CPU bounce buffer when no
+ *     direct `(srcType, dstType)` bridge factory is registered.
  *
  * @example
  * @code
- *   Graph g;
+ *   Graph g = Graph::withDefaults();
  *   g.registerDevice(std::make_shared<FpgaDevice>("fpga:0", device));
  *
- *   GraphBuffer raw = g.inputBuffer("raw");
+ *   GraphBuffer raw = g.inputBuffer(BufferType::F32, "raw");
  *
- *   IOMap io;
- *   GraphBuffer result;
- *   io.bindInputBuffer("in", raw).bindOutputBuffer("out", result);
+ *   IOMap rootIo;
+ *   GraphBuffer rootOut;
+ *   rootIo.bindInputBuffer("in", raw)
+ *         .bindOutputBuffer("out", BufferType::F32, rootOut);
+ *   g.addNode(rootKernel, std::move(rootIo), "fpga:0");
  *
- *   g.addNode(myKernel, io, "fpga:0");
+ *   // Nested authoring lives on the child region. The body cannot reference
+ *   // a parent-scope token directly; route it through an explicit start
+ *   // boundary so the compiler can prove the import.
+ *   auto body = g.rootRegion().createChild();
+ *   GraphBuffer bodyImported = body->inputBuffer(BufferType::F32, "imported");
+ *   body->importFromParent(
+ *       std::vector<BufferBoundaryMapping>{{rootOut, bodyImported}});
+ *
+ *   IOMap bodyIo;
+ *   GraphBuffer bodyOut;
+ *   bodyIo.bindInputBuffer("in", bodyImported)
+ *         .bindOutputBuffer("out", BufferType::F32, bodyOut, body->scopeId());
+ *   body->addKernel(bodyKernel, std::move(bodyIo), "fpga:0");
+ *
+ *   LoopSpec loop;
+ *   loop.tripCount = LoopTripCount::constant<int32_t>(4);
+ *   loop.body = body;
+ *   g.addLoop(std::move(loop));
+ *
+ *   g.compile();
  *   g.run();
  * @endcode
  */
@@ -54,21 +105,23 @@
 #define VRT_GRAPH_GRAPH_HPP
 
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include <vrt/graph/compiler.hpp>
+#include <vrt/graph/control/graph_region.hpp>
 #include <vrt/graph/crossdevice/bridge.hpp>
 #include <vrt/graph/device/device.hpp>
 #include <vrt/graph/device/dgraph.hpp>
 #include <vrt/graph/core/graph_buffer.hpp>
 #include <vrt/graph/node/io_map.hpp>
 #include <vrt/graph/node/kernel_descriptor.hpp>
-#include <vrt/graph/node/node.hpp>
 
 namespace vrt::graph {
 
@@ -100,19 +153,37 @@ class Graph {
      * @brief Register a device.
      *
      * Must be called before compile/run.  Multiple devices of different types
-     * and ids may be registered.  Registering a new device after compilation
-     * resets the compiled state.
+     * and ids may be registered, but a Graph may host **at most one** CPU-typed
+     * device. The CPU device is effectively a singleton owned by `Graph`:
+     * production code should obtain it via `Graph::withDefaults()` (which
+     * registers a canonical `CpuDevice` under the id `"cpu"`) and not call
+     * `registerDevice` with another `CpuDevice` afterwards. Host-side compute
+     * that wants its own placement domain (e.g. NUMA-affine workers) should
+     * declare a separate `DeviceType` instead of a second CPU device.
+     *
+     * Registering a new device after compilation resets the compiled state.
      *
      * @param device  Shared-ownership device instance.
-     * @throws std::invalid_argument  If a device with the same id is already registered.
+     * @throws std::invalid_argument  If a device with the same id is already
+     *                                registered, or if a second CPU-typed
+     *                                device is registered.
      */
     void registerDevice(std::shared_ptr<IDevice> device) {
         const std::string did = device->id();
         if (devices_.count(did)) {
             throw std::invalid_argument("Graph::registerDevice: duplicate device id '" + did + "'");
         }
+        if (device->type() == DeviceType::CPU) {
+            for (const auto& [existingId, existing] : devices_) {
+                if (existing->type() == DeviceType::CPU) {
+                    throw std::invalid_argument(
+                        "Graph::registerDevice: a CPU device is already registered ('" +
+                        existingId + "'); only one CPU-typed device is allowed");
+                }
+            }
+        }
         devices_[did] = std::move(device);
-        compiled_ = false;
+        invalidateCompiledState();
     }
 
     /**
@@ -145,25 +216,26 @@ class Graph {
                 "Graph::registerBridgeFactory: duplicate factory for device-type pair");
         }
         bridgeFactories_[key] = std::move(factory);
-        compiled_ = false;
+        invalidateCompiledState();
     }
 
     /**
      * @brief Look up (or lazily create) the bridge instance handling
      *        transfers from device id @p srcDevId to @p dstDevId.
      *
-     * The instance is cached; subsequent calls with the same pair return
-     * the same `IBridge`.
+     * Returns @c nullptr when no factory is registered for the underlying
+     * device-type pair (callers that need a fall-back path inspect the
+     * pointer rather than catching an exception). The instance is cached;
+     * subsequent calls with the same pair return the same `IBridge*`.
      *
-     * @throws std::runtime_error If no factory is registered for the
-     *         underlying device-type pair, or if either device id is
-     *         unknown.
+     * @throws std::runtime_error If either device id is unknown, or the
+     *         registered factory itself returns null.
      */
-    IBridge& bridgeFor(const std::string& srcDevId,
+    IBridge* bridgeFor(const std::string& srcDevId,
                        const std::string& dstDevId) {
         auto cacheKey = std::make_pair(srcDevId, dstDevId);
         auto it = bridgeInstances_.find(cacheKey);
-        if (it != bridgeInstances_.end()) return *it->second;
+        if (it != bridgeInstances_.end()) return it->second.get();
 
         auto sIt = devices_.find(srcDevId);
         auto dIt = devices_.find(dstDevId);
@@ -179,11 +251,7 @@ class Graph {
         auto typeKey = std::make_pair(sIt->second->type(), dIt->second->type());
         auto fIt = bridgeFactories_.find(typeKey);
         if (fIt == bridgeFactories_.end()) {
-            throw std::runtime_error(
-                "Graph::bridgeFor: no bridge factory registered for {" +
-                std::string(deviceTypeName(typeKey.first)) + ", " +
-                std::string(deviceTypeName(typeKey.second)) +
-                "} (needed for transfer from '" + srcDevId + "' to '" + dstDevId + "')");
+            return nullptr;  // No factory for this device-type pair.
         }
 
         auto inst = fIt->second(*sIt->second, *dIt->second);
@@ -192,9 +260,9 @@ class Graph {
                 "Graph::bridgeFor: factory returned null for '" + srcDevId +
                 "' -> '" + dstDevId + "'");
         }
-        auto& ref = *inst;
+        auto* ptr = inst.get();
         bridgeInstances_[cacheKey] = std::move(inst);
-        return ref;
+        return ptr;
     }
 
     /**
@@ -222,14 +290,26 @@ class Graph {
     }
 
     /**
-     * @brief Returns the user-added kernel nodes in insertion order.
+     * @brief Returns a non-owning view of the root-region kernel operations
+     *        in insertion order.
      *
-     * Intended for inspection and visualisation; mutating the graph must go
-     * through addNode(). Users only ever construct KernelNodes; BridgeOpNodes
-     * are synthesised by the compiler into the per-device DGraphs (see
-     * dgraphs()).
+     * Intended for inspection and visualisation; structured control-flow ops
+     * are available through rootRegion(). The returned vector references
+     * `KernelOp`s held by `rootRegion()`'s op list, which is stable for the
+     * region's lifetime; the view is invalidated by any subsequent op append
+     * on the root region (`Graph::addNode`, `Graph::addLoop`,
+     * `Graph::addConditional`, …). Callers should grab the view once and
+     * stop using it before authoring more root-level ops.
      */
-    const std::vector<KernelNode>& nodes() const { return nodes_; }
+    std::vector<std::reference_wrapper<const KernelOp>> rootKernels() const {
+        std::vector<std::reference_wrapper<const KernelOp>> out;
+        for (const RegionOp& op : rootRegion_->ops()) {
+            if (const auto* kernel = std::get_if<KernelOp>(&op)) {
+                out.emplace_back(std::cref(*kernel));
+            }
+        }
+        return out;
+    }
 
     /**
      * @brief Returns the registered devices keyed by id().
@@ -239,19 +319,26 @@ class Graph {
     }
 
     /**
+     * @brief Returns the root authored region of the structured graph.
+     */
+    GraphRegion& rootRegion() { return *rootRegion_; }
+    const GraphRegion& rootRegion() const { return *rootRegion_; }
+
+    /**
      * @brief Returns the per-device subgraphs produced by the last compile.
      *
-     * Empty until launch()/run() (or any operation that triggers
-     * ensureCompiled()) has been called.
+     * Empty until compile() has been called and reset whenever the graph
+     * is re-authored or new devices/bridge factories are registered.
      */
     const std::vector<DGraph>& dgraphs() const { return dgraphs_; }
 
     /**
-     * @brief Returns the registered CpuDevice, preferring the canonical
-     *        `"cpu"` device when present.
+     * @brief Returns the registered CPU-typed device as a CpuDevice.
      *
-     * Returns nullptr if no registered device is both a CPU-typed device and
-     * a concrete CpuDevice instance.
+     * registerDevice() enforces that a Graph hosts at most one CPU-typed
+     * device, so this returns the singleton when present. Returns nullptr if
+     * no CPU device is registered or the registered CPU is not a CpuDevice
+     * instance.
      */
     std::shared_ptr<CpuDevice> cpuDevice() const;
 
@@ -261,37 +348,48 @@ class Graph {
      * The returned GraphScalar token may be bound as an input scalar or,
      * when the kernel IOTypeMap declares it as an output scalar, as a result
      * location written by the kernel.
+     *
+     * Delegates fully to the root region: the type is recorded on
+     * `rootRegion()` (via `GraphRegion::scalar()`) and the runtime value is
+     * initialised to zero in the shared scalar store. `globalScalar()` and a
+     * direct `rootRegion().scalar()` call are therefore interchangeable, and
+     * both populate the type table queried by the typed accessors below.
+     *
+     * Graph::setScalar / Graph::getScalar / Graph::setScalarBits /
+     * Graph::scalarBits address the **root scope only**: the `name` parameter
+     * is interpreted as a root-scope identifier and resolved against the same
+     * `scopedScalarKey` namespace used internally for runtime values, so
+     * scalars created on a non-root `GraphRegion::scalar()` are not reachable
+     * through these accessors.
      */
     GraphScalar globalScalar(ScalarType type, std::string name) {
-        if (scalarTypes_.count(name)) {
-            throw std::invalid_argument("Graph::globalScalar: name '" + name + "' already used");
-        }
-        scalarTypes_[name] = type;
-        (*scalarValues_)[name] = 0;
-        compiled_ = false;
-        return GraphScalar::globalVar(type, std::move(name));
+        GraphScalar token = rootRegion_->scalar(type, name);
+        const std::string key = scopedScalarKey(rootRegion_->scopeId(), name);
+        (*scalarValues_)[key] = 0;
+        invalidateCompiledState();
+        return token;
     }
 
     /**
      * @brief Set a declared graph-global scalar from raw bits.
      */
     void setScalarBits(const std::string& name, uint64_t bits) {
-        auto typeIt = scalarTypes_.find(name);
-        if (typeIt == scalarTypes_.end()) {
+        if (!rootRegion_->scalarType(name)) {
             throw std::out_of_range("Graph::setScalarBits: unknown scalar '" + name + "'");
         }
-        (*scalarValues_)[name] = bits;
+        const std::string key = scopedScalarKey(rootRegion_->scopeId(), name);
+        (*scalarValues_)[key] = bits;
     }
 
     /**
      * @brief Read a declared graph-global scalar as raw bits.
      */
     uint64_t scalarBits(const std::string& name) const {
-        auto typeIt = scalarTypes_.find(name);
-        if (typeIt == scalarTypes_.end()) {
+        if (!rootRegion_->scalarType(name)) {
             throw std::out_of_range("Graph::scalarBits: unknown scalar '" + name + "'");
         }
-        auto valueIt = scalarValues_->find(name);
+        const std::string key = scopedScalarKey(rootRegion_->scopeId(), name);
+        auto valueIt = scalarValues_->find(key);
         if (valueIt == scalarValues_->end()) {
             throw std::out_of_range("Graph::scalarBits: scalar '" + name + "' has no value");
         }
@@ -301,11 +399,11 @@ class Graph {
     template <class T>
     void setScalar(const std::string& name, T value) {
         static_assert(std::is_arithmetic_v<T>, "Graph::setScalar only supports arithmetic types");
-        auto typeIt = scalarTypes_.find(name);
-        if (typeIt == scalarTypes_.end()) {
+        auto declaredType = rootRegion_->scalarType(name);
+        if (!declaredType) {
             throw std::out_of_range("Graph::setScalar: unknown scalar '" + name + "'");
         }
-        if (typeIt->second != typeToScalarType<T>()) {
+        if (*declaredType != typeToScalarType<T>()) {
             throw std::invalid_argument(
                 "Graph::setScalar: type mismatch for scalar '" + name + "'");
         }
@@ -318,11 +416,11 @@ class Graph {
     template <class T>
     T getScalar(const std::string& name) const {
         static_assert(std::is_arithmetic_v<T>, "Graph::getScalar only supports arithmetic types");
-        auto typeIt = scalarTypes_.find(name);
-        if (typeIt == scalarTypes_.end()) {
+        auto declaredType = rootRegion_->scalarType(name);
+        if (!declaredType) {
             throw std::out_of_range("Graph::getScalar: unknown scalar '" + name + "'");
         }
-        if (typeIt->second != typeToScalarType<T>()) {
+        if (*declaredType != typeToScalarType<T>()) {
             throw std::invalid_argument(
                 "Graph::getScalar: type mismatch for scalar '" + name + "'");
         }
@@ -339,15 +437,16 @@ class Graph {
      * @param type  Element type of the buffer.
      * @param name  Logical name; must be unique among all graph buffers.
      * @return      A GraphBuffer token that may be passed to IOMap::bindInputBuffer().
-     * @throws std::invalid_argument  If the name is already taken or empty.
+     * @throws std::invalid_argument  If the name is already taken.
+     *
+     * Delegates name registration to the root region so that ::inputBuffer()
+     * calls directly on rootRegion() and ::inputBuffer() calls on Graph share
+     * the same name set.
      */
     GraphBuffer inputBuffer(BufferType type, std::string name) {
-        if (bufferNames_.count(name)) {
-            throw std::invalid_argument("Graph::inputBuffer: name '" + name + "' already used");
-        }
-        bufferNames_.insert(name);
-        compiled_ = false;
-        return GraphBuffer::make(type, std::move(name));
+        GraphBuffer token = rootRegion_->inputBuffer(type, std::move(name));
+        invalidateCompiledState();
+        return token;
     }
 
     /**
@@ -367,49 +466,63 @@ class Graph {
                         IOMap                    ioMap,
                         std::string              deviceHint = "",
                         std::vector<std::string> afterNodes = {}) {
-        std::string id = kernel.name + "_" + std::to_string(nodeCounter_++);
-        if (nodeById_.count(id)) {
-            throw std::invalid_argument("Graph::addNode: node id collision for '" + id + "'");
-        }
-        KernelNode n{std::move(id), std::move(kernel), std::move(deviceHint),
-                     std::move(ioMap), std::move(afterNodes)};
-        const std::string nodeId = n.id;
-        nodeById_[nodeId] = nodes_.size();
-        nodes_.push_back(std::move(n));
-        compiled_ = false;
+        const std::string nodeId = rootRegion_->addKernel(
+            std::move(kernel), std::move(ioMap), std::move(deviceHint), std::move(afterNodes));
+        invalidateCompiledState();
         return nodeId;
     }
 
-    // --- Validation & execution ---
+    std::string addLoop(LoopSpec spec) {
+        const std::string id = rootRegion_->addLoop(std::move(spec));
+        invalidateCompiledState();
+        return id;
+    }
+
+    std::string addConditional(ConditionalSpec spec) {
+        const std::string id = rootRegion_->addConditional(std::move(spec));
+        invalidateCompiledState();
+        return id;
+    }
+
+    // --- Compilation & execution ---
 
     /**
-     * @brief Validate the graph structure without compiling or executing.
+     * @brief Compile the authored graph into per-device DGraphs and IDevicePlans.
      *
-     * Checks:
-     *  - No cycles in the dependency graph.
-     *  - Every input buffer token references a declared buffer name.
-     *  - Every deviceHint matches a registered device (or is empty).
-     *  - No mandatory port in any IOTypeMap is left unbound (when IOTypeMap is
-     *    provided; binding completeness is enforced by the device at compile()).
+     * Compilation is the single, explicit validation step. After authoring
+     * (registerDevice, registerBridgeFactory, addNode, addLoop, addConditional,
+     * inputBuffer, globalScalar, …) the user must call compile() exactly once
+     * before launch() / wait() / run(). compile() validates the graph
+     * structure (root-scope scalar/buffer references, port bindings, scopes,
+     * cycles, bridge factory coverage) and lowers it into per-device DGraphs
+     * and IDevicePlans.
      *
-     * @throws std::runtime_error  On any structural violation, with a descriptive message.
+     * Calling compile() again rebuilds from scratch. Authoring helpers and
+     * registerDevice / registerBridgeFactory invalidate the compiled state, so
+     * a fresh compile() is required after any structural mutation.
+     *
+     * @throws std::runtime_error  On any structural violation; see
+     *                             GraphCompiler::compile for details.
      */
-    void validate() {
-        validateDeclaredScalars();
-        // Cycle detection and basic consistency — delegate to compiler logic.
-        // Full port-binding validation is backend-specific and deferred to compile().
+    void compile() {
         GraphCompiler compiler;
-        auto lookup = [this](const std::string& s, const std::string& d) -> IBridge& {
+        auto lookup = [this](const std::string& s, const std::string& d) -> IBridge* {
             return this->bridgeFor(s, d);
         };
-        compiler.compile(nodes_, devices_, lookup, scalarValues_);  // throws on structural errors
-        // If compile() succeeds we discard the result; this is a dry-run.
+        plans_.clear();
+        dgraphs_ = compiler.compile(rootRegion(), devices_, bridgeFactories_,
+                                    lookup, scalarValues_);
+        plans_.reserve(dgraphs_.size());
+        for (const auto& dg : dgraphs_) {
+            plans_.push_back(dg.device->compilePlan(dg));
+        }
+        compiled_ = true;
     }
 
     /**
-     * @brief Compile (if needed) and execute synchronously.
+     * @brief Execute synchronously. Equivalent to launch() followed by wait().
      *
-     * Equivalent to calling launch() followed immediately by wait().
+     * Requires a prior call to compile(). Throws if the graph is not compiled.
      */
     void run() {
         launch();
@@ -417,69 +530,43 @@ class Graph {
     }
 
     /**
-     * @brief Compile (if needed) and start asynchronous execution.
+     * @brief Start asynchronous execution on every device.
      *
-     * Returns as soon as all devices have been started.  Call wait() to block
-     * until all devices complete.
-     *
-     * @throws std::runtime_error  If the graph is empty or has no registered devices.
+     * Requires a prior call to compile(). Throws if the graph is not compiled.
+     * Returns as soon as all device plans have been started; call wait() to
+     * block until they all complete.
      */
     void launch() {
-        ensureCompiled();
-        for (auto& dg : dgraphs_) {
-            dg.device->launch();
+        requireCompiled("launch");
+        for (auto& plan : plans_) {
+            plan->launch();
         }
     }
 
     /**
-     * @brief Wait for all devices to complete.
+     * @brief Wait for every device plan started by launch() to complete.
      *
-     * Must be called after launch().  Blocks until every IDevice::wait()
-     * returns.
+     * Requires a prior call to compile(). Throws if the graph is not compiled.
      */
     void wait() {
-        for (auto& dg : dgraphs_) {
-            dg.device->wait();
+        requireCompiled("wait");
+        for (auto& plan : plans_) {
+            plan->wait();
         }
     }
 
    private:
-    void ensureCompiled() {
-        if (compiled_) return;
-        if (nodes_.empty()) {
-            throw std::runtime_error("Graph::launch: graph has no nodes");
-        }
-        if (devices_.empty()) {
-            throw std::runtime_error("Graph::launch: no devices registered");
-        }
-        validateDeclaredScalars();
-        validateBridges();
-        GraphCompiler compiler;
-        auto lookup = [this](const std::string& s, const std::string& d) -> IBridge& {
-            return this->bridgeFor(s, d);
-        };
-        dgraphs_ = compiler.compile(nodes_, devices_, lookup, scalarValues_);
-        compiled_ = true;
+    void invalidateCompiledState() {
+        plans_.clear();
+        dgraphs_.clear();
+        compiled_ = false;
     }
 
-    void validateDeclaredScalars() const;
-
-    /**
-     * @brief Verify that every non-CPU device type has a {CPU, Type} factory
-     *        in both directions.
-     */
-    void validateBridges() const {
-        for (const auto& [id, device] : devices_) {
-            DeviceType dt = device->type();
-            if (dt == DeviceType::CPU) continue;
-            if (!bridgeFactories_.count({DeviceType::CPU, dt}) ||
-                !bridgeFactories_.count({dt, DeviceType::CPU})) {
-                throw std::runtime_error(
-                    "Graph: device '" + id +
-                    "' requires {CPU, " + deviceTypeName(dt) +
-                    "} and {" + deviceTypeName(dt) +
-                    ", CPU} bridge factories, but at least one is missing");
-            }
+    void requireCompiled(const char* method) const {
+        if (!compiled_) {
+            throw std::runtime_error(
+                std::string("Graph::") + method +
+                ": graph has not been compiled; call compile() first");
         }
     }
 
@@ -493,20 +580,18 @@ class Graph {
         return "unknown";
     }
 
-    std::vector<KernelNode>                                   nodes_;
-    std::map<std::string, size_t>                             nodeById_;    // id → index in nodes_
+    std::shared_ptr<GraphRegion>                              rootRegion_ =
+        GraphRegion::createRoot();
     std::map<std::string, std::shared_ptr<IDevice>>           devices_;    // device-id → device
     std::map<std::pair<DeviceType, DeviceType>, BridgeFactory> bridgeFactories_;
     std::map<std::pair<std::string, std::string>,
              std::shared_ptr<IBridge>>                        bridgeInstances_;
-    std::set<std::string>                                     bufferNames_; // declared buffer names
-    std::map<std::string, ScalarType>                         scalarTypes_;
     std::shared_ptr<std::map<std::string, uint64_t>>          scalarValues_ =
         std::make_shared<std::map<std::string, uint64_t>>();
 
-    std::vector<DGraph> dgraphs_;   // populated by ensureCompiled()
+    std::vector<DGraph> dgraphs_;   // populated by compile()
+    std::vector<std::unique_ptr<IDevicePlan>> plans_;
     bool                compiled_ = false;
-    uint32_t            nodeCounter_ = 0;
 };
 
 }  // namespace vrt::graph

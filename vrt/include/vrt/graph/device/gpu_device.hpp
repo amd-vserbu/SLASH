@@ -24,14 +24,14 @@
  *
  * Execution model
  * ---------------
- * Nodes are compiled into a HIP Graph (hipGraph_t) during compile().  Each
+ * Nodes are compiled into a HIP Graph (hipGraph_t) in a GpuDevicePlan. Each
  * kernel node becomes a hipGraphAddKernelNode.  Bridge-supplied opaque
- * closures (carried by `BridgeOpNode` entries in the per-device DGraph)
+ * closures (carried by `CompiledBridgeOpNode` entries in the per-device DGraph)
  * become hipGraphAddHostNode callbacks.
  *
- * The HIP Graph is instantiated once (hipGraphInstantiate) and launched via
- * hipGraphLaunch into a dedicated stream.  Repeated launch()/wait() cycles
- * reuse the instantiated executable graph.
+ * The HIP Graph is instantiated once per plan (hipGraphInstantiate) and
+ * launched via hipGraphLaunch into a dedicated stream. Repeated launch()/wait()
+ * cycles on the same plan reuse the instantiated executable graph.
  *
  * Buffer management
  * -----------------
@@ -47,7 +47,7 @@
  *
  * Kernel dispatch
  * ---------------
- * GPU kernels are registered before compile() via registerKernel().  Each
+ * GPU kernels are registered before compilePlan() via registerKernel(). Each
  * registration provides:
  *   - A __global__ function pointer
  *   - A paramOrder vector mapping port names to kernel parameter positions
@@ -61,7 +61,7 @@
  * ----------------------------
  * GpuDevice has no built-in sync primitives.  Bridges construct opaque
  * closures, returned to the compiler in a `BridgeStepPair` and spliced as
- * `BridgeOpNode` entries into this device's `DGraph::nodes`; the GpuDevice
+ * `CompiledBridgeOpNode` entries into this device's `DGraph::nodes`; the GpuDevice
  * translates each
  * closure into a HIP host-node callback so it runs in stream order.
  */
@@ -82,7 +82,7 @@
 #include <vrt/graph/device/device.hpp>
 #include <vrt/graph/device/dgraph.hpp>
 #include <vrt/graph/node/io_map.hpp>
-#include <vrt/graph/node/node.hpp>
+#include <vrt/graph/node/compiled_node.hpp>
 #include <vrt/graph/core/types.hpp>
 
 namespace vrt::graph {
@@ -204,30 +204,14 @@ class GpuDevice : public IDevice {
     DeviceType  type() const override { return DeviceType::GPU; }
     std::string id()   const override { return id_; }
 
-    void compile(const DGraph& dg) override;
-
-    void launch() override;
-    void wait() override;
+    std::unique_ptr<IDevicePlan> compilePlan(const DGraph& dg) override;
 
    private:
+    friend class GpuDevicePlan;
+
     // Device memory management
     void* ensureDeviceBuffer(const std::string& name, size_t sizeBytes);
     void  freeDeviceBuffers();
-    void  destroyHipGraph();
-
-    // Graph-building helpers — each returns the created HIP graph node so
-    // the caller can register it in `hipNodeById_` (or chain it as a dep
-    // for follow-up nodes such as a kernel that depends on a synthesised
-    // H2D copy).
-    hipGraphNode_t addKernelNode(const KernelNode& node,
-                                 const std::vector<hipGraphNode_t>& deps);
-    hipGraphNode_t addOpHostNode(std::function<bool()> tryReady,
-                                 std::function<void()> action,
-                                 const std::vector<hipGraphNode_t>& deps);
-    hipGraphNode_t addMemcpyH2DNode(const std::string& bufferName, size_t sizeBytes,
-                                    const std::vector<hipGraphNode_t>& deps);
-    hipGraphNode_t addMemcpyD2HNode(const std::string& bufferName, size_t sizeBytes,
-                                    const std::vector<hipGraphNode_t>& deps);
 
     std::string                                  id_;
     int                                          hipDeviceIdx_;
@@ -236,35 +220,7 @@ class GpuDevice : public IDevice {
     std::map<std::string, GpuKernelBinding>      kernels_;
     std::map<std::string, void*>                 deviceBuffers_;  // name → hipMalloc'd ptr
     std::map<std::string, size_t>                deviceBufferSizes_;
-
-    // HIP Graph objects
-    hipGraph_t      hipGraph_ = nullptr;
-    hipGraphExec_t  hipExec_  = nullptr;
     hipStream_t     stream_   = nullptr;
-
-    // Per-DGraph Node id → HIP graph node handle. Populated during
-    // compile() so subsequent nodes can resolve their `dependsOn` ids to
-    // real HIP handles. Cleared in destroyHipGraph().
-    std::map<std::string, hipGraphNode_t> hipNodeById_;
-
-    // Per-kernel parameter storage (kept alive for graph lifetime)
-    struct KernelParamStore {
-        std::vector<void*>    argPtrs;       // void** array passed to HIP
-        std::vector<uint64_t> scalarVals;    // scalar value storage
-        std::vector<void*>    devicePtrVals; // device pointer storage
-    };
-    std::vector<std::unique_ptr<KernelParamStore>> paramStores_;
-
-    // Host-callback data kept alive for graph lifetime (one per OpStep host node).
-    // Public so the free hipHost callback function in the .hip TU can reach it.
-   public:
-    struct HostCallbackData {
-        std::function<bool()> tryReady;
-        std::function<void()> action;
-    };
-
-   private:
-    std::vector<std::unique_ptr<HostCallbackData>> callbackDatas_;
 };
 
 }  // namespace vrt::graph

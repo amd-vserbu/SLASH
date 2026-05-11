@@ -25,8 +25,8 @@
  * Usage:
  * @code
  *   std::visit(overloaded {
- *       [](const KernelNode& k) { ... },
- *       [](const BridgeOpNode& b) { ... },
+ *       [](const CompiledKernelNode& k) { ... },
+ *       [](const CompiledBridgeOpNode& b) { ... },
  *   }, node);
  * @endcode
  */

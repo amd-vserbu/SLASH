@@ -22,12 +22,12 @@
  * @file graph_buffer.hpp
  * @brief GraphBuffer — typed, opaque buffer token used in graph construction.
  *
- * A GraphBuffer is a first-class value in the graph: a (name, element-type)
- * pair that the compiler resolves to a concrete, device-allocated buffer at
- * compile time.
+ * A GraphBuffer is a first-class value in the graph: a (scope, name,
+ * element-type) tuple that the compiler resolves to a concrete,
+ * device-allocated buffer at compile time.
  *
  * Tokens are minted via the public factory:
- *   GraphBuffer::make(BufferType, std::string)
+ *   GraphBuffer::make(BufferType, std::string, scopeId)
  *
  * In normal usage the factory is invoked indirectly through:
  *  - Graph::inputBuffer()         — graph-level inputs (no producer node)
@@ -40,6 +40,7 @@
 #ifndef VRT_GRAPH_CORE_GRAPH_BUFFER_HPP
 #define VRT_GRAPH_CORE_GRAPH_BUFFER_HPP
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -47,6 +48,10 @@
 #include <vrt/graph/core/types.hpp>
 
 namespace vrt::graph {
+
+inline std::string scopedBufferKey(uint64_t scopeId, const std::string& name) {
+    return "scope:" + std::to_string(scopeId) + ":" + name;
+}
 
 class GraphBuffer {
    public:
@@ -56,21 +61,27 @@ class GraphBuffer {
      * @brief Mint a new, valid buffer token.
      *
      * @param type  Element type of the buffer.
-     * @param name  Logical name (unique within its Graph).  Must be non-empty.
+     * @param name     Logical name (unique within its scope).  Must be non-empty.
+     * @param scopeId  Graph-region namespace that owns this token.
      * @throws std::invalid_argument if @p name is empty.
      */
-    static GraphBuffer make(BufferType type, std::string name) {
+    static GraphBuffer make(BufferType type, std::string name, uint64_t scopeId = 0) {
         if (name.empty()) {
             throw std::invalid_argument(
                 "GraphBuffer::make: name must not be empty");
         }
-        return GraphBuffer(type, std::move(name));
+        return GraphBuffer(type, std::move(name), scopeId);
     }
 
     /**
      * @brief Returns the logical name of this buffer (unique within its Graph).
      */
     const std::string& name() const { return name_; }
+
+    /**
+     * @brief Returns the graph-region namespace that owns this token.
+     */
+    uint64_t scopeId() const { return scopeId_; }
 
     /**
      * @brief Returns the element type of this buffer.
@@ -86,11 +97,12 @@ class GraphBuffer {
     bool valid() const { return !name_.empty(); }
 
    private:
-    GraphBuffer(BufferType type, std::string name)
-        : type_(type), name_(std::move(name)) {}
+    GraphBuffer(BufferType type, std::string name, uint64_t scopeId)
+        : type_(type), name_(std::move(name)), scopeId_(scopeId) {}
 
     BufferType  type_ = BufferType::U8;  // placeholder for default-constructed tokens
     std::string name_;
+    uint64_t    scopeId_ = 0;
 };
 
 }  // namespace vrt::graph

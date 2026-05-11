@@ -24,7 +24,8 @@
  *
  * A GraphScalar is either:
  *  - A compile-time constant (created via GraphScalar::constant()), or
- *  - A reference to a named global variable (created via GraphScalar::globalVar()).
+ *  - A reference to a named scalar variable in a graph-region scope
+ *    (created via GraphScalar::globalVar()).
  *
  * Values are stored as raw uint64_t bits; ScalarType governs their interpretation.
  * No templates are used to avoid metaprogramming complexity.
@@ -42,6 +43,10 @@
 #include <vrt/graph/core/types.hpp>
 
 namespace vrt::graph {
+
+inline std::string scopedScalarKey(uint64_t scopeId, const std::string& name) {
+    return "scope:" + std::to_string(scopeId) + ":" + name;
+}
 
 namespace detail {
 
@@ -70,7 +75,7 @@ class GraphScalar {
      * @param bits   Raw bit pattern of the value (e.g. reinterpret_cast a float to uint32_t).
      */
     static GraphScalar constantFromBits(ScalarType type, uint64_t bits) {
-        return GraphScalar(type, bits, "");
+        return GraphScalar(type, bits, "", 0);
     }
 
     template<class T>
@@ -86,13 +91,14 @@ class GraphScalar {
      * consumed by another node or read back by the host.
      *
      * @param type      Element type.
-     * @param varName   Name of the global variable (must be unique within the Graph).
+     * @param varName   Name of the scalar variable (must be unique within its scope).
+     * @param scopeId   Graph-region namespace that owns this scalar variable.
      */
-    static GraphScalar globalVar(ScalarType type, std::string varName) {
+    static GraphScalar globalVar(ScalarType type, std::string varName, uint64_t scopeId = 0) {
         if (varName.empty()) {
             throw std::invalid_argument("GraphScalar::globalVar: varName must not be empty");
         }
-        return GraphScalar(type, 0, std::move(varName));
+        return GraphScalar(type, 0, std::move(varName), scopeId);
     }
 
     /**
@@ -125,13 +131,21 @@ class GraphScalar {
         return varName_;
     }
 
+    /**
+     * @brief Returns the graph-region namespace that owns this scalar.
+     *
+     * Constants are scope-independent and return 0.
+     */
+    uint64_t scopeId() const { return scopeId_; }
+
    private:
-    GraphScalar(ScalarType type, uint64_t bits, std::string varName)
-        : type_(type), bits_(bits), varName_(std::move(varName)) {}
+    GraphScalar(ScalarType type, uint64_t bits, std::string varName, uint64_t scopeId)
+        : type_(type), bits_(bits), varName_(std::move(varName)), scopeId_(scopeId) {}
 
     ScalarType  type_;
     uint64_t    bits_;
     std::string varName_;
+    uint64_t    scopeId_ = 0;
 };
 
 }  // namespace vrt::graph

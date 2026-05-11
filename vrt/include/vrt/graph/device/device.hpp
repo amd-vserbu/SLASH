@@ -23,14 +23,15 @@
  * @brief IDevice — abstract execution interface for a single device instance.
  *
  * Cross-device synchronisation and data movement are realised as
- * BridgeOpNode entries in `DGraph::nodes` (synthesised by the compiler from
- * each registered IBridge); the device just walks the node list with
- * `std::visit`.
+ * CompiledBridgeOpNode entries in `DGraph::nodes` (synthesised by the compiler from
+ * each registered IBridge). Devices compile those DGraphs into explicit
+ * IDevicePlan objects so multiple plans can coexist for one device.
  */
 
 #ifndef VRT_GRAPH_DEVICE_DEVICE_HPP
 #define VRT_GRAPH_DEVICE_DEVICE_HPP
 
+#include <memory>
 #include <string>
 
 #include <vrt/graph/core/types.hpp>
@@ -38,6 +39,17 @@
 namespace vrt::graph {
 
 struct DGraph;
+
+class IDevicePlan {
+   public:
+    virtual ~IDevicePlan() = default;
+
+    /** @brief Start asynchronous execution of the compiled plan. */
+    virtual void launch() = 0;
+
+    /** @brief Block until the plan has completed. */
+    virtual void wait() = 0;
+};
 
 class IDevice {
    public:
@@ -49,24 +61,17 @@ class IDevice {
     /**
      * @brief Returns the unique device identifier, e.g. `"fpga:0"`.
      *
-     * Matched against `KernelNode::deviceHint` during compilation.
+     * Matched against authored kernel placement during compilation.
      */
     virtual std::string id() const = 0;
 
     /**
-     * @brief Compile the per-device subgraph.
+     * @brief Compile the per-device subgraph into an executable plan.
      *
-     * `dg.nodes` is an ordered list of `Node` variants (KernelNode +
-     * BridgeOpNode). The device walks the list with `std::visit` and
-     * arranges its native execution plan accordingly.
+     * `dg.nodes` is an ordered list of `CompiledNode` variants. The returned
+     * plan owns the device-specific compiled execution state.
      */
-    virtual void compile(const DGraph& dg) = 0;
-
-    /** @brief Start asynchronous execution of the compiled subgraph. */
-    virtual void launch() = 0;
-
-    /** @brief Block until this device's subgraph has completed. */
-    virtual void wait() = 0;
+    virtual std::unique_ptr<IDevicePlan> compilePlan(const DGraph& dg) = 0;
 };
 
 }  // namespace vrt::graph

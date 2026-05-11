@@ -25,7 +25,7 @@
  * Free functions in `vrt::graph::render` that convert a Graph (or one of its
  * compiled per-device DGraphs) into a Graphviz `.dot` source string.  Edges
  * are derived from IOMap data flow (input/output buffer tokens, RW pairs)
- * and explicit `Node::afterNodes` ordering constraints.
+ * and explicit authored `KernelOp::afterOps` ordering constraints.
  */
 
 #ifndef VRT_GRAPH_RENDER_DOT_HPP
@@ -43,9 +43,10 @@ namespace render {
 /**
  * @brief Render a full Graph as Graphviz DOT.
  *
- * Nodes are grouped per-device using `subgraph cluster_<id>` blocks.  Data
- * dependencies are drawn as solid edges; explicit `afterNodes` ordering is
- * drawn as dashed edges.
+ * Authored regions are rendered as nested clusters. Kernel nodes are grouped
+ * per-device inside their region; control-flow bodies and branches appear as
+ * child clusters. Data dependencies are drawn as solid edges; explicit
+ * `afterOps` ordering is drawn as dashed edges.
  */
 std::string renderToDot(const Graph& graph);
 
