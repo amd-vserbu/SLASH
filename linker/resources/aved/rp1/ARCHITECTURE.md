@@ -881,24 +881,68 @@ Host resets by asserting soft reset on GCQ (`RESET_INTERRUPT_CTRL[31]`) and wait
 
 ## H. Integration Points
 
-### VRT Runtime Changes (High-Level)
-- New `GraphBuilder` class that constructs node arrays with barrier allocation
-- `Kernel::call()` gains a `GraphBuilder` overload that adds KERNEL_DISPATCH nodes
-- `Buffer::sync()` adds DMA_COPY nodes
-- `GraphBuilder::loop()` / `GraphBuilder::cond()` emit LOOP / COND / RERUN nodes
-- `GraphBuilder::submit()` writes nodes + args to DDR, increments `graph_seq`, rings doorbell
-- Barrier bucket allocation handled automatically by GraphBuilder
-- Host-side CQ polling thread (or interrupt handler in driver)
+### VRT Runtime (Phase 1 — landed)
+
+The VRT side of the integration is built as three layered components in
+`vrt/{include,src}/vrt/graph/device/` (under namespace
+`vrt::graph` for the public surface and `vrt::graph::fpga` for the
+internal plumbing):
+
+| Layer | Header | Role |
+|-------|--------|------|
+| `Rp1BarWindow` | `device/fpga/rp1_bar_window.hpp` | Owns the `vrtd::BarFile` for BAR4. Each method brackets exactly one BAR access through `BarFile::getPtr<T>(Direction, offset)` so the dma-buf `SYNC_START` / `SYNC_END` contract is honoured. |
+| `Rp1Submitter` | `device/fpga/rp1_submitter.hpp` | Programs the control block on first use (`ensureReady`), stages a fully-realised `Rp1GraphImage`, bumps `graph_seq`, polls `graph_done_seq`. Knows nothing about graphs or kernels. |
+| `FpgaDevice : IDevice` | `device/fpga_device.hpp` | Lowers a `vrt::graph::DGraph` into an `Rp1GraphImage`. Walks the topologically-ordered `CompiledKernelNode`s, allocates one barrier bit per kernel in bucket 0 (bit 31 reserved for the sentinel), packs scalar args from each `IOMap` into a contiguous argument buffer, and appends a trailing `RP1_OP_SIGNAL` whose `await_mask` is the OR of every leaf kernel's set-bit. |
+
+Authoring stays in `vrt::graph::Graph` — there is no separate
+`GraphBuilder` type. The user calls `Graph::withDefaults()`,
+`registerDevice(std::make_shared<FpgaDevice>(...))`, then
+`addNode(KernelDescriptor{name, DeviceType::FPGA, ...}, IOMap{...},
+"fpga:0", afterNodes)`. Kernel names are resolved to R5 AXI-Lite base
+addresses through a user-supplied `FpgaKernelLocationLookup`. The
+canonical demonstration is `examples/rp1_bringup_vrt`, which is the
+direct VRT-graph port of the bringup C tool's `diamond` stage.
+
+Limitations of phase 1 (each will be addressed by a follow-up phase):
+
+- Only `CompiledKernelNode`s are honoured. Any `CompiledBridgeOpNode`,
+  `CompiledBoundaryNode`, `CompiledLoopNode`, or `CompiledConditionalNode`
+  causes `FpgaDevice::compilePlan()` to throw with a descriptive
+  diagnostic. Cross-device buffer transfers, structured control flow,
+  and graph-region boundaries are deferred.
+- Up to 31 kernels per graph (bucket-0 bits 0..30, bit 31 = sentinel).
+- Argument scalars must be `GraphScalar::constant(...)` from a phase-1
+  Graph; the compiler currently rejects global-variable scalar bindings
+  on non-CPU kernels at the front end. FpgaDevice does implement
+  deferred resolution and that path is exercised by direct DGraph
+  construction in `fpga_device_test`, ready for when the compiler
+  relaxes the restriction.
+- Buffer data movement is the user's problem: the existing
+  `CpuFpgaBridge` (`vrt/src/graph/crossdevice/cpu_fpga_bridge.cpp`)
+  still has FPGA-side TODOs. Phase 1 graphs operate on buffers the
+  user has pre-staged outside the graph (e.g. via libvrtdpp QDMA or
+  the existing host-side `vrt::Buffer`).
 
 ### Driver Changes
-- Map DDR control block region for host access (BAR or QDMA)
-- Expose GCQ doorbell via ioctl or mmap
-- CQ interrupt handler -> notify VRT of completions
+
+Phase 1 reuses the existing daemon path: vrtd hands out a BAR fd via
+`VRTD_REQ_GET_BAR_FD`, the libvrtdpp `vrtd::BarFile` wraps it, and
+`Rp1BarWindow` builds typed accessors on top. No new wire opcodes.
+
+Multi-tenant serialisation of `graph_seq` and an `irq_cq`-backed
+eventfd for completion (replacing the current poll loop) are tracked
+as future phases.
 
 ### Linker Changes
 - `project_gen.py`: emit kernel base address table for R5 address space
 - `tcl_gen.py`: generate RPU -> user region AXI path, address assignments
 - System map must include R5-visible kernel addresses alongside PCIe-visible ones
+
+For phase 1 the R5 addresses are hardcoded in the example (see
+`examples/rp1_bringup_vrt/rp1_bringup_vrt.cpp`); a future phase will
+auto-generate the `FpgaKernelLocationLookup` from `system_map.xml`
+using the documented formula
+`r5_addr = xml_addr - 0x0202'0000'0000 + 0x8800'0000`.
 
 ---
 

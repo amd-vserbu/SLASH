@@ -104,6 +104,7 @@ file(
   ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/graph/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/graph/device/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/graph/device/fpga/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/graph/crossdevice/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/graph/render/*.cpp
 )

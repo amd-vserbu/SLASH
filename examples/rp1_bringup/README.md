@@ -1,8 +1,18 @@
 # rp1_bringup
 
+> **Deprecated for the `diamond` stage.** The VRT-graph port at
+> [`../rp1_bringup_vrt/`](../rp1_bringup_vrt/) reproduces the four-kernel
+> diamond DAG on top of `vrt::graph::Graph` + `vrt::graph::FpgaDevice`
+> and is the canonical phase-1 regression test. Prefer it over the
+> `diamond` subcommand of this tool. The `dump`, `signal`, and `kernel`
+> subcommands are still useful as lower-level diagnostics and are kept
+> in tree. The whole tool will be deleted once `rp1_bringup_vrt` has
+> been validated on silicon.
+
 Temporary scaffolding for the first on-hardware tests of the RP1 graph
-processor. Will be deleted once libslash / VRT expose a real
-`GraphBuilder` API.
+processor. The `signal` / `kernel` subcommands remain the smallest
+possible way to validate firmware liveness and the AXI-Lite path
+without any VRT runtime in the picture.
 
 The tool submits tiny graphs to the RP1 firmware over BAR4 (the same
 BAR the existing `07_rp1_memcheck` uses) and polls `graph_done_seq` for
@@ -113,6 +123,61 @@ words of an unused `in` pointer, e.g.:
 If you'd rather pre-stage the args yourself over the user-region BAR
 before invoking this tool, leave the args off — `arg_count` will be 0
 and the firmware will only emit `ap_start`.
+
+### 4. `diamond` — Stage 2: four kernels, A → {B, C} → D
+
+```bash
+./build/rp1_bringup diamond /dev/slash_ctl0
+```
+
+Builds and submits
+
+```
+        A
+       / \
+      B   C        all four KERNEL_DISPATCH
+       \ /
+        D
+        |
+      SIGNAL       sentinel: writes 0xD1A1D0DD into slot 0
+```
+
+Pass iff the sentinel slot reads back `0xD1A1D0DD` and exactly 5 CQ
+entries were written (4 kernels + 1 signal). Validates, beyond what
+the single-kernel test does:
+
+- barrier AND — D waits for both B and C
+- parallel dispatch — B and C are in flight together at some point
+- the scanner chains multiple in-flight kernels through `check_inflight`
+
+The four R5 addresses + shared args are **hardcoded** at the top of
+`rp1_bringup.c`:
+
+```c
+#define DIAMOND_KERNEL_A_R5   0x88010000u
+#define DIAMOND_KERNEL_B_R5   0x88020000u
+#define DIAMOND_KERNEL_C_R5   0x88030000u
+#define DIAMOND_KERNEL_D_R5   0x88040000u
+static const uint32_t DIAMOND_ARGS[] = { 0u, 0u, 0u };
+```
+
+Edit those to match your bitstream, rebuild, re-run. All four kernels
+share the same `DIAMOND_ARGS` list, so this assumes four instances of a
+kernel with the same AXI-Lite signature (e.g. four `00_axilite/increment`
+instances with `size=0`). If your diamond needs heterogeneous args,
+duplicate the dispatch loop inside `cmd_diamond`.
+
+On failure the tool prints `cq_delta` (how many CQ entries the diamond
+produced) — this tells you exactly how far the graph got:
+
+| `cq_delta` | Where it stalled |
+|---|---|
+| 0 | A never started — re-check `dump`, and that DIAMOND_KERNEL_A_R5 responds |
+| 1 | A completed, B/C never returned ap_done — DIAMOND_KERNEL_B_R5 or _C_R5 is wrong |
+| 2 | A + one of {B,C} completed, the other stalled |
+| 3 | A + B + C done, D stalled — DIAMOND_KERNEL_D_R5 is wrong |
+| 4 | All four kernels completed, but the trailing SIGNAL didn't fire — barrier wiring or DDR write visibility bug |
+| 5 | PASS (you shouldn't see this in the failure path) |
 
 ## Diagnostics
 

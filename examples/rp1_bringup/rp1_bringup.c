@@ -67,6 +67,45 @@
 #define BRINGUP_CQ_SIZE      64u
 #define BRINGUP_MAX_ARGS     8
 
+/* =========================================================================
+ * DIAMOND TEST CONFIG — edit these to match your bitstream's kernels.
+ *
+ * Lay out four kernel instances at distinct R5 addresses + a shared
+ * arg list. The diamond subcommand dispatches them as
+ *
+ *     A → {B, C} → D → SIGNAL
+ *
+ * with bucket-0 barrier bits 0..4. All four kernels share the same
+ * arg list (DIAMOND_ARGS), so this assumes four instances of a kernel
+ * with the same AXI-Lite signature -- e.g. four `00_axilite/increment`
+ * instances with `size=0`. If you want different args per kernel,
+ * duplicate the dispatch block inside cmd_diamond and tweak.
+ *
+ * Find R5 addresses from system_map.xml:
+ *     r5_addr = xml_addr - 0x0202_0000_0000 + 0x8800_0000
+ * or by sweeping BAR0 for AXI-Lite slaves that respond with 0x4 (ap_idle).
+ * ====================================================================== */
+
+/* Match the four instances produced by the rp1_bringup_vrt vbin
+ * (examples/rp1_bringup_vrt/config.cfg has nk=bringup_kernel:4).  The
+ * linker places them at 64 KiB-aligned addresses in alphabetical
+ * instance order starting at host 0x0202_0000_0000, which converts to
+ * the R5 addresses below via
+ *     r5_addr = xml_addr - 0x0202_0000_0000 + 0x8800_0000
+ * Verify against the generated system_map.xml if you fork the kernel. */
+#define DIAMOND_KERNEL_A_R5   0x88000000u  /* bringup_kernel_0 */
+#define DIAMOND_KERNEL_B_R5   0x88010000u  /* bringup_kernel_1 */
+#define DIAMOND_KERNEL_C_R5   0x88020000u  /* bringup_kernel_2 */
+#define DIAMOND_KERNEL_D_R5   0x88030000u  /* bringup_kernel_3 */
+
+/* Written to each kernel at +0x10, +0x14, +0x18, ... before ap_start.
+ * Matches the bringup_kernel(size, in*) signature: size=0 + 64-bit
+ * NULL pointer. */
+static const uint32_t DIAMOND_ARGS[] = { 0u, 0u, 0u };
+
+#define DIAMOND_DONE_SLOT     0u
+#define DIAMOND_DONE_MAGIC    0xD1A1D0DDu
+
 /* -------------------------------------------------------------------------
  * Small utilities
  * ---------------------------------------------------------------------- */
@@ -414,6 +453,112 @@ static int cmd_kernel(volatile void *bar, uint32_t kernel_r5_addr,
 }
 
 /* -------------------------------------------------------------------------
+ * Subcommand: diamond
+ *
+ *   A → {B, C} → D → SIGNAL
+ *
+ * Four KERNEL_DISPATCH nodes laid out as a diamond DAG, gated by a
+ * trailing SIGNAL that writes DIAMOND_DONE_MAGIC into a known slot.
+ * Kernel addresses + shared args are hardcoded above — edit them to
+ * match your bitstream.
+ *
+ * Validates, beyond what the single-kernel test does:
+ *   - barrier AND (D waits for B *and* C)
+ *   - parallel dispatch (B and C in flight together at some point)
+ *   - the scanner can chain multiple in-flight kernels via check_inflight
+ * ---------------------------------------------------------------------- */
+
+static int cmd_diamond(volatile void *bar)
+{
+    volatile rp1_ctrl_t        *c      = get_ctrl(bar);
+    rp1_node_t                 *nodes  = get_nodes(bar);
+    uint32_t                   *argbuf = get_args(bar);
+    volatile rp1_signal_slot_t *sigs   = get_sigs(bar);
+
+    const size_t arg_count = sizeof(DIAMOND_ARGS) / sizeof(DIAMOND_ARGS[0]);
+
+    /* All four kernels read from the same shared arg block at offset 0. */
+    for (size_t i = 0; i < arg_count; i++) argbuf[i] = DIAMOND_ARGS[i];
+
+    bar_zero((volatile void *)&nodes[0], 5 * sizeof(rp1_node_t));
+
+    static const struct {
+        uint32_t r5;
+        uint8_t  await_bucket;  uint32_t await_mask;
+        uint8_t  set_bucket;    uint32_t set_mask;
+    } kdef[4] = {
+        { DIAMOND_KERNEL_A_R5, 0, 0x00, 0, 0x01 },  /* A */
+        { DIAMOND_KERNEL_B_R5, 0, 0x01, 0, 0x02 },  /* B: needs A */
+        { DIAMOND_KERNEL_C_R5, 0, 0x01, 0, 0x04 },  /* C: needs A */
+        { DIAMOND_KERNEL_D_R5, 0, 0x06, 0, 0x08 },  /* D: needs B and C */
+    };
+    for (size_t i = 0; i < 4; i++) {
+        node_set_header(&nodes[i], RP1_OP_KERNEL_DISPATCH,
+                        kdef[i].await_bucket, kdef[i].await_mask,
+                        kdef[i].set_bucket,   kdef[i].set_mask);
+        nodes[i].payload.kernel_dispatch.kernel_base_addr  = kdef[i].r5;
+        nodes[i].payload.kernel_dispatch.arg_buffer_offset = 0;
+        nodes[i].payload.kernel_dispatch.arg_count         = (uint16_t)arg_count;
+        nodes[i].payload.kernel_dispatch.ctrl_flags        = 0;
+        nodes[i].payload.kernel_dispatch.timeout_cycles    = 0;
+    }
+
+    /* Sentinel SIGNAL — fires after D completes; proves the full graph ran. */
+    node_set_header(&nodes[4], RP1_OP_SIGNAL,
+                    /* await */ 0, 0x08,
+                    /* set   */ 0, 0x10);
+    nodes[4].payload.signal.target_slot = DIAMOND_DONE_SLOT;
+    nodes[4].payload.signal.value       = DIAMOND_DONE_MAGIC;
+    nodes[4].payload.signal.operation   = RP1_SIGOP_SET;
+
+    sigs[DIAMOND_DONE_SLOT].value            = 0;
+    sigs[DIAMOND_DONE_SLOT].last_writer_node = 0;
+    sigs[DIAMOND_DONE_SLOT].flags            = 0;
+
+    program_ctrl(c, /* node_count */ 5);
+
+    const uint32_t prior_cq = c->cq_write_idx;
+    uint32_t want_seq = c->graph_done_seq + 1;
+    __sync_synchronize();
+    c->graph_seq = want_seq;
+    __sync_synchronize();
+
+    printf("diamond: submitted seq=%" PRIu32
+           " (A=0x%08x B=0x%08x C=0x%08x D=0x%08x), polling...\n",
+           want_seq,
+           DIAMOND_KERNEL_A_R5, DIAMOND_KERNEL_B_R5,
+           DIAMOND_KERNEL_C_R5, DIAMOND_KERNEL_D_R5);
+    if (wait_for_seq(c, want_seq) != 0) {
+        dump_ctrl(c);
+        return 1;
+    }
+
+    __sync_synchronize();
+    uint32_t done = sigs[DIAMOND_DONE_SLOT].value;
+    uint32_t cq_delta = c->cq_write_idx - prior_cq;
+
+    if (done != DIAMOND_DONE_MAGIC) {
+        fprintf(stderr,
+                "FAIL: sentinel slot %u = 0x%08" PRIx32
+                ", expected 0x%08" PRIx32 " (cq_delta=%u — check which kernel stalled)\n",
+                DIAMOND_DONE_SLOT, done, DIAMOND_DONE_MAGIC, cq_delta);
+        dump_ctrl(c);
+        return 1;
+    }
+    if (cq_delta != 5u) {
+        fprintf(stderr,
+                "FAIL: cq_delta=%u, expected 5 (4 kernels + sentinel signal)\n",
+                cq_delta);
+        dump_ctrl(c);
+        return 1;
+    }
+
+    printf("PASS: slot[%u]=0x%08x cq_delta=%u state=%s\n",
+           DIAMOND_DONE_SLOT, done, cq_delta, rp1_state_str(c->rp1_state));
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Driver
  * ---------------------------------------------------------------------- */
 
@@ -421,12 +566,14 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s dump   <slash_ctl_path>\n"
-            "  %s signal <slash_ctl_path>\n"
-            "  %s kernel <slash_ctl_path> <kernel_r5_addr_hex> [arg0_hex ...]\n"
+            "  %s dump    <slash_ctl_path>\n"
+            "  %s signal  <slash_ctl_path>\n"
+            "  %s kernel  <slash_ctl_path> <kernel_r5_addr_hex> [arg0_hex ...]\n"
+            "  %s diamond <slash_ctl_path>\n"
             "\n"
-            "  <kernel_r5_addr_hex> = xml_addr - 0x0202_0000_0000 + 0x8800_0000\n",
-            argv0, argv0, argv0);
+            "  kernel:  <kernel_r5_addr_hex> = xml_addr - 0x0202_0000_0000 + 0x8800_0000\n"
+            "  diamond: addresses + args are hardcoded at the top of rp1_bringup.c\n",
+            argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -520,6 +667,8 @@ int main(int argc, char **argv)
                 rc = cmd_kernel(bar, (uint32_t)r5, args, arg_count);
             }
         }
+    } else if (strcmp(mode, "diamond") == 0) {
+        rc = cmd_diamond(bar);
     } else {
         fprintf(stderr, "Unknown subcommand: %s\n", mode);
         usage(argv[0]);

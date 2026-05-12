@@ -3,6 +3,11 @@ FetchContent_Declare(
   googletest
   URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.zip
 )
+# Don't emit install rules for GoogleTest: it's a test-only dependency pulled
+# in via FetchContent. Leaving it on causes its headers/libs/cmake files to
+# land in debian/tmp during the packaging install step and generates a
+# cascade of dh_missing warnings.
+set(INSTALL_GTEST OFF CACHE BOOL "Disable installation of GoogleTest" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 enable_testing()
@@ -31,6 +36,9 @@ add_vrt_test(graph_test graph_test.cpp)
 add_vrt_test(region_compiler_test region_compiler_test.cpp)
 add_vrt_test(render_test render_test.cpp)
 add_vrt_test(semaphore_pool_test semaphore_pool_test.cpp)
+add_vrt_test(rp1_bar_window_test rp1_bar_window_test.cpp)
+add_vrt_test(rp1_submitter_test rp1_submitter_test.cpp)
+add_vrt_test(fpga_device_test fpga_device_test.cpp)
 
 # --- GPU graph tests (conditional on HIP) ---
 if(VRT_HAS_GPU)

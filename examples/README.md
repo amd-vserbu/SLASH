@@ -10,6 +10,7 @@ This directory contains the example projects for VRT. Each example demonstrates 
 | 3 | Controlling multiple V80s | Uses vrtbin of example 0 |
 | 4 | Frequency targets | |
 | 5 | Memory performance test | Instantiates current maximum number of kernels |
+| `rp1_bringup_vrt` | VRT-graph + FpgaDevice → RP1 firmware | Phase-1 RP1 regression: four-kernel diamond on top of `vrt::graph::Graph`. See [rp1_bringup_vrt/README.md](rp1_bringup_vrt/README.md). |
 
 ## How to run the examples
 
