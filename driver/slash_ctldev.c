@@ -50,6 +50,12 @@
 #include "slash.h"
 #include "slash_dmabuf.h"
 
+#if defined(SLASH_ENABLE_P2P) && (SLASH_ENABLE_P2P) && defined(CONFIG_PCI_P2PDMA)
+#define SLASH_CTLDEV_P2P_ENABLED 1
+#else
+#define SLASH_CTLDEV_P2P_ENABLED 0
+#endif
+
 /** Compute the size of a struct member without needing an instance. */
 #define SLASH_FIELD_SIZE(_type, _member) (sizeof(((_type *)0)->_member))
 
@@ -69,6 +75,21 @@
     (offsetof(struct slash_ioctl_bar_fd_request, flags) + SLASH_FIELD_SIZE(struct slash_ioctl_bar_fd_request, flags))
 #define SLASH_IOCTL_BAR_FD_RESPONSE_SIZE \
     (offsetof(struct slash_ioctl_bar_fd_request, length) + SLASH_FIELD_SIZE(struct slash_ioctl_bar_fd_request, length))
+
+/*
+ * Legacy BAR_FD payload (pre-p2p_capable). The ioctl command number encodes
+ * payload size, so keep accepting this variant for mixed-version userspace.
+ */
+struct slash_ioctl_bar_fd_request_v1 {
+    __u32 size;
+    __u8  bar_number;
+    __u8  pad0;
+    __u16 pad1;
+    __u32 flags;
+    __u64 length;
+};
+
+#define SLASH_CTLDEV_IOCTL_GET_BAR_FD_V1 _IOWR('v', 0x31, struct slash_ioctl_bar_fd_request_v1)
 
 #define SLASH_BAR_DMABUF_DRAIN_TIMEOUT_MS 5000
 
@@ -205,7 +226,7 @@ static int slash_ctldev_set_bar_info(struct pci_dev *pdev, struct slash_ctldev *
         flags                  = pci_resource_flags(pdev, i);
         ctldev->bars[i].mmio   = ((flags & IORESOURCE_MEM) != 0);
 
-#ifdef CONFIG_PCI_P2PDMA
+#if SLASH_CTLDEV_P2P_ENABLED
         if (ctldev->bars[i].mmio) {
             int p2p_ret;
 
@@ -504,7 +525,7 @@ static void slash_ctldev_destroy_dmabufs(struct slash_ctldev *ctldev)
  *
  * Dispatches to one of:
  *   - GET_BAR_INFO:    Return BAR properties (start, size, usability).
- *   - GET_BAR_FD:      Return a dma-buf fd for mmap'ing a BAR.
+ *   - GET_BAR_FD:      Return a dma-buf fd for mmap'ing/P2P import of a BAR.
  *   - GET_DEVICE_INFO: Return PCI identity (BDF, vendor/device IDs).
  *
  * All ioctls use the size-versioning pattern described in the file
@@ -598,7 +619,8 @@ static long slash_ctldev_fop_ioctl(struct file *file, unsigned int op, unsigned 
         return 0;
     }
 
-    case SLASH_CTLDEV_IOCTL_GET_BAR_FD: {
+    case SLASH_CTLDEV_IOCTL_GET_BAR_FD:
+    case SLASH_CTLDEV_IOCTL_GET_BAR_FD_V1: {
         struct slash_ioctl_bar_fd_request fd_request = {0};
         struct slash_ctldev_bar *bar = NULL;
         int ret;
@@ -650,6 +672,7 @@ static long slash_ctldev_fop_ioctl(struct file *file, unsigned int op, unsigned 
         }
 
         fd_request.length = bar->len;
+        fd_request.p2p_capable = bar->p2pdma_registered ? 1 : 0;
         fd_request.size = sizeof(fd_request);
 
         if (fd_request_alleged_size < SLASH_IOCTL_BAR_FD_RESPONSE_SIZE) {

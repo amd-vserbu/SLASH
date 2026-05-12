@@ -85,6 +85,54 @@ slash_bar_info_free(bi);
 slash_ctldev_close(dev);
 ```
 
+### Control device — fd-only BAR export for P2P importers
+
+Use this path when another kernel driver imports the BAR dma-buf. Unlike
+`slash_bar_file_open()`, this API does not mmap the BAR into userspace.
+
+```c
+#include <slash/ctldev.h>
+
+struct slash_ctldev *dev = slash_ctldev_open("/dev/slash_ctl0");
+if (!dev) {
+  return 1;
+}
+
+struct slash_p2p_bar *p2p = slash_p2p_bar_open(dev, 0, O_CLOEXEC);
+if (!p2p) {
+  slash_ctldev_close(dev);
+  return 1;
+}
+
+printf("BAR%d fd=%d len=%zu bdf=%s p2p_capable=%d\n",
+     p2p->bar_number,
+     p2p->fd,
+     p2p->len,
+     p2p->device_info.bdf,
+     (int) p2p->p2p_capable);
+
+/* Pass p2p->fd to the importing driver's ioctl path. */
+
+slash_p2p_bar_close(p2p);
+slash_ctldev_close(dev);
+```
+
+Note: the current driver policy serializes BAR userspace mmap and P2P access
+for the same BAR. If an importer has an active P2P mapping, opening a new
+userspace BAR mmap may fail with `-EBUSY` (and vice versa).
+
+If you are using Coyote userspace APIs, map the exported fd directly:
+
+```c++
+// p2p is from slash_p2p_bar_open(...)
+coyote::cThread t(vfid, getpid(), device);
+void *token = t.mapExternalDmabuf(p2p->fd, p2p->len, -1);
+
+// Use token in coyote invoke() SG entries.
+
+t.unmapExternalDmabuf(token);
+```
+
 ### QDMA — queue-based DMA transfers
 
 Queue pair lifecycle: **add &rarr; start &rarr; I/O &rarr; stop &rarr; del**.

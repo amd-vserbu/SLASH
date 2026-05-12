@@ -89,6 +89,14 @@
 #define SLASH_CTLDEV_QDMA_MODE 0600
 
 /*
+ * Build-time switch for BAR dma-buf P2P support.
+ * When disabled, dmabuf attach/map for peer importers returns -EOPNOTSUPP.
+ */
+#ifndef SLASH_ENABLE_P2P
+#define SLASH_ENABLE_P2P 1
+#endif
+
+/*
  * Override the kernel's pr_fmt to prefix every pr_info/pr_err/pr_dbg
  * message with "slash:<function_name>: ".
  */

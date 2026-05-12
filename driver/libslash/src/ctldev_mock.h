@@ -72,4 +72,20 @@ struct slash_bar_file *slash_bar_file_mock_open(struct slash_ctldev *ctldev, int
  */
 int slash_bar_file_mock_close(struct slash_bar_file *bar_file);
 
+/**
+ * @brief Open mock BAR 0 as fd-only P2P handle (no mmap).
+ * @param ctldev      Mock control device handle.
+ * @param bar_number  BAR index (only 0 is supported).
+ * @param flags       Open flags (e.g. O_CLOEXEC).
+ * @return Allocated P2P BAR handle, or NULL on failure.
+ */
+struct slash_p2p_bar *slash_p2p_bar_mock_open(struct slash_ctldev *ctldev, int bar_number, int flags);
+
+/**
+ * @brief Close mock P2P BAR handle and unlink the backing file.
+ * @param p2p_bar  P2P BAR handle returned by slash_p2p_bar_mock_open().
+ * @return 0 on success, -1 on failure.
+ */
+int slash_p2p_bar_mock_close(struct slash_p2p_bar *p2p_bar);
+
 #endif /* LIBSLASH_CTLDEV_MOCK_H */

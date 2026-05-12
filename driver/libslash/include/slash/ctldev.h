@@ -26,6 +26,7 @@
  *   1. Device info — PCI identity (slash_device_info_read)
  *   2. BAR info    — BAR properties (slash_bar_info_read)
  *   3. BAR file    — mmap'd BAR access via dma-buf (slash_bar_file_open)
+ *   4. P2P BAR     — fd-only BAR export metadata (slash_p2p_bar_open)
  *
  * BAR file access uses the kernel dma-buf framework. Callers must
  * bracket MMIO accesses with the start/end sync helpers for cache
@@ -80,6 +81,25 @@ struct slash_bar_file {
      * by slash_bar_file_close().  NULL in non-mock mode.
      */
     char *mock_path;
+};
+
+/**
+ * @brief An fd-only BAR export handle for peer-driver P2P import.
+ *
+ * Obtained via slash_p2p_bar_open(). Unlike slash_bar_file, this
+ * handle does not mmap the BAR into userspace. It packages the dmabuf
+ * fd together with BAR and PCI identity metadata often needed when
+ * handing the buffer to a second driver.
+ */
+struct slash_p2p_bar {
+    size_t len;                           /**< BAR size in bytes (same value as bar_info.length). */
+    int fd;                               /**< dmabuf file descriptor for peer import. */
+    int bar_number;                       /**< BAR index requested by the caller. */
+    bool p2p_capable;                     /**< True if kernel reports BAR is P2PDMA-capable. */
+    struct slash_ioctl_bar_info bar_info; /**< Snapshot of BAR metadata from GET_BAR_INFO. */
+    struct slash_ioctl_device_info device_info; /**< Snapshot of PCI identity from GET_DEVICE_INFO. */
+    bool mock;                            /**< True if backed by a mock file instead of real hardware. */
+    char *mock_path;                      /**< Mock backing file path (NULL for real hardware). */
 };
 
 /**
@@ -153,6 +173,31 @@ struct slash_bar_file *slash_bar_file_open(struct slash_ctldev *ctldev, int bar_
  *         The handle is freed regardless.
  */
 int slash_bar_file_close(struct slash_bar_file *bar_file);
+
+/**
+ * @brief Open a BAR as an fd-only P2P export handle.
+ *
+ * @param ctldev     Open control device handle.
+ * @param bar_number Which BAR to export (0–5).
+ * @param flags      Only O_CLOEXEC is accepted.
+ *
+ * On success returns a handle that owns a dmabuf fd suitable for
+ * passing to another driver's dma-buf import path. This call does not
+ * create a userspace BAR mmap.
+ *
+ * @return NULL on failure.
+ */
+struct slash_p2p_bar *slash_p2p_bar_open(struct slash_ctldev *ctldev, int bar_number, int flags);
+
+/**
+ * @brief Close an fd-only P2P BAR handle.
+ *
+ * @param p2p_bar Handle from slash_p2p_bar_open(). NULL returns -1 / EINVAL.
+ *
+ * @return 0 on success, -1 if close/unlink fails.
+ *         The handle is freed regardless.
+ */
+int slash_p2p_bar_close(struct slash_p2p_bar *p2p_bar);
 
 /**
  * @brief Issue a DMA_BUF_IOCTL_SYNC on the BAR fd.

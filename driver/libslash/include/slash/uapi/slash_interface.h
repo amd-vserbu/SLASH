@@ -105,6 +105,8 @@ struct slash_ioctl_bar_fd_request {
 
     /* Kernel to userspace */
     __u64 length;        /**< [out] Size of the BAR region backing the returned fd. */
+    __u8  p2p_capable;   /**< [out] Non-zero if BAR is registered for P2PDMA attach/map. */
+    __u8  pad2[7];       /**< Padding for future expansion/alignment. */
 };
 
 /** Maximum length (including NUL) of a PCI BDF string ("DDDD:BB:DD.F"). */

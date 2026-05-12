@@ -30,6 +30,7 @@ else
 endif
 
 SLASH_QDMA_OP_DEBUG ?= 0
+SLASH_ENABLE_P2P ?= 1
 
 obj-m          := $(MODULE).o
 $(MODULE)-objs := $(MODULE)_main.o $(MODULE)_ctldev.o $(MODULE)_pcie.o $(MODULE)_dmabuf.o $(MODULE)_hotplug.o $(MODULE)_qdma.o
@@ -44,7 +45,8 @@ ccflags-y += \
 	-I$(src)/$(LIBQDMA_PATH)/qdma_access/qdma_soft_access \
 	\
 	-DTANDEM_BOOT_SUPPORTED=1 \
-	-DSLASH_QDMA_OP_DEBUG=$(SLASH_QDMA_OP_DEBUG)
+	-DSLASH_QDMA_OP_DEBUG=$(SLASH_QDMA_OP_DEBUG) \
+	-DSLASH_ENABLE_P2P=$(SLASH_ENABLE_P2P)
 
 
 LIBQDMA_OBJS := \

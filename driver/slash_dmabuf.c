@@ -48,8 +48,11 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
-#ifdef CONFIG_PCI_P2PDMA
+#if defined(SLASH_ENABLE_P2P) && (SLASH_ENABLE_P2P) && defined(CONFIG_PCI_P2PDMA)
+#define SLASH_DMABUF_P2P_ENABLED 1
 #include <linux/pci-p2pdma.h>
+#else
+#define SLASH_DMABUF_P2P_ENABLED 0
 #endif
 #include <linux/printk.h>
 #include <linux/scatterlist.h>
@@ -66,7 +69,7 @@
  * @p2pdma_registered: True when this BAR was successfully registered via
  *                     pci_p2pdma_add_resource().
  * @cpu_mmap_count: Number of active userspace VMAs for this BAR.
- * @p2p_map_count: Number of active P2P sg mappings exported to importers.
+ * @p2p_map_count: Number of active or in-flight P2P mappings.
  * @remove_in_progress: Set while remove path is draining this dmabuf.
  * @mode_lock: Serializes access-mode checks and state transitions.
  * @p2p_idle_wq: Woken when p2p_map_count transitions to zero.
@@ -85,11 +88,48 @@ struct slash_bar_dmabuf_data {
     wait_queue_head_t p2p_idle_wq;
 };
 
+static int slash_bar_dmabuf_try_reserve_p2p_map(struct slash_bar_dmabuf_data *priv)
+{
+    int ret = 0;
+
+    mutex_lock(&priv->mode_lock);
+
+    if (atomic_read(&priv->remove_in_progress))
+        ret = -ENODEV;
+    else if (!priv->p2pdma_registered)
+        ret = -EOPNOTSUPP;
+    else if (atomic_read(&priv->cpu_mmap_count) > 0)
+        ret = -EBUSY;
+    else
+        atomic_inc(&priv->p2p_map_count);
+
+    mutex_unlock(&priv->mode_lock);
+
+    return ret;
+}
+
+static void slash_bar_dmabuf_put_p2p_map(struct slash_bar_dmabuf_data *priv)
+{
+    int new_count;
+
+    new_count = atomic_dec_return(&priv->p2p_map_count);
+    if (new_count < 0) {
+        atomic_inc(&priv->p2p_map_count);
+        dev_warn(&priv->pdev->dev,
+                 "slash: BAR%d unmap underflow in p2p_map_count\n",
+                 priv->bar_number);
+        return;
+    }
+
+    if (new_count == 0)
+        wake_up_all(&priv->p2p_idle_wq);
+}
+
 static int slash_bar_dmabuf_attach(struct dma_buf *dmabuf, struct dma_buf_attachment *attach)
 {
     struct slash_bar_dmabuf_data *priv = dmabuf->priv;
 
-#ifdef CONFIG_PCI_P2PDMA
+#if SLASH_DMABUF_P2P_ENABLED
     struct device *clients[1] = { attach->dev };
 
     mutex_lock(&priv->mode_lock);
@@ -131,7 +171,9 @@ static int slash_bar_dmabuf_attach(struct dma_buf *dmabuf, struct dma_buf_attach
 
     return 0;
 #else
-    dev_dbg(attach->dev, "%s: CONFIG_PCI_P2PDMA disabled", SLASH_NAME);
+    dev_dbg(attach->dev,
+            "%s: P2P disabled by build or kernel config",
+            SLASH_NAME);
     return -EOPNOTSUPP;
 #endif
 }
@@ -148,7 +190,7 @@ static struct sg_table *slash_bar_dmabuf_map(struct dma_buf_attachment *attach,
 {
     struct slash_bar_dmabuf_data *priv = attach->dmabuf->priv;
 
-#ifdef CONFIG_PCI_P2PDMA
+#if SLASH_DMABUF_P2P_ENABLED
     resource_size_t bar_start;
     unsigned long first_pfn;
     unsigned long page_off;
@@ -159,32 +201,25 @@ static struct sg_table *slash_bar_dmabuf_map(struct dma_buf_attachment *attach,
     struct sg_table *sgt;
     int ret;
 
-    mutex_lock(&priv->mode_lock);
-    if (atomic_read(&priv->remove_in_progress)) {
-        mutex_unlock(&priv->mode_lock);
-        return ERR_PTR(-ENODEV);
-    }
-    if (!priv->p2pdma_registered) {
-        mutex_unlock(&priv->mode_lock);
-        return ERR_PTR(-EOPNOTSUPP);
-    }
-    if (atomic_read(&priv->cpu_mmap_count) > 0) {
-        mutex_unlock(&priv->mode_lock);
-        return ERR_PTR(-EBUSY);
-    }
-    mutex_unlock(&priv->mode_lock);
+    ret = slash_bar_dmabuf_try_reserve_p2p_map(priv);
+    if (ret)
+        return ERR_PTR(ret);
 
     bar_start = pci_resource_start(priv->pdev, priv->bar_number);
     page_off = offset_in_page(bar_start);
     span = page_off + priv->len;
     npages = DIV_ROUND_UP(span, PAGE_SIZE);
 
-    if (npages > INT_MAX)
-        return ERR_PTR(-E2BIG);
+    if (npages > INT_MAX) {
+        ret = -E2BIG;
+        goto err_put_p2p_map;
+    }
 
     pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
-    if (!pages)
-        return ERR_PTR(-ENOMEM);
+    if (!pages) {
+        ret = -ENOMEM;
+        goto err_put_p2p_map;
+    }
 
     first_pfn = PFN_DOWN(bar_start);
     for (i = 0; i < npages; i++) {
@@ -193,30 +228,36 @@ static struct sg_table *slash_bar_dmabuf_map(struct dma_buf_attachment *attach,
 
     sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
     if (!sgt) {
+        ret = -ENOMEM;
         kvfree(pages);
-        return ERR_PTR(-ENOMEM);
+        goto err_put_p2p_map;
     }
 
     ret = sg_alloc_table_from_pages(sgt, pages, npages, page_off, priv->len,
                                     GFP_KERNEL);
     kvfree(pages);
     if (ret) {
-        kfree(sgt);
-        return ERR_PTR(ret);
+        goto err_free_sgt;
     }
 
     ret = dma_map_sgtable(attach->dev, sgt, dir, DMA_ATTR_SKIP_CPU_SYNC);
     if (ret) {
-        sg_free_table(sgt);
-        kfree(sgt);
-        return ERR_PTR(ret);
+        goto err_free_sgt_table;
     }
 
-    atomic_inc(&priv->p2p_map_count);
-
     return sgt;
+
+err_free_sgt_table:
+    sg_free_table(sgt);
+err_free_sgt:
+    kfree(sgt);
+err_put_p2p_map:
+    slash_bar_dmabuf_put_p2p_map(priv);
+    return ERR_PTR(ret);
 #else
-    dev_dbg(attach->dev, "%s: CONFIG_PCI_P2PDMA disabled", SLASH_NAME);
+    dev_dbg(attach->dev,
+            "%s: P2P disabled by build or kernel config",
+            SLASH_NAME);
     return ERR_PTR(-EOPNOTSUPP);
 #endif
 }
@@ -233,15 +274,7 @@ static void slash_bar_dmabuf_unmap(struct dma_buf_attachment *attach,
     sg_free_table(sgl);
     kfree(sgl);
 
-    if (atomic_read(&priv->p2p_map_count) <= 0) {
-        dev_warn(&priv->pdev->dev,
-                 "slash: BAR%d unmap underflow in p2p_map_count\n",
-                 priv->bar_number);
-        return;
-    }
-
-    if (atomic_dec_and_test(&priv->p2p_map_count))
-        wake_up_all(&priv->p2p_idle_wq);
+    slash_bar_dmabuf_put_p2p_map(priv);
 }
 
 /**

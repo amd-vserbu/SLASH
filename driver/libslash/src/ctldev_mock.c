@@ -301,3 +301,89 @@ int slash_bar_file_mock_close(struct slash_bar_file *bar_file)
 
     return ret;
 }
+
+struct slash_p2p_bar *slash_p2p_bar_mock_open(struct slash_ctldev *ctldev, int bar_number, int flags)
+{
+    (void) flags;
+
+    struct slash_p2p_bar *p2p_bar;
+    char *path;
+    int fd;
+
+    if (ctldev == NULL || !ctldev->mock) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    if (bar_number != 0) {
+        errno = ENODEV;
+        return NULL;
+    }
+
+    p2p_bar = calloc(1, sizeof(*p2p_bar));
+    if (p2p_bar == NULL) {
+        return NULL;
+    }
+
+    path = NULL;
+    fd = slash_mock_create_backing_file(&path);
+    if (fd < 0) {
+        free(p2p_bar);
+        return NULL;
+    }
+
+    if (ftruncate(fd, (off_t) SLASH_MOCK_BAR_SIZE) != 0) {
+        (void) unlink(path);
+        free(path);
+        (void) close(fd);
+        free(p2p_bar);
+        return NULL;
+    }
+
+    p2p_bar->fd = fd;
+    p2p_bar->len = (size_t) SLASH_MOCK_BAR_SIZE;
+    p2p_bar->bar_number = bar_number;
+    p2p_bar->p2p_capable = true;
+
+    p2p_bar->bar_info.size = sizeof(p2p_bar->bar_info);
+    p2p_bar->bar_info.bar_number = (uint8_t) bar_number;
+    p2p_bar->bar_info.usable = 1;
+    p2p_bar->bar_info.in_use = 0;
+    p2p_bar->bar_info.start_address = 0;
+    p2p_bar->bar_info.length = SLASH_MOCK_BAR_SIZE;
+
+    p2p_bar->device_info.size = sizeof(p2p_bar->device_info);
+    (void) snprintf(p2p_bar->device_info.bdf, sizeof(p2p_bar->device_info.bdf), "0000:00:00.0");
+
+    p2p_bar->mock = true;
+    p2p_bar->mock_path = path;
+
+    return p2p_bar;
+}
+
+int slash_p2p_bar_mock_close(struct slash_p2p_bar *p2p_bar)
+{
+    int ret = 0;
+
+    if (p2p_bar == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (p2p_bar->fd >= 0) {
+        if (close(p2p_bar->fd) != 0) {
+            ret = -1;
+        }
+    }
+
+    if (p2p_bar->mock_path != NULL) {
+        if (unlink(p2p_bar->mock_path) != 0 && errno != ENOENT) {
+            ret = -1;
+        }
+        free(p2p_bar->mock_path);
+    }
+
+    free(p2p_bar);
+
+    return ret;
+}
