@@ -20,11 +20,39 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
 
 extern "C" {
 #include "config.h"
 }
+
+class ScopedEnv {
+public:
+    ScopedEnv(const char *name, const char *value) : name_(name) {
+        const char *old = std::getenv(name);
+        if (old != nullptr) {
+            had_old_ = true;
+            old_ = old;
+        }
+        setenv(name, value, 1);
+    }
+
+    ~ScopedEnv() {
+        if (had_old_) {
+            setenv(name_, old_.c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+private:
+    const char *name_;
+    bool had_old_ = false;
+    std::string old_;
+};
 
 static struct device_policy *make_device_policy(const char *bdf, bool bar, bool qdma, bool buffer,
                                                 bool design_write, bool clock, bool pcie_hotplug,
@@ -220,4 +248,18 @@ TEST(ConfigCleanupTest, CleanupDevicePolicyZeroed) {
 TEST(ConfigCleanupTest, CleanupRoleZeroed) {
     auto *r = static_cast<struct role *>(calloc(1, sizeof(struct role)));
     cleanup_role(r);
+}
+
+TEST(ConfigLoadTest, ParsesPcieUnlinkOnReset) {
+    const auto fixture =
+        std::filesystem::path(__FILE__).parent_path() / "fixtures" / "pcie-unlink-on-reset.conf";
+    ScopedEnv env("VRTD_CONFIG", fixture.c_str());
+
+    struct config *cfg = nullptr;
+    ASSERT_EQ(config_load(&cfg), 0);
+    ASSERT_NE(cfg, nullptr);
+
+    EXPECT_TRUE(cfg->pcie_unlink_on_reset);
+
+    cleanup_config(cfg);
 }

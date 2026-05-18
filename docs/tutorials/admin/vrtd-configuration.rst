@@ -46,6 +46,20 @@ Any ``.conf`` file placed in the ``vrtd.conf.d/`` directory is loaded
 automatically. This lets you add custom roles and user mappings without
 editing the main configuration.
 
+Global Reset Options
+====================
+
+Most installations should keep reset behavior at the default:
+
+.. code-block:: ini
+
+   pcie-unlink-on-reset = no
+
+Set ``pcie-unlink-on-reset = yes`` only for hosts that need a full upstream
+PCIe link disable/enable cycle after the normal Secondary Bus Reset (SBR).
+This is a site-specific workaround for systems whose PCIe root complex does
+not recover reliably from SBR alone.
+
 Understanding Roles
 ====================
 

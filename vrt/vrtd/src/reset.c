@@ -70,11 +70,13 @@
  *      ENODEV is tolerated (device may already have been removed by firmware).
  *   8. Toggle Secondary Bus Reset on the upstream PCIe bridge via
  *      slash_hotplug_toggle_sbr().
- *   9. Wait 5 seconds for the device to complete reconfiguration and
+ *   9. Optionally disable/re-enable the upstream PCIe link to force link
+ *      retraining on hosts that do not recover reliably from SBR alone.
+ *  10. Wait 5 seconds for the device to complete reconfiguration and
  *      re-train the PCIe link.
- *  10. Rescan the PCI bus via slash_hotplug_rescan() to re-enumerate all PFs.
- *  11. Verify the device is back by calling ami_dev_find() on PF0.
- *  12. Run device discovery to re-add the reset device to vrtd's tracked
+ *  11. Rescan the PCI bus via slash_hotplug_rescan() to re-enumerate all PFs.
+ *  12. Verify the device is back by calling ami_dev_find() on PF0.
+ *  13. Run device discovery to re-add the reset device to vrtd's tracked
  *      device list.
  */
 
@@ -115,9 +117,12 @@
  * @param devices  The global array of tracked device pointers.  The target
  *                 device is removed at the start; after a successful reset,
  *                 the newly-discovered device is added back.
+ * @param pcie_unlink_on_reset
+ *                 If true, bounce the upstream PCIe link after SBR and before
+ *                 rescanning.
  * @return VRTD_RET_OK on success, or a VRTD_RET_* error code on failure.
  */
-uint16_t reset_with_ami(struct device *device, struct device_ptr_array  *devices)
+uint16_t reset_with_ami(struct device *device, struct device_ptr_array  *devices, bool pcie_unlink_on_reset)
 {
     /*
      * Step 1: Compute BDF (Bus:Device.Function) strings for all three PFs.
@@ -310,14 +315,29 @@ uint16_t reset_with_ami(struct device *device, struct device_ptr_array  *devices
     LOG(LOG_INFO, "reset_with_ami: SBR toggle complete for %s", pf0_bdf);
 
     /*
-     * Step 9: Wait for the FPGA to complete reconfiguration and re-train
+     * Step 9: Optional PCIe link bounce.  Some host/root-complex combinations
+     * need the downstream link forced through Link Disable before they recover
+     * reliably after FPGA reconfiguration.
+     */
+    if (pcie_unlink_on_reset) {
+        LOG(LOG_INFO, "reset_with_ami: toggling PCIe link for %s", pf0_bdf);
+        ret = slash_hotplug_toggle_pcie_link(g_hotplug, pf0_bdf);
+        if (ret != 0) {
+            LOG(LOG_ERR, "reset_with_ami: hotplug toggle_pcie_link(%s) failed: %m", pf0_bdf);
+            return hotplug_errno_to_vrtd_ret(errno);
+        }
+        LOG(LOG_INFO, "reset_with_ami: PCIe link toggle complete for %s", pf0_bdf);
+    }
+
+    /*
+     * Step 10: Wait for the FPGA to complete reconfiguration and re-train
      * the PCIe link.  5 seconds is a conservative estimate that accounts for
      * bitstream loading time and link training, mentioned in a AVED sw comment.
      */
     usleep(5000000);
 
     /*
-     * Step 10-12: Rescan the PCI bus and verify the device reappears.
+     * Step 11-13: Rescan the PCI bus and verify the device reappears.
      * The rescan re-enumerates all functions (PF0, PF1, PF2), then we wait
      * for the kernel, drivers, and udev to fully initialize device nodes.
      * If the device has not reappeared, retry the rescan after 3 seconds,

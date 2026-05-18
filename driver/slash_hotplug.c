@@ -18,7 +18,7 @@
  * PCIe hot-plug and reset subsystem for the SLASH kernel module.
  *
  * This file manages the PCIe-level lifecycle of SLASH FPGA devices,
- * providing four operations via /dev/slash_hotplug:
+ * providing five operations via /dev/slash_hotplug:
  *
  *   - **RESCAN**     — rescan all PCI root buses to discover new devices.
  *   - **REMOVE**     — remove a specific device from the PCI bus.
@@ -26,6 +26,8 @@
  *                      the device's immediate upstream bridge.
  *   - **HOTPLUG**    — atomic remove + rescan cycle on the device's
  *                      immediate parent bus.
+ *   - **TOGGLE_PCIE_LINK** — disable/re-enable the upstream PCIe link
+ *                            to force a full link retrain.
  *
  * These operations are essential for FPGA reconfiguration workflows.
  * When a new bitstream is loaded, the FPGA's PCI identity and BAR
@@ -35,8 +37,9 @@
  * A typical reconfiguration flow:
  *   1. REMOVE each PCI function (PF0, PF1, PF2 ...)
  *   2. TOGGLE_SBR to reset the device
- *   3. Wait in userspace for the FPGA to re-initialize
- *   4. RESCAN to discover the new configuration
+ *   3. Optionally TOGGLE_PCIE_LINK for systems that need a full link bounce
+ *   4. Wait in userspace for the FPGA to re-initialize
+ *   5. RESCAN to discover the new configuration
  *
  * All ioctls that operate on a specific device require an explicit
  * BDF string in the request.
@@ -213,6 +216,61 @@ static int slash_hotplug_handle_remove(const char *bdf)
 }
 
 /**
+ * slash_hotplug_get_upstream_bridge() - Resolve and pin a device's upstream bridge.
+ * @bdf:        BDF string identifying the endpoint or its former location.
+ * @op_name:    Operation name for log messages.
+ * @bridge_out: Receives a reference-counted pci_dev pointer.
+ * @bus_out:    Optional output for the endpoint bus number.
+ *
+ * Endpoint functions are usually removed before reset/link operations, so this
+ * resolves via pci_find_bus() instead of looking up the endpoint.  The returned
+ * bridge is the immediate parent of the endpoint bus.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int slash_hotplug_get_upstream_bridge(
+    const char *bdf,
+    const char *op_name,
+    struct pci_dev **bridge_out,
+    int *bus_out
+)
+{
+    struct pci_bus *ep_bus;
+    struct pci_dev *bridge;
+    int domain, bus_nr, slot, func;
+
+    if (sscanf(bdf, "%x:%x:%x.%x", &domain, &bus_nr, &slot, &func) != 4) {
+        pr_err("slash_hotplug: %s: malformed BDF '%s'\n", op_name, bdf);
+        return -EINVAL;
+    }
+
+    /*
+     * Hold pci_lock_rescan_remove() across pci_find_bus() + pci_dev_get().
+     * pci_find_bus() does not pin the returned pci_bus; without the lock, a
+     * concurrent bus removal could free ep_bus before we pin ep_bus->self.
+     */
+    pr_info("slash_hotplug: %s: looking up bus (domain=%04x bus=%02x)\n",
+            op_name, domain, bus_nr);
+    pci_lock_rescan_remove();
+    ep_bus = pci_find_bus(domain, bus_nr);
+    if (!ep_bus || !ep_bus->self) {
+        pci_unlock_rescan_remove();
+        pr_err("slash_hotplug: %s: no upstream bridge for %s\n", op_name, bdf);
+        return -ENODEV;
+    }
+    bridge = pci_dev_get(ep_bus->self);
+    pci_unlock_rescan_remove();
+
+    *bridge_out = bridge;
+    if (bus_out)
+        *bus_out = bus_nr;
+
+    pr_info("slash_hotplug: %s: bridge=%s bus=%02x\n",
+            op_name, pci_name(bridge), bus_nr);
+    return 0;
+}
+
+/**
  * slash_hotplug_handle_toggle_sbr() - Perform a Secondary Bus Reset.
  * @bdf: BDF string identifying the device (or its former location).
  *
@@ -238,40 +296,14 @@ static int slash_hotplug_handle_remove(const char *bdf)
  */
 static int slash_hotplug_handle_toggle_sbr(const char *bdf)
 {
-    struct pci_bus *ep_bus;
     struct pci_dev *bridge;
-    int domain, bus_nr, slot, func;
     int ret;
 
     pr_info("slash_hotplug: toggle_sbr: starting for BDF %s\n", bdf);
 
-    if (sscanf(bdf, "%x:%x:%x.%x", &domain, &bus_nr, &slot, &func) != 4) {
-        pr_err("slash_hotplug: toggle_sbr: malformed BDF '%s'\n", bdf);
-        return -EINVAL;
-    }
-
-    /*
-     * Hold pci_lock_rescan_remove() across the pci_find_bus() + pci_dev_get()
-     * pair.  pci_find_bus() does not pin the returned pci_bus; without the
-     * lock, a concurrent bus removal could free ep_bus between the lookup and
-     * the dev_get, turning ep_bus->self into a use-after-free.  The lock is
-     * dropped before pci_bridge_secondary_bus_reset() to avoid deadlocking
-     * with the PCI slot lock that the reset function acquires internally.
-     */
-    pr_info("slash_hotplug: toggle_sbr: looking up bus (domain=%04x bus=%02x)\n",
-            domain, bus_nr);
-    pci_lock_rescan_remove();
-    ep_bus = pci_find_bus(domain, bus_nr);
-    if (!ep_bus || !ep_bus->self) {
-        pci_unlock_rescan_remove();
-        pr_err("slash_hotplug: toggle_sbr: no upstream bridge for %s\n", bdf);
-        return -ENODEV;
-    }
-    bridge = pci_dev_get(ep_bus->self);
-    pci_unlock_rescan_remove();
-
-    pr_info("slash_hotplug: toggle_sbr: bridge=%s bus=%02x\n",
-            pci_name(bridge), bus_nr);
+    ret = slash_hotplug_get_upstream_bridge(bdf, "toggle_sbr", &bridge, NULL);
+    if (ret)
+        return ret;
 
     /*
      * pci_bridge_secondary_bus_reset() saves and restores bridge config
@@ -309,6 +341,73 @@ out_put:
     pci_dev_put(bridge);
     if (!ret)
         pr_info("slash_hotplug: toggle_sbr: %s complete\n", bdf);
+    return ret;
+}
+
+/**
+ * slash_hotplug_handle_toggle_pcie_link() - Disable and re-enable the PCIe link.
+ * @bdf: BDF string identifying the device (or its former location).
+ *
+ * Toggles the PCIe Link Disable bit on the endpoint bus' immediate upstream
+ * bridge.  This forces the downstream link through a full down/up retraining
+ * cycle and is intended as an opt-in workaround for host root complexes that
+ * do not recover reliably from SBR alone.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int slash_hotplug_handle_toggle_pcie_link(const char *bdf)
+{
+    struct pci_dev *bridge;
+    int bus_nr;
+    int pcie_type;
+    int ret;
+
+    pr_info("slash_hotplug: toggle_pcie_link: starting for BDF %s\n", bdf);
+
+    ret = slash_hotplug_get_upstream_bridge(bdf, "toggle_pcie_link", &bridge, &bus_nr);
+    if (ret)
+        return ret;
+
+    if (!pci_is_pcie(bridge)) {
+        pr_err("slash_hotplug: toggle_pcie_link: bridge %s is not PCIe\n", pci_name(bridge));
+        ret = -EOPNOTSUPP;
+        goto out_put;
+    }
+
+    pcie_type = pci_pcie_type(bridge);
+    if (pcie_type != PCI_EXP_TYPE_ROOT_PORT && pcie_type != PCI_EXP_TYPE_DOWNSTREAM) {
+        pr_err("slash_hotplug: toggle_pcie_link: bridge %s is not a downstream/root port (type=%d)\n",
+               pci_name(bridge), pcie_type);
+        ret = -EOPNOTSUPP;
+        goto out_put;
+    }
+
+    pr_info("slash_hotplug: toggle_pcie_link: disabling link on bridge=%s bus=%02x\n",
+            pci_name(bridge), bus_nr);
+    ret = pcie_capability_set_word(bridge, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_LD);
+    if (ret) {
+        pr_err("slash_hotplug: toggle_pcie_link: failed to disable link (%d)\n", ret);
+        goto out_put;
+    }
+
+    msleep(100);
+
+    pr_info("slash_hotplug: toggle_pcie_link: re-enabling link on bridge=%s\n",
+            pci_name(bridge));
+    ret = pcie_capability_clear_word(bridge, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_LD);
+    if (ret) {
+        pr_err("slash_hotplug: toggle_pcie_link: failed to re-enable link (%d)\n", ret);
+        goto out_put;
+    }
+
+    pr_info("slash_hotplug: toggle_pcie_link: waiting 1000 ms for PCIe link retraining\n");
+    msleep(1000);
+    pr_info("slash_hotplug: toggle_pcie_link: post-link-bounce settle complete (1000 ms)\n");
+
+out_put:
+    pci_dev_put(bridge);
+    if (!ret)
+        pr_info("slash_hotplug: toggle_pcie_link: %s complete\n", bdf);
     return ret;
 }
 
@@ -417,6 +516,18 @@ static long slash_hotplug_ioctl(struct file *file, unsigned int cmd, unsigned lo
         ret = slash_hotplug_handle_toggle_sbr(req.bdf);
         if (!ret)
             pr_info("slash_hotplug: ioctl: TOGGLE_SBR succeeded\n");
+        break;
+    case SLASH_HOTPLUG_IOCTL_TOGGLE_PCIE_LINK:
+        pr_info("slash_hotplug: ioctl: dispatching TOGGLE_PCIE_LINK\n");
+        ret = slash_hotplug_copy_request(arg, &req);
+        if (ret) {
+            pr_err("slash_hotplug: toggle_pcie_link: copy_request failed (%d)\n", ret);
+            break;
+        }
+        pr_info("slash_hotplug: toggle_pcie_link: BDF %s\n", req.bdf);
+        ret = slash_hotplug_handle_toggle_pcie_link(req.bdf);
+        if (!ret)
+            pr_info("slash_hotplug: ioctl: TOGGLE_PCIE_LINK succeeded\n");
         break;
     case SLASH_HOTPLUG_IOCTL_HOTPLUG:
         pr_info("slash_hotplug: ioctl: dispatching HOTPLUG\n");

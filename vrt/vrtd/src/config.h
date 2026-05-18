@@ -242,6 +242,9 @@ struct config {
 
     /** @brief If true, use mock devices instead of real hardware (for testing). */
     bool mock_device;
+
+    /** @brief If true, bounce the upstream PCIe link after SBR during reset. */
+    bool pcie_unlink_on_reset;
 };
 
 /**

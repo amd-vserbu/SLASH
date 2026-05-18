@@ -609,6 +609,7 @@ static int parse_file_unique(struct config_parse_state *state, const char *path)
  *       `include = <path>`        -> parse_file()       (recursive include)
  *       `include-glob = <pattern>` -> parse_file_glob()  (glob-based include)
  *       `enable-mock-device = <bool>` -> sets config->mock_device
+ *       `pcie-unlink-on-reset = <bool>` -> enables post-SBR PCIe link bounce
  *   - `[role:<name>]`  -> role_find_and_add_value()  (role permission keys)
  *   - `[user:<name>]`  -> user_find_and_add_value()  (user-to-role mapping)
  *   - `[group:<name>]` -> group_find_and_add_value() (group-to-role mapping)
@@ -653,6 +654,8 @@ static int parse_config_callback(void *user, const char *section, const char *na
         }
     } else if (MATCH("", "enable-mock-device")) {
         state->config->mock_device = string_to_bool(value);
+    } else if (MATCH("", "pcie-unlink-on-reset")) {
+        state->config->pcie_unlink_on_reset = string_to_bool(value);
     } else if (MATCH_OBJECT("role", objname)) {
         /* Check if objname contains a device selector (e.g. "admin:0000:03:00").
          * Role names must not contain colons, so the first colon in objname

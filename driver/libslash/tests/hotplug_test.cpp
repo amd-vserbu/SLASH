@@ -59,6 +59,12 @@ TEST(HotplugToggleSbrTest, NullHandle) {
     EXPECT_EQ(errno, EINVAL);
 }
 
+TEST(HotplugTogglePcieLinkTest, NullHandle) {
+    errno = 0;
+    EXPECT_EQ(slash_hotplug_toggle_pcie_link(nullptr, "0000:00:00.0"), -1);
+    EXPECT_EQ(errno, EINVAL);
+}
+
 TEST(HotplugHotplugTest, NullHandle) {
     errno = 0;
     EXPECT_EQ(slash_hotplug_hotplug(nullptr, "0000:00:00.0"), -1);

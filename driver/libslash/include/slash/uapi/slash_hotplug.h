@@ -27,9 +27,10 @@
  *
  *   1. REMOVE all PCI functions (PF0, PF1, PF2 …) from the bus.
  *   2. TOGGLE_SBR on the root-port to reset the device.
- *   3. Sleep (~5 s) to let the device re-initialise.
- *   4. RESCAN the PCI bus to discover the new configuration.
- *   5. HOTPLUG each function to complete re-enumeration.
+ *   3. Optionally TOGGLE_PCIE_LINK to force link retraining.
+ *   4. Sleep (~5 s) to let the device re-initialise.
+ *   5. RESCAN the PCI bus to discover the new configuration.
+ *   6. HOTPLUG each function to complete re-enumeration.
  *
  * For a simple device teardown/re-add (no reset or bitstream change),
  * REMOVE → RESCAN is sufficient.
@@ -107,5 +108,15 @@ struct slash_hotplug_device_request {
  * before HOTPLUG if a reset is required.
  */
 #define SLASH_HOTPLUG_IOCTL_HOTPLUG    _IOW(SLASH_HOTPLUG_IOCTL_MAGIC, 0x33, struct slash_hotplug_device_request)
+
+/**
+ * Disable and re-enable the upstream PCIe link.
+ *
+ * This toggles the PCIe Link Disable bit in the upstream bridge Link Control
+ * register.  It is stronger than SBR and is intended as an opt-in workaround
+ * for host/root-complexes that need the downstream link forced through a full
+ * down/up retraining cycle before rescan.
+ */
+#define SLASH_HOTPLUG_IOCTL_TOGGLE_PCIE_LINK _IOW(SLASH_HOTPLUG_IOCTL_MAGIC, 0x34, struct slash_hotplug_device_request)
 
 #endif /* SLASH_HOTPLUG_UAPI_H */

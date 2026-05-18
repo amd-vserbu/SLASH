@@ -1567,7 +1567,11 @@ static uint16_t client_handle_request_device_hotplug_op(
         break;
     }
     case VRTD_DEVICE_HOTPLUG_OP_RESET_SEQUENCE: {
-        uint16_t reset_ret = reset_with_ami(d, &client->state->devices);
+        uint16_t reset_ret = reset_with_ami(
+            d,
+            &client->state->devices,
+            client->state->config->pcie_unlink_on_reset
+        );
         if (reset_ret != VRTD_RET_OK) {
             return reset_ret;
         }

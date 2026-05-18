@@ -178,6 +178,11 @@ int slash_hotplug_toggle_sbr(struct slash_hotplug *hotplug, const char *bdf)
     return slash_hotplug_ioctl_with_request(hotplug, SLASH_HOTPLUG_IOCTL_TOGGLE_SBR, bdf);
 }
 
+int slash_hotplug_toggle_pcie_link(struct slash_hotplug *hotplug, const char *bdf)
+{
+    return slash_hotplug_ioctl_with_request(hotplug, SLASH_HOTPLUG_IOCTL_TOGGLE_PCIE_LINK, bdf);
+}
+
 int slash_hotplug_hotplug(struct slash_hotplug *hotplug, const char *bdf)
 {
     return slash_hotplug_ioctl_with_request(hotplug, SLASH_HOTPLUG_IOCTL_HOTPLUG, bdf);

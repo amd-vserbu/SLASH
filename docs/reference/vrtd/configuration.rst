@@ -23,6 +23,30 @@ directive at the top of the file:
 This loads all ``.conf`` files in the ``vrtd.conf.d/`` directory, allowing
 drop-in configuration without editing the main file.
 
+Global Settings
+===============
+
+Global settings are specified before any section header:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 20 50
+
+   * - Key
+     - Default
+     - Description
+   * - ``include-glob``
+     - ``vrtd.conf.d/*.conf``
+     - Load additional configuration fragments.
+   * - ``pcie-unlink-on-reset``
+     - ``no``
+     - After reset SBR, disable and re-enable the upstream PCIe link before
+       rescanning. This is a site-specific workaround for hosts that do not
+       recover reliably from SBR alone.
+   * - ``enable-mock-device``
+     - ``no``
+     - Use mock devices instead of real hardware, primarily for testing.
+
 Roles
 =====
 

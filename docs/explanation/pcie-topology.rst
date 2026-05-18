@@ -119,7 +119,7 @@ Hotplug Lifecycle
 FPGA reconfiguration requires removing the device from the PCI bus,
 performing a Secondary Bus Reset (SBR), and re-enumerating. The ``slash``
 kernel module exposes a hotplug character device at ``/dev/slash_hotplug``
-with four ioctl operations:
+with five ioctl operations:
 
 .. list-table::
    :header-rows: 1
@@ -131,7 +131,10 @@ with four ioctl operations:
      - Remove a device by BDF from the PCI bus.
    * - ``TOGGLE_SBR``
      - Assert the Secondary Bus Reset on the root port (2 ms hold), deassert,
-       then wait 5 s for the link to retrain.
+       then wait for the link to retrain.
+   * - ``TOGGLE_PCIE_LINK``
+     - Disable and re-enable the upstream PCIe link to force a full link
+       retrain. This is optional and intended for site-specific host issues.
    * - ``RESCAN``
      - Rescan the entire PCI bus to re-enumerate devices.
    * - ``HOTPLUG``
@@ -143,8 +146,9 @@ A typical FPGA programming sequence follows this order:
 
    1. REMOVE  PF0, PF1, PF2       ← tear down all three functions
    2. TOGGLE_SBR on root port      ← reset the FPGA, reload bitstream
-   3. RESCAN                       ← re-enumerate the bus
-   4. HOTPLUG each function        ← bind drivers to the new device
+   3. Optional TOGGLE_PCIE_LINK    ← force link down/up on affected hosts
+   4. RESCAN                       ← re-enumerate the bus
+   5. HOTPLUG each function        ← bind drivers to the new device
 
 The ``vrtd`` daemon orchestrates this sequence through its
 ``ResetSequence`` hotplug operation, which is triggered by

@@ -19,8 +19,8 @@
  *
  * This module provides a thin wrapper around the slash hotplug character
  * device (/dev/slash_hotplug).  It handles opening/closing the device
- * node and issuing the four hotplug ioctls defined in the UAPI header:
- * rescan, remove, toggle SBR, and full hot-plug.
+ * node and issuing the hotplug ioctls defined in the UAPI header:
+ * rescan, remove, toggle SBR, toggle PCIe link, and full hot-plug.
  *
  * All functions follow POSIX conventions: return 0 on success, -1 on
  * failure with errno set.  slash_hotplug_open() returns NULL on failure.
@@ -104,6 +104,21 @@ int slash_hotplug_remove(struct slash_hotplug *hotplug, const char *bdf);
  * @return 0 on success, -1 on failure.
  */
 int slash_hotplug_toggle_sbr(struct slash_hotplug *hotplug, const char *bdf);
+
+/**
+ * @brief Disable and re-enable the upstream PCIe link.
+ *
+ * @param hotplug Open hotplug handle.
+ * @param bdf     PCI BDF string identifying the device (or its former
+ *                location if already removed).  Required.
+ *
+ * Toggles the PCIe Link Disable bit on the device's immediate upstream
+ * bridge to force link retraining.  This is intended for reset workflows that
+ * need a stronger host-side recovery step than SBR alone.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int slash_hotplug_toggle_pcie_link(struct slash_hotplug *hotplug, const char *bdf);
 
 /**
  * @brief Perform a full hot-plug cycle (remove + rescan).

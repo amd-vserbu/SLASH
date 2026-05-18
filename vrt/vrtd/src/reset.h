@@ -21,11 +21,12 @@
 #ifndef VRTD_RESET_H
 #define VRTD_RESET_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 struct device;
 struct device_ptr_array;
 
-uint16_t reset_with_ami(struct device *device, struct device_ptr_array *devices);
+uint16_t reset_with_ami(struct device *device, struct device_ptr_array *devices, bool pcie_unlink_on_reset);
 
 #endif /* VRTD_RESET_H */
