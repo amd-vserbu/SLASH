@@ -223,7 +223,14 @@ TEST(RenderDotTest, GraphRendersAuthoredBoundaryNodes) {
     EXPECT_TRUE(contains(dot, "[Boundary]"));
     EXPECT_TRUE(contains(dot, "(Start)"));
     EXPECT_TRUE(contains(dot, "(End)"));
-    EXPECT_TRUE(contains(dot, "\"" + startId + "\" -> \"" + endId + "\""));
+    // Boundary ops live in the child body region; the renderer namespaces
+    // their Graphviz ids by the region's scope so that identical authored
+    // ids in different regions don't collide once nested clusters share one
+    // `digraph G`.
+    const std::string scopePrefix = "scope" + std::to_string(body->scopeId()) + "__";
+    EXPECT_TRUE(contains(dot,
+                         "\"" + scopePrefix + startId + "\" -> \"" +
+                             scopePrefix + endId + "\""));
 }
 
 // ---------------------------------------------------------------------------

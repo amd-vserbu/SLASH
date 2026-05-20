@@ -68,6 +68,19 @@ const char* deviceTypeShortName(DeviceType dt) {
     return "?";
 }
 
+/// Qualify an authored op id with its enclosing region's scope so it remains
+/// unique across the single full-Graph DOT document. Op ids minted by
+/// GraphRegion::nextOpId are only unique within their region — different
+/// regions independently reset their op counters, so identically-shaped
+/// boundary or kernel ids collide once nested clusters are emitted into a
+/// single `digraph`. Root-region ids (scope 0) keep their bare form.
+std::string qualifiedNodeId(uint64_t scopeId, const std::string& opId) {
+    if (scopeId == 0) return opId;
+    std::ostringstream os;
+    os << "scope" << scopeId << "__" << opId;
+    return os.str();
+}
+
 /// Build a map: scoped-buffer-key → producing-kernel-node-id.
 ///
 /// Keying on the scoped key (not just the buffer name) keeps the renderer
@@ -114,12 +127,22 @@ std::vector<ConsumedBufferRef> consumedBuffers(const KernelT& n) {
     return refs;
 }
 
-/// Emit a kernel node as a rounded box.
+/// Emit a kernel node as a rounded box. `scopeId` is the enclosing region's
+/// scope id, used to namespace the Graphviz node id (the visible label keeps
+/// the bare authored id).
+template <typename KernelT>
+void emitKernelNode(std::ostringstream& os, const KernelT& n,
+                    uint64_t scopeId, const std::string& indent) {
+    os << indent << "\"" << escape(qualifiedNodeId(scopeId, n.id)) << "\""
+       << " [label=\"" << escape(n.id) << "\\n[" << escape(n.kernel.name) << "]\"];\n";
+}
+
+/// Convenience overload for the per-device DGraph path, which lives in its
+/// own `digraph` and therefore needs no scope qualification.
 template <typename KernelT>
 void emitKernelNode(std::ostringstream& os, const KernelT& n,
                     const std::string& indent) {
-    os << indent << "\"" << escape(n.id) << "\""
-       << " [label=\"" << escape(n.id) << "\\n[" << escape(n.kernel.name) << "]\"];\n";
+    emitKernelNode(os, n, /*scopeId=*/0, indent);
 }
 
 /// Emit a bridge-op node as a dashed blue ellipse.
@@ -298,22 +321,22 @@ const char* loopKindLabel(LoopKind kind) {
 }
 
 void emitAuthoredBoundaryNode(std::ostringstream& os, const SubgraphBoundaryOp& b,
-                              const std::string& indent) {
-    os << indent << "\"" << escape(b.id) << "\""
+                              uint64_t scopeId, const std::string& indent) {
+    os << indent << "\"" << escape(qualifiedNodeId(scopeId, b.id)) << "\""
        << " [shape=diamond, style=dashed, color=gray, label=\""
        << escape(b.id) << "\\n[Boundary]\\n(" << boundarySideLabel(b.side) << ")\"];\n";
 }
 
 void emitAuthoredControlNode(std::ostringstream& os, const LoopOp& loop,
-                             const std::string& indent) {
-    os << indent << "\"" << escape(loop.id) << "\""
+                             uint64_t scopeId, const std::string& indent) {
+    os << indent << "\"" << escape(qualifiedNodeId(scopeId, loop.id)) << "\""
        << " [shape=octagon, style=dashed, color=gray, label=\""
        << escape(loop.id) << "\\n[Loop]\\n(" << loopKindLabel(loop.kind) << ")\"];\n";
 }
 
 void emitAuthoredControlNode(std::ostringstream& os, const ConditionalOp& conditional,
-                             const std::string& indent) {
-    os << indent << "\"" << escape(conditional.id) << "\""
+                             uint64_t scopeId, const std::string& indent) {
+    os << indent << "\"" << escape(qualifiedNodeId(scopeId, conditional.id)) << "\""
        << " [shape=octagon, style=dashed, color=gray, label=\""
        << escape(conditional.id) << "\\n[Conditional]\"];\n";
 }
@@ -370,32 +393,83 @@ std::vector<GraphBuffer> authoredConsumedBuffers(const RegionOp& op) {
     return buffers;
 }
 
-void collectRegionEdges(const GraphRegion& region, AuthoredRenderContext& ctx) {
-    struct Producer {
-        std::string id;
-        std::string label;
-    };
+/// Identifies the kernel/control op (by qualified Graphviz id) that last writes
+/// a particular scoped buffer token. Keyed by `authoredBufferKey(buffer)` so a
+/// single map can describe producers across the whole region tree.
+struct Producer {
+    std::string id;     // qualified Graphviz id of the producing op
+    std::string label;  // bare buffer name, kept for symmetry with edge labels
+};
+using ProducerMap = std::unordered_map<std::string, Producer>;
 
-    std::unordered_map<std::string, Producer> producers;
-    std::unordered_set<std::string> idSet;
-    idSet.reserve(region.ops().size());
-
+/// Walk the region tree and register every authored producer in `producers`.
+///
+/// This must run as a global pre-pass before any edges are emitted, because
+/// boundary edges need to resolve producers in scopes other than the boundary's
+/// own region (e.g. a parent-region kernel producing a token that's imported
+/// into a child region via `SubgraphBoundaryOp::bufferMappings`).
+///
+/// For each op we register:
+///   - `ioMap.outputBuffers` and `ioMap.rwBuffers.out` (the regular kernel /
+///     control-op outputs).
+///   - For `SubgraphBoundaryOp`: each `bufferMappings[i].target`, with the
+///     boundary itself as the producer. This makes local consumers of the
+///     boundary's target tokens resolve naturally to a `boundary → consumer`
+///     edge in the per-region pass, without that pass having to know about
+///     boundaries.
+void collectGlobalProducers(const GraphRegion& region, ProducerMap& producers) {
+    const uint64_t scopeId = region.scopeId();
     for (const RegionOp& op : region.ops()) {
-        const std::string& id = regionOpId(op);
-        idSet.insert(id);
+        const std::string qualifiedId = qualifiedNodeId(scopeId, regionOpId(op));
 
         const IOMap& ioMap = authoredIoMap(op);
         for (const auto& [port, buffer] : ioMap.outputBuffers()) {
             (void)port;
-            producers[authoredBufferKey(buffer)] = Producer{id, buffer.name()};
+            producers[authoredBufferKey(buffer)] =
+                Producer{qualifiedId, buffer.name()};
         }
         for (const auto& rw : ioMap.rwBuffers()) {
-            producers[authoredBufferKey(rw.out)] = Producer{id, rw.out.name()};
+            producers[authoredBufferKey(rw.out)] =
+                Producer{qualifiedId, rw.out.name()};
+        }
+
+        if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
+            for (const auto& bm : boundary->bufferMappings) {
+                producers[authoredBufferKey(bm.target)] =
+                    Producer{qualifiedId, bm.target.name()};
+            }
+        }
+
+        if (const auto* loop = std::get_if<LoopOp>(&op)) {
+            if (loop->body) collectGlobalProducers(*loop->body, producers);
+        }
+        if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
+            if (cond->thenRegion) collectGlobalProducers(*cond->thenRegion, producers);
+            if (cond->elseRegion) collectGlobalProducers(*cond->elseRegion, producers);
         }
     }
+}
+
+/// Emit data/after edges for a single region using the pre-built global
+/// producer map. Consumers in this region resolve their incoming edges
+/// against `producers`, which already contains every authored writer across
+/// the whole region tree (including boundary publications).
+///
+/// In addition to the regular consumer-side edges, every `SubgraphBoundaryOp`
+/// emits one edge per `bufferMappings[i]` from the producer of the mapping's
+/// *source* token to the boundary itself, labelled with the source name. This
+/// renders the data flow into / out of a boundary that was previously
+/// invisible in the authored DOT output.
+void collectRegionEdges(const GraphRegion& region, const ProducerMap& producers,
+                        AuthoredRenderContext& ctx) {
+    const uint64_t scopeId = region.scopeId();
+    std::unordered_set<std::string> idSet;  // bare authored ids local to this region
+    idSet.reserve(region.ops().size());
+    for (const RegionOp& op : region.ops()) idSet.insert(regionOpId(op));
 
     for (const RegionOp& op : region.ops()) {
-        const std::string& toId = regionOpId(op);
+        const std::string toId = qualifiedNodeId(scopeId, regionOpId(op));
+
         for (const GraphBuffer& buffer : authoredConsumedBuffers(op)) {
             auto pit = producers.find(authoredBufferKey(buffer));
             if (pit == producers.end()) continue;
@@ -403,9 +477,46 @@ void collectRegionEdges(const GraphRegion& region, AuthoredRenderContext& ctx) {
             ctx.edges.push_back(RenderEdge{RenderEdge::Kind::Data,
                                            pit->second.id, toId, buffer.name()});
         }
+
+        if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
+            for (const auto& bm : boundary->bufferMappings) {
+                auto pit = producers.find(authoredBufferKey(bm.source));
+                if (pit == producers.end()) continue;
+                if (pit->second.id == toId) continue;
+                ctx.edges.push_back(RenderEdge{RenderEdge::Kind::Data,
+                                               pit->second.id, toId,
+                                               bm.source.name()});
+            }
+        }
+
         for (const std::string& after : authoredAfterOps(op)) {
             if (idSet.count(after)) {
-                ctx.edges.push_back(RenderEdge{RenderEdge::Kind::After, after, toId, {}});
+                ctx.edges.push_back(RenderEdge{RenderEdge::Kind::After,
+                                               qualifiedNodeId(scopeId, after),
+                                               toId, {}});
+            }
+        }
+    }
+}
+
+/// Recursively collect edges for every region in the tree using the shared
+/// global producer map. Edge collection is intentionally separated from
+/// cluster/visual-node emission so that the per-region edge pass has access
+/// to producers in *all* regions (not just its own).
+void collectAllRegionEdges(const GraphRegion& region,
+                           const ProducerMap& producers,
+                           AuthoredRenderContext& ctx) {
+    collectRegionEdges(region, producers, ctx);
+    for (const RegionOp& op : region.ops()) {
+        if (const auto* loop = std::get_if<LoopOp>(&op)) {
+            if (loop->body) collectAllRegionEdges(*loop->body, producers, ctx);
+        }
+        if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
+            if (cond->thenRegion) {
+                collectAllRegionEdges(*cond->thenRegion, producers, ctx);
+            }
+            if (cond->elseRegion) {
+                collectAllRegionEdges(*cond->elseRegion, producers, ctx);
             }
         }
     }
@@ -430,6 +541,7 @@ void emitAuthoredDeviceClusters(std::ostringstream& os,
                                 const GraphRegion& region,
                                 AuthoredRenderContext& ctx,
                                 const std::string& indent) {
+    const uint64_t scopeId = region.scopeId();
     std::map<std::string, std::vector<const KernelOp*>> byDevice;
     for (const RegionOp& op : region.ops()) {
         if (const auto* kernel = std::get_if<KernelOp>(&op)) {
@@ -446,7 +558,7 @@ void emitAuthoredDeviceClusters(std::ostringstream& os,
         os << indent << "  style=rounded;\n";
         os << indent << "  color=gray;\n";
         for (const KernelOp* node : nodePtrs) {
-            emitKernelNode(os, *node, indent + "  ");
+            emitKernelNode(os, *node, scopeId, indent + "  ");
         }
         os << indent << "}\n";
     }
@@ -457,8 +569,7 @@ void emitRegionCluster(std::ostringstream& os,
                        const std::string& label,
                        AuthoredRenderContext& ctx,
                        const std::string& indent) {
-    collectRegionEdges(region, ctx);
-
+    const uint64_t scopeId = region.scopeId();
     os << indent << "subgraph " << nextClusterName(ctx) << " {\n";
     os << indent << "  label=\"" << escape(label) << "\";\n";
     os << indent << "  style=rounded;\n";
@@ -473,15 +584,15 @@ void emitRegionCluster(std::ostringstream& os,
                 if constexpr (std::is_same_v<T, KernelOp>) {
                     return;
                 } else if constexpr (std::is_same_v<T, SubgraphBoundaryOp>) {
-                    emitAuthoredBoundaryNode(os, concrete, indent + "  ");
+                    emitAuthoredBoundaryNode(os, concrete, scopeId, indent + "  ");
                 } else if constexpr (std::is_same_v<T, LoopOp>) {
-                    emitAuthoredControlNode(os, concrete, indent + "  ");
+                    emitAuthoredControlNode(os, concrete, scopeId, indent + "  ");
                     if (concrete.body) {
                         emitRegionCluster(os, *concrete.body, concrete.id + " loop body",
                                           ctx, indent + "  ");
                     }
                 } else if constexpr (std::is_same_v<T, ConditionalOp>) {
-                    emitAuthoredControlNode(os, concrete, indent + "  ");
+                    emitAuthoredControlNode(os, concrete, scopeId, indent + "  ");
                     if (concrete.thenRegion) {
                         emitRegionCluster(os, *concrete.thenRegion, concrete.id + " then",
                                           ctx, indent + "  ");
@@ -507,6 +618,20 @@ std::string renderToDot(const Graph& graph) {
     os << "  node [shape=box, style=rounded];\n";
 
     AuthoredRenderContext ctx{graph.devices()};
+
+    // Phase 1: build a global producer map across the whole region tree so the
+    // edge pass can resolve cross-region producers (in particular for boundary
+    // mappings, which read tokens from the parent scope and publish into the
+    // local scope).
+    ProducerMap producers;
+    collectGlobalProducers(graph.rootRegion(), producers);
+
+    // Phase 2: walk every region and emit edges (regular consumers, boundary
+    // mappings, and intra-region `afterOps`) into `ctx.edges`.
+    collectAllRegionEdges(graph.rootRegion(), producers, ctx);
+
+    // Phase 3: emit the cluster/visual-node tree. Edges are deferred to the
+    // top level so Graphviz routes them through cluster boundaries correctly.
     emitRegionCluster(os, graph.rootRegion(), "root region", ctx, "  ");
 
     for (const RenderEdge& edge : ctx.edges) {

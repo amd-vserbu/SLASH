@@ -60,157 +60,15 @@
 using namespace vrt::graph;
 
 // ============================================================================
-// MockCpuDevice — same shape as the test mock; runs kernels on a worker thread
+// MockCpuDevice — same executor as CpuDevice; only the type tag differs so the
+// graph compiler treats it as a separate device class for routing purposes.
 // ============================================================================
 
-class MockCpuDevice : public IDevice {
-    class Plan;
-
+class MockCpuDevice : public CpuDevice {
    public:
-    explicit MockCpuDevice(std::string id) : id_(std::move(id)) {}
-
-    ~MockCpuDevice() override = default;
-
-    void registerKernel(std::shared_ptr<CpuKernel> kernel) {
-        if (!kernel) throw std::invalid_argument("MockCpu: kernel must not be null");
-        kernels_[kernel->name()] = std::move(kernel);
-    }
-
-    void setInputBuffer(const std::string& n, const void* d, size_t s) {
-        auto& b = buffers_[n];
-        b.resize(s);
-        if (d && s) std::memcpy(b.data(), d, s);
-    }
-    void getOutputBuffer(const std::string& n, void* d, size_t s) const {
-        auto it = buffers_.find(n);
-        if (it == buffers_.end()) throw std::runtime_error("MockCpu: no buf " + n);
-        std::memcpy(d, it->second.data(), std::min(s, it->second.size()));
-    }
-    size_t bufferSize(const std::string& n) const {
-        auto it = buffers_.find(n);
-        return it == buffers_.end() ? 0 : it->second.size();
-    }
-
-    DeviceType  type() const override { return DeviceType::MOCK_CPU; }
-    std::string id()   const override { return id_; }
-
-    std::unique_ptr<IDevicePlan> compilePlan(const DGraph& dg) override;
-
-   private:
-    struct OpStep {
-        std::function<bool()> tryReady;
-        std::function<void()> action;
-    };
-    struct KernelStep { CompiledKernelNode node; };
-    using Step = std::variant<OpStep, KernelStep>;
-
-    class Plan : public IDevicePlan {
-       public:
-        Plan(MockCpuDevice& device, const DGraph& dg)
-            : device_(device) {
-            steps_.reserve(dg.nodes.size());
-            for (const CompiledNode& n : dg.nodes) {
-                std::visit(
-                    [&](const auto& x) {
-                        using T = std::decay_t<decltype(x)>;
-                        if constexpr (std::is_same_v<T, CompiledKernelNode>) {
-                            steps_.push_back(KernelStep{x});
-                        } else if constexpr (std::is_same_v<T, CompiledBridgeOpNode>) {
-                            steps_.push_back(OpStep{x.tryReady, x.action});
-                        } else {
-                            throw std::runtime_error(
-                                "MockCpu: compiled control/boundary nodes are not executable yet");
-                        }
-                    },
-                    n);
-            }
-        }
-
-        ~Plan() override { wait(); }
-
-        void launch() override {
-            if (worker_.joinable()) worker_.join();
-            worker_ = std::thread([this] {
-                for (auto& s : steps_) {
-                    if (std::holds_alternative<KernelStep>(s)) {
-                        device_.execKernel(std::get<KernelStep>(s).node);
-                    } else {
-                        const auto& op = std::get<OpStep>(s);
-                        while (!op.tryReady()) {}
-                        op.action();
-                    }
-                }
-            });
-        }
-
-        void wait() override {
-            if (worker_.joinable()) worker_.join();
-        }
-
-       private:
-        MockCpuDevice& device_;
-        std::vector<Step> steps_;
-        std::thread worker_;
-    };
-
-    void execKernel(const CompiledKernelNode& node) {
-        auto it = kernels_.find(node.kernel.name);
-        if (it == kernels_.end()) throw std::runtime_error("MockCpu: no kernel " + node.kernel.name);
-
-        std::map<std::string, CpuBufferView> bv;
-        size_t defSize = 0;
-        for (const auto& [p, b] : node.ioMap.inputBuffers()) {
-            CpuBufferView view = resolveBuffer(b);
-            view.elementType = b.type();
-            if (defSize == 0) defSize = view.sizeBytes;
-            bv[p] = view;
-        }
-        for (const auto& [p, b] : node.ioMap.outputBuffers()) {
-            auto& s = ensureBuffer(b, defSize);
-            bv[p] = CpuBufferView{s.data(), s.size(), b.type()};
-        }
-        for (const auto& rw : node.ioMap.rwBuffers()) {
-            bv[rw.inPort] = resolveBuffer(rw.in);
-            bv[rw.inPort].elementType = rw.in.type();
-            auto& inputStorage = buffers_.at(bufferStorageKey(rw.in));
-            const std::string outKey = scopedBufferKey(rw.out.scopeId(), rw.out.name());
-            buffers_[outKey] = inputStorage;
-            bv[rw.outPort] = CpuBufferView{buffers_[outKey].data(), buffers_[outKey].size(),
-                                           rw.out.type()};
-        }
-        CpuKernelArgs args(std::move(bv), {});
-        it->second->call(args);
-    }
-
-    std::string bufferStorageKey(const GraphBuffer& buffer) const {
-        const std::string key = scopedBufferKey(buffer.scopeId(), buffer.name());
-        if (buffers_.count(key)) return key;
-        if (buffer.scopeId() == 0 && buffers_.count(buffer.name())) return buffer.name();
-        return key;
-    }
-
-    CpuBufferView resolveBuffer(const GraphBuffer& buffer) const {
-        const std::string key = bufferStorageKey(buffer);
-        auto it = buffers_.find(key);
-        if (it == buffers_.end()) throw std::runtime_error("MockCpu: missing input " + buffer.name());
-        return CpuBufferView{const_cast<void*>(static_cast<const void*>(it->second.data())),
-                             it->second.size(), buffer.type()};
-    }
-
-    std::vector<uint8_t>& ensureBuffer(const GraphBuffer& buffer, size_t sizeBytes) {
-        auto& buf = buffers_[scopedBufferKey(buffer.scopeId(), buffer.name())];
-        if (buf.size() < sizeBytes) buf.resize(sizeBytes);
-        return buf;
-    }
-
-    std::string                                  id_;
-    std::map<std::string, std::shared_ptr<CpuKernel>> kernels_;
-    std::map<std::string, std::vector<uint8_t>>  buffers_;
+    using CpuDevice::CpuDevice;
+    DeviceType type() const override { return DeviceType::MOCK_CPU; }
 };
-
-std::unique_ptr<IDevicePlan> MockCpuDevice::compilePlan(const DGraph& dg) {
-    return std::make_unique<Plan>(*this, dg);
-}
 
 // ============================================================================
 // Bridge between any pair of cpu-like devices (CpuDevice + MockCpuDevice).
@@ -604,6 +462,35 @@ int main(int argc, char** argv) {
     cpu->setInputBuffer("raw", data.data(), data.size());
     g.setScalar<int32_t>("render_branch_flag", 1);
     g.compile(); g.run();
+
+    // --- Verify the executed pipeline ---
+    //
+    // Pipeline shape with the configured input (raw = 0xAA x 64) and
+    // render_branch_flag = 1:
+    //   ingest .. normalize .. {branchA, branchB} -> merge (XOR) -> encode -> finalize
+    //     branchA and branchB run the same copyKernel chain, so both feed merge
+    //     with 0xAA x 64; XOR yields 0x00 x 64. The loop body, then-branch, and
+    //     control_sink are all memcpy, so bControlFinal must be 0x00 x 64.
+
+    constexpr uint8_t kExpectedByte = 0x00;
+    std::vector<uint8_t> result(data.size(), 0xFF);
+    cpu->getOutputBuffer(bControlFinal.name(), result.data(), result.size());
+    const bool ok = std::all_of(result.begin(), result.end(),
+                                [](uint8_t b) { return b == kExpectedByte; });
+
+    std::cout << "verification: bControlFinal == 0x"
+              << std::hex << static_cast<int>(kExpectedByte) << std::dec
+              << " x " << result.size()
+              << " -> " << (ok ? "OK" : "FAILED") << "\n";
+    if (!ok) {
+        auto firstMismatch = std::find_if(
+            result.begin(), result.end(),
+            [](uint8_t b) { return b != kExpectedByte; });
+        std::cerr << "  first mismatch at byte " << (firstMismatch - result.begin())
+                  << " = 0x" << std::hex << static_cast<int>(*firstMismatch)
+                  << std::dec << "\n";
+        return 2;
+    }
 
     // --- Render: write full Graph + every per-device DGraph as .dot files ---
 
