@@ -12,7 +12,7 @@ RP1 (ARM Cortex-R5 core 1) sits **on-die** with single-digit-nanosecond access t
 
 **Explicit parallelism.** If a node's barrier dependencies are satisfied, RP1 **will** dispatch it. This is a hard guarantee, not best-effort. It matters because kernels may communicate via AXI-Stream interfaces while co-executing. A stream producer kernel started before its consumer can block on backpressure, and the guarantee ensures the consumer will be started -- preventing deadlock. Kernels connected by streams must be designed for backpressure tolerance, but they can rely on RP1 dispatching both ends once barriers are met.
 
-**Future: explicit reprogram points.** A graph could eventually include nodes that trigger partial reconfiguration to swap kernel sets mid-execution. This is low priority and not part of the current design.
+**Explicit reprogram points (`PDI_LOAD`, opcode `0x0030`).** A graph can include a `PDI_LOAD` node that asks the PMC to partial-reconfigure the fabric from a host-staged DDR PDI; see Section A. The host MUST gate the node behind barriers that drain every kernel resident in the to-be-reconfigured region -- RP1 does not validate this. Updating the R5 kernel-base table to reach kernels that only exist in the new design is the graph creator's responsibility (it can be done by `SCALAR_WRITE` nodes or by re-submitting a fresh graph against the new layout).
 
 **Future: graph regions.** For very large graphs (thousands of nodes), the host may partition the graph into regions with guaranteed non-overlapping execution. This also provides a natural boundary for partial reconfiguration. The flat scanner scales to current graph sizes; regions are the path for scaling further.
 
@@ -114,6 +114,7 @@ Bit 3-15: reserved
 0x0012  SCALAR_READ      -- Read kernel register -> signal array slot.
 0x0020  DMA_COPY         -- Memory transfer (DDR-DDR phase 1, DDR-HBM phase 2).
 0x0021  DMA_FILL         -- Fill a memory region with a pattern.
+0x0030  PDI_LOAD         -- Trigger a partial PDI reload from DDR via the PMC.
 0x0040  LOOP    -- Clear body state + buckets for next loop iteration.
 0x0041  COND    -- Evaluate condition, set then_bucket or else_bucket barriers.
 0x0042  RERUN            -- Clear DONE state of a target node back to PENDING.
@@ -192,6 +193,43 @@ Phase 1: DDR-DDR only (R5 software memcpy). HOST/HBM deferred to Phase 2.
 0x22    2B    reserved
 0x24    28B   reserved
 ```
+
+#### PDI_LOAD (0x0030)
+
+```
+0x10    4B    pdi_addr_lo         -- DDR physical address of partial PDI (low 32)
+0x14    4B    pdi_addr_hi         -- DDR physical address of partial PDI (high 32)
+0x18    4B    timeout_cycles      -- Poll budget for IPI ACK (0 = default 10M)
+0x1C    4B    reserved
+0x20    32B   reserved
+```
+
+Triggers a partial PDI reconfiguration by asking the PMC (PLM) to load
+the PDI staged at `(pdi_addr_hi << 32) | pdi_addr_lo` in DDR.  RP1 writes
+the canonical XLoader command block into the PMC scratch area at
+`0xFF3F0A40-0xFF3F0A4C`, pokes IPI channel 3 (`0xFF360000 <- 0x02`), and
+then blocks reading the IPI observation register (`0xFF360004`) until it
+clears or the timeout budget is exhausted.
+
+The IPI ACK does **not** guarantee that the fabric has finished
+reconfiguring -- the PMC continues loading the PDI asynchronously after
+the ACK.  The graph creator is responsible for sequencing any node that
+depends on the new fabric content (e.g., a downstream `KERNEL_DISPATCH`
+or `SCALAR_WRITE` against a kernel that only exists in the new design).
+A simple way to insert that delay is an `AWAIT_SEMAPHORE` pattern with
+the host writing the "PR complete" signal once it has verified the new
+design via its own out-of-band path.
+
+The host MUST also drain any in-flight kernels that live in the
+to-be-reconfigured region by gating the `PDI_LOAD` node behind their
+barriers.  The "single user region" guarantee makes this trivial in the
+common case: every kernel in the graph is in the active region, so the
+`PDI_LOAD` simply awaits the graph's join barrier.
+
+On timeout RP1 marks the node `ERROR`, sets `rp1_error_code = 3`, and
+emits a `RP1_CQ_TIMEOUT` CQ entry.  If `HALT_ON_ERROR` is set, the
+graph aborts; otherwise the node's `barrier_set_mask` is still raised
+so downstream nodes can run.
 
 #### LOOP (0x0040)
 
@@ -855,12 +893,27 @@ Board A computes, then pushes a semaphore to Board B's signal array. Board B spi
 
 ## G. Error Handling
 
+### Error codes (`rp1_ctrl_t.rp1_error_code`)
+
+| Value | Symbol             | Meaning                                          |
+|-------|--------------------|--------------------------------------------------|
+| 0     | (none)             | No error since the last graph reset.             |
+| 1     | `ERR_INFLIGHT_FULL`| Scanner tried to dispatch a 33rd in-flight kernel. |
+| 2     | `ERR_KERNEL_TIMEOUT` | A kernel did not assert `ap_done` within `timeout_cycles`. |
+| 3     | `ERR_PDI_TIMEOUT`  | The PMC did not ACK a `PDI_LOAD` IPI within `timeout_cycles`. |
+
 ### Kernel Timeout
 If a kernel doesn't assert `ap_done` within `timeout_cycles`, RP1:
 1. Marks the node ERROR
 2. Writes a CQ entry with status=TIMEOUT
-3. Sets `rp1_error_code` in the control block
+3. Sets `rp1_error_code = 2` in the control block
 4. If HALT_ON_ERROR: stops graph processing. Otherwise: applies `barrier_set_mask` and continues.
+
+### PDI Load Timeout
+If the PMC does not clear the IPI observation register within
+`timeout_cycles` of a `PDI_LOAD` node firing, RP1 follows the same
+recipe with `rp1_error_code = 3` and a `RP1_CQ_TIMEOUT` CQ entry.  See
+the `PDI_LOAD` payload description in Section A for the full sequence.
 
 ### Inflight Limit
 If the scanner would dispatch a 33rd kernel, it reports ERR_INFLIGHT_FULL and aborts the graph.

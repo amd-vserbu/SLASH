@@ -61,9 +61,19 @@ static int test_payload_sizes(void)
     CHECK_EQ32(sizeof(rp1_payload_signal_t),          48, "signal payload");
     CHECK_EQ32(sizeof(rp1_payload_dma_copy_t),        48, "dma_copy payload");
     CHECK_EQ32(sizeof(rp1_payload_dma_fill_t),        48, "dma_fill payload");
+    CHECK_EQ32(sizeof(rp1_payload_pdi_load_t),        48, "pdi_load payload");
     CHECK_EQ32(sizeof(rp1_payload_loop_t),            48, "loop payload");
     CHECK_EQ32(sizeof(rp1_payload_cond_t),            48, "cond payload");
     CHECK_EQ32(sizeof(rp1_payload_rerun_t),           48, "rerun payload");
+
+    /* PDI_LOAD: verify the first three fields land where the host stack
+     * expects them. */
+    CHECK_EQ32((uint32_t)offsetof(rp1_payload_pdi_load_t, pdi_addr_lo),
+               0,  "pdi_load.pdi_addr_lo offset");
+    CHECK_EQ32((uint32_t)offsetof(rp1_payload_pdi_load_t, pdi_addr_hi),
+               4,  "pdi_load.pdi_addr_hi offset");
+    CHECK_EQ32((uint32_t)offsetof(rp1_payload_pdi_load_t, timeout_cycles),
+               8,  "pdi_load.timeout_cycles offset");
     return 0;
 }
 

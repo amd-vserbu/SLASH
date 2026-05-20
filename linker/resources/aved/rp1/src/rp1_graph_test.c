@@ -20,6 +20,7 @@
 #include "rp1_test.h"
 #include "rp1_store.h"
 #include "rp1_run.h"
+#include "rp1_pdi.h"
 
 #include <slash/uapi/rp1_protocol.h>
 
@@ -276,6 +277,57 @@ static void make_cond(rp1_node_t *n,
     n->payload.cond.done_mask          = done_mask;
 }
 
+static void make_pdi_load(rp1_node_t *n,
+                          uint32_t addr_lo, uint32_t addr_hi,
+                          uint32_t timeout_cycles, uint16_t flags,
+                          uint8_t aw_b, uint32_t aw_m,
+                          uint8_t st_b, uint32_t st_m)
+{
+    n->opcode               = RP1_OP_PDI_LOAD;
+    n->flags                = flags;
+    n->barrier_await_mask   = aw_m;
+    n->barrier_set_mask     = st_m;
+    n->barrier_await_bucket = aw_b;
+    n->barrier_set_bucket   = st_b;
+    n->status               = RP1_NODE_PENDING;
+
+    n->payload.pdi_load.pdi_addr_lo    = addr_lo;
+    n->payload.pdi_load.pdi_addr_hi    = addr_hi;
+    n->payload.pdi_load.timeout_cycles = timeout_cycles;
+}
+
+/* -------------------------------------------------------------------------
+ * rp1_pdi_load() override — preempts the weak default at link time.
+ *
+ * Records the arguments handed to it on each call so the test bodies can
+ * assert what the scanner forwarded.  s_pdi_force_rc lets the caller pick
+ * the return value (0 = success / 1 = timeout) to exercise both paths.
+ * ---------------------------------------------------------------------- */
+
+static uint32_t s_pdi_call_count;
+static uint32_t s_pdi_last_addr_lo;
+static uint32_t s_pdi_last_addr_hi;
+static uint32_t s_pdi_last_timeout;
+static int      s_pdi_force_rc;
+
+static void pdi_override_reset(void)
+{
+    s_pdi_call_count   = 0;
+    s_pdi_last_addr_lo = 0;
+    s_pdi_last_addr_hi = 0;
+    s_pdi_last_timeout = 0;
+    s_pdi_force_rc     = 0;
+}
+
+int rp1_pdi_load(uint32_t addr_lo, uint32_t addr_hi, uint32_t timeout_cycles)
+{
+    s_pdi_call_count++;
+    s_pdi_last_addr_lo = addr_lo;
+    s_pdi_last_addr_hi = addr_hi;
+    s_pdi_last_timeout = timeout_cycles;
+    return s_pdi_force_rc;
+}
+
 /* -------------------------------------------------------------------------
  * test_diamond_dag
  *
@@ -323,6 +375,55 @@ static int test_diamond_dag(void)
         CHECK_EQ32(ctrl[0],        0x3u, "diamond: ctrl reg ap_start|ap_done");
         CHECK_EQ32(ctrl[0x10 / 4], i,    "diamond: kernel arg[0]");
     }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * test_kernel_unblocks_signal
+ *
+ *   SIGNAL -> KERNEL_DISPATCH -> SIGNAL
+ *
+ * The fake kernel is marked ap_done by the scan-pass hook after the scanner
+ * has already attempted node activation for that pass.  The completion must
+ * still count as progress so rp1_loop() performs another activation pass for
+ * the downstream SIGNAL instead of declaring the graph complete.
+ * ---------------------------------------------------------------------- */
+
+static int test_kernel_unblocks_signal(void)
+{
+    setup_graph(/* node_count */ 3, /* fake_kernels */ 1);
+
+    G_ARGS[0] = 0x12345678u;
+
+    make_signal(&G_NODES[0], 0, 0xBEEFBEEFu, RP1_SIGOP_SET,
+                0, 0x00, 0, 0x1);
+    make_kernel(&G_NODES[1], 0, 0, 0x1, 0, 0x2, 0u, 1);
+    make_signal(&G_NODES[2], 1, 0xCAFEBABEu, RP1_SIGOP_SET,
+                0, 0x2, 0, 0x4);
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "kernel_chain: rp1_run rc");
+
+    CHECK_EQ32(G_SIGS[0].value, 0xBEEFBEEFu, "kernel_chain: pre signal");
+    CHECK_EQ32(G_SIGS[1].value, 0xCAFEBABEu, "kernel_chain: post signal");
+    CHECK_EQ32(g_node_status[0], RP1_NODE_DONE, "kernel_chain: node 0 DONE");
+    CHECK_EQ32(g_node_status[1], RP1_NODE_DONE, "kernel_chain: node 1 DONE");
+    CHECK_EQ32(g_node_status[2], RP1_NODE_DONE, "kernel_chain: node 2 DONE");
+    CHECK_EQ32(g_barriers[0] & 0x7u, 0x7u, "kernel_chain: barriers raised");
+
+    CHECK_EQ32(s_trace_count, 3u, "kernel_chain: nodes traced");
+    CHECK_EQ32(s_trace[0],    0u, "kernel_chain: pre first");
+    CHECK_EQ32(s_trace[1],    1u, "kernel_chain: kernel second");
+    CHECK_EQ32(s_trace[2],    2u, "kernel_chain: post third");
+
+    CHECK_EQ32(G_CTRL->cq_write_idx, 3u, "kernel_chain: cq entries");
+    CHECK_EQ32(G_CQ[0].node_index,   0u, "kernel_chain: CQ[0] pre");
+    CHECK_EQ32(G_CQ[1].node_index,   1u, "kernel_chain: CQ[1] kernel");
+    CHECK_EQ32(G_CQ[2].node_index,   2u, "kernel_chain: CQ[2] post");
+
+    volatile uint32_t *ctrl = (volatile uint32_t *)(uintptr_t)FAKE_KERNEL(0);
+    CHECK_EQ32(ctrl[0],        0x3u,        "kernel_chain: ctrl ap_start|ap_done");
+    CHECK_EQ32(ctrl[0x10 / 4], 0x12345678u, "kernel_chain: arg[0]");
     return 0;
 }
 
@@ -476,6 +577,153 @@ static int test_cond_boolean(void)
 }
 
 /* -------------------------------------------------------------------------
+ * test_pdi_load_basic
+ *
+ *   Single PDI_LOAD node, override returns success.
+ *   Verifies the scanner forwards the payload to rp1_pdi_load() verbatim
+ *   and marks the node DONE / writes an OK CQ entry on return.
+ * ---------------------------------------------------------------------- */
+
+static int test_pdi_load_basic(void)
+{
+    setup_graph(/* node_count */ 1, /* fake_kernels */ 0);
+    pdi_override_reset();
+
+    make_pdi_load(&G_NODES[0],
+                  /* addr_lo */ 0x10000000u,
+                  /* addr_hi */ 0x00000001u,
+                  /* timeout */ 12345u,
+                  /* flags   */ 0,
+                  /* await   */ 0, 0x00,
+                  /* set     */ 0, 0x01);
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "pdi_basic: rp1_run rc");
+
+    CHECK_EQ32(s_pdi_call_count,       1u,          "pdi_basic: invoked once");
+    CHECK_EQ32(s_pdi_last_addr_lo,     0x10000000u, "pdi_basic: addr_lo forwarded");
+    CHECK_EQ32(s_pdi_last_addr_hi,     0x00000001u, "pdi_basic: addr_hi forwarded");
+    CHECK_EQ32(s_pdi_last_timeout,     12345u,      "pdi_basic: timeout forwarded");
+
+    CHECK_EQ32(g_node_status[0],       RP1_NODE_DONE, "pdi_basic: node DONE");
+    CHECK_EQ32(g_barriers[0] & 0x1u,   0x1u,          "pdi_basic: barrier set");
+    CHECK_EQ32(G_CTRL->cq_write_idx,   1u,            "pdi_basic: one CQ entry");
+    CHECK_EQ32(G_CQ[0].status,         RP1_CQ_OK,     "pdi_basic: CQ status OK");
+    CHECK_EQ32(G_CQ[0].node_index,     0u,            "pdi_basic: CQ node_index");
+    CHECK_EQ32(G_CTRL->rp1_state,      RP1_STATE_READY, "pdi_basic: rp1_state");
+    CHECK_EQ32(G_CTRL->rp1_error_code, 0u,            "pdi_basic: no error");
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * test_pdi_load_timeout
+ *
+ *   Two passes: first with HALT_ON_ERROR cleared (graph continues, barrier
+ *   still raised so downstream can run), second with HALT_ON_ERROR set
+ *   (scanner aborts via rp1_state = ERROR).  In both cases rp1_pdi_load()
+ *   returns 1, which the scanner must surface as ERR_PDI_TIMEOUT (3).
+ * ---------------------------------------------------------------------- */
+
+static int test_pdi_load_timeout(void)
+{
+    /* ---- Run 1: non-fatal timeout (no HALT_ON_ERROR) ---- */
+    setup_graph(/* node_count */ 2, /* fake_kernels */ 0);
+    pdi_override_reset();
+    s_pdi_force_rc = 1;  /* force timeout */
+
+    make_pdi_load(&G_NODES[0],
+                  0xDEAD0000u, 0u, 0u, /* flags */ 0,
+                  0, 0x00, 0, 0x01);
+    /* Downstream SIGNAL gated on the PDI's set bit — verifies the
+     * scanner still raises barriers on non-fatal timeout. */
+    make_signal(&G_NODES[1], 30, 0xFEEDBEEFu, RP1_SIGOP_SET,
+                0, 0x01, 0, 0x02);
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "pdi_timeout[non-fatal]: rp1_run rc");
+
+    CHECK_EQ32(g_node_status[0],       RP1_NODE_ERROR,  "pdi_timeout[non-fatal]: node ERROR");
+    CHECK_EQ32(G_CTRL->rp1_error_code, 3u,              "pdi_timeout[non-fatal]: err code 3");
+    CHECK_EQ32(G_CQ[0].status,         RP1_CQ_TIMEOUT,  "pdi_timeout[non-fatal]: CQ TIMEOUT");
+    CHECK_EQ32(g_barriers[0] & 0x1u,   0x1u,            "pdi_timeout[non-fatal]: barrier still set");
+    CHECK_EQ32(G_SIGS[30].value,       0xFEEDBEEFu,     "pdi_timeout[non-fatal]: downstream ran");
+    CHECK_EQ32(G_CTRL->rp1_state,      RP1_STATE_READY, "pdi_timeout[non-fatal]: rp1_state");
+
+    /* ---- Run 2: fatal timeout (HALT_ON_ERROR set) ---- */
+    setup_graph(/* node_count */ 2, /* fake_kernels */ 0);
+    pdi_override_reset();
+    s_pdi_force_rc = 1;
+
+    make_pdi_load(&G_NODES[0],
+                  0xDEAD0000u, 0u, 0u,
+                  /* flags */ RP1_FLAG_HALT_ON_ERROR,
+                  0, 0x00, 0, 0x01);
+    make_signal(&G_NODES[1], 30, 0xFEEDBEEFu, RP1_SIGOP_SET,
+                0, 0x01, 0, 0x02);
+
+    rc = rp1_run(&s_hooks);
+    CHECK_EQ32((uint32_t)(rc + 1), 0u, "pdi_timeout[fatal]: rp1_run returned -1");
+
+    CHECK_EQ32(g_node_status[0],       RP1_NODE_ERROR,  "pdi_timeout[fatal]: node ERROR");
+    CHECK_EQ32(g_node_status[1],       RP1_NODE_PENDING,"pdi_timeout[fatal]: downstream blocked");
+    CHECK_EQ32(G_SIGS[30].value,       0u,              "pdi_timeout[fatal]: downstream silent");
+    CHECK_EQ32(G_CTRL->rp1_state,      RP1_STATE_ERROR, "pdi_timeout[fatal]: rp1_state ERROR");
+    CHECK_EQ32(G_CTRL->rp1_error_code, 3u,              "pdi_timeout[fatal]: err code 3");
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * test_pdi_load_chained
+ *
+ *   Two PDI_LOAD nodes chained via a bucket-0 barrier (node 1 awaits the
+ *   set bit raised by node 0).  Each call to the override returns 0 and
+ *   updates the recorder; if the scanner honours the barrier dependency,
+ *   the override sees two distinct invocations in node-order, so the
+ *   last_addr_lo field ends up holding the second node's payload.
+ *
+ *   We avoid an upstream KERNEL_DISPATCH on purpose: the fake-kernel
+ *   ap_done hook is unrelated to PDI_LOAD and is exercised by the
+ *   diamond/loop tests already.
+ * ---------------------------------------------------------------------- */
+
+static int test_pdi_load_chained(void)
+{
+    setup_graph(/* node_count */ 2, /* fake_kernels */ 0);
+    pdi_override_reset();
+
+    make_pdi_load(&G_NODES[0],
+                  /* addr_lo */ 0x11110000u,
+                  /* addr_hi */ 0x00000001u,
+                  /* timeout */ 0u,
+                  /* flags   */ 0,
+                  /* await   */ 0, 0x00,
+                  /* set     */ 0, 0x01);
+    make_pdi_load(&G_NODES[1],
+                  /* addr_lo */ 0x22220000u,
+                  /* addr_hi */ 0x00000002u,
+                  /* timeout */ 0u,
+                  /* flags   */ 0,
+                  /* await   */ 0, 0x01,
+                  /* set     */ 0, 0x02);
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "pdi_chain: rp1_run rc");
+
+    /* Both nodes fired, in order — the recorder captures the latest call. */
+    CHECK_EQ32(s_pdi_call_count,       2u,            "pdi_chain: invoked twice");
+    CHECK_EQ32(s_pdi_last_addr_lo,     0x22220000u,   "pdi_chain: last addr_lo (node 1)");
+    CHECK_EQ32(s_pdi_last_addr_hi,     0x00000002u,   "pdi_chain: last addr_hi (node 1)");
+
+    CHECK_EQ32(g_node_status[0],     RP1_NODE_DONE, "pdi_chain: node 0 DONE");
+    CHECK_EQ32(g_node_status[1],     RP1_NODE_DONE, "pdi_chain: node 1 DONE");
+    CHECK_EQ32(g_barriers[0] & 0x3u, 0x3u,          "pdi_chain: both barriers raised");
+    CHECK_EQ32(G_CTRL->cq_write_idx, 2u,            "pdi_chain: two CQ entries");
+    CHECK_EQ32(G_CQ[0].node_index,   0u,            "pdi_chain: CQ[0] is node 0");
+    CHECK_EQ32(G_CQ[1].node_index,   1u,            "pdi_chain: CQ[1] is node 1");
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Runner
  * ---------------------------------------------------------------------- */
 
@@ -490,10 +738,14 @@ static int run(const char *name, int (*fn)(void))
 
 void rp1_graph_test_run(void)
 {
-    run("diamond_dag",    test_diamond_dag);
-    run("signal_chain",   test_signal_chain);
-    run("loop_decrement", test_loop_decrement);
-    run("cond_boolean",   test_cond_boolean);
+    run("diamond_dag",         test_diamond_dag);
+    run("kernel_unblocks_signal", test_kernel_unblocks_signal);
+    run("signal_chain",        test_signal_chain);
+    run("loop_decrement",      test_loop_decrement);
+    run("cond_boolean",        test_cond_boolean);
+    run("pdi_load_basic",   test_pdi_load_basic);
+    run("pdi_load_timeout", test_pdi_load_timeout);
+    run("pdi_load_chained", test_pdi_load_chained);
 }
 
 #endif /* QEMU_SEMIHOSTING */

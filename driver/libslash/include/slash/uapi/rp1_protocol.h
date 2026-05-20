@@ -76,6 +76,7 @@ typedef enum {
     RP1_OP_SCALAR_READ     = 0x0012,
     RP1_OP_DMA_COPY        = 0x0020,
     RP1_OP_DMA_FILL        = 0x0021,
+    RP1_OP_PDI_LOAD        = 0x0030,
     RP1_OP_LOOP            = 0x0040,
     RP1_OP_COND            = 0x0041,
     RP1_OP_RERUN           = 0x0042,
@@ -208,6 +209,22 @@ typedef struct {
     uint8_t  _reserved1[28];
 } rp1_payload_dma_fill_t;
 
+/* PDI_LOAD (0x0030) -- partial PDI reconfiguration via PMC IPI.
+ *
+ * The host pre-stages a partial PDI in DDR at (pdi_addr_hi << 32 | pdi_addr_lo)
+ * and submits this node.  When the node fires, RP1 issues the canonical
+ * Versal "load PDI from DDR" command to the PMC via IPI channel 3 and
+ * blocks on the IPI observation register until the PMC ACKs the request.
+ * The host is responsible for ensuring no kernels are in-flight against
+ * the region being reconfigured (use barrier dependencies). */
+typedef struct {
+    uint32_t pdi_addr_lo;     /* DDR physical address (low 32 bits)   */
+    uint32_t pdi_addr_hi;     /* DDR physical address (high 32 bits)  */
+    uint32_t timeout_cycles;  /* Watchdog (0 = default 10M cycles)    */
+    uint32_t _reserved0;
+    uint8_t  _reserved1[32];
+} rp1_payload_pdi_load_t;
+
 /* LOOP (0x0040) */
 typedef struct {
     uint32_t body_start;          /* First node index of loop body     */
@@ -268,6 +285,7 @@ typedef struct {
         rp1_payload_signal_t          signal;
         rp1_payload_dma_copy_t        dma_copy;
         rp1_payload_dma_fill_t        dma_fill;
+        rp1_payload_pdi_load_t        pdi_load;
         rp1_payload_loop_t            loop;
         rp1_payload_cond_t            cond;
         rp1_payload_rerun_t           rerun;
@@ -398,6 +416,8 @@ RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_copy_t)        == 48,
                   "dma_copy payload must be 48 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_fill_t)        == 48,
                   "dma_fill payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_pdi_load_t)        == 48,
+                  "pdi_load payload must be 48 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_payload_loop_t)            == 48,
                   "loop payload must be 48 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_payload_cond_t)            == 48,

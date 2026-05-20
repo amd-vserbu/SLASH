@@ -8,6 +8,7 @@
  */
 
 #include "rp1_loop.h"
+#include "rp1_pdi.h"
 #include "rp1_store.h"
 #include <slash/uapi/rp1_protocol.h>
 #include <stdint.h>
@@ -190,7 +191,9 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
  * ---------------------------------------------------------------------- */
 
 /*
- * Returns 0 on normal operation, -1 if a HALT_ON_ERROR timeout fired.
+ * Returns:  1  at least one inflight kernel completed or timed out
+ *           0  no progress
+ *          -1  HALT_ON_ERROR timeout fired
  *
  * Timeout: timeout_remaining is decremented once per call.  On real
  * hardware this under-counts (one call ≈ one scan pass ≈ microseconds,
@@ -200,6 +203,7 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
 static int check_inflight(void)
 {
     uint32_t i = 0;
+    int made_progress = 0;
 
     while (i < g_inflight_count) {
         rp1_inflight_t *k = &g_inflight[i];
@@ -213,6 +217,7 @@ static int check_inflight(void)
                                k->node_index, RP1_CQ_OK, 0);
             }
             remove_inflight(i);
+            made_progress = 1;
             /* don't increment i — slot was replaced by swap */
         } else {
             k->timeout_remaining--;
@@ -231,13 +236,14 @@ static int check_inflight(void)
                 /* Non-fatal: set barriers so dependents can proceed. */
                 g_barriers[k->set_bucket] |= k->set_mask;
                 remove_inflight(i);
+                made_progress = 1;
             } else {
                 i++;
             }
         }
     }
 
-    return 0;
+    return made_progress;
 }
 
 /* -------------------------------------------------------------------------
@@ -284,6 +290,32 @@ static int activate_nodes(uint32_t node_count)
             add_inflight(node, i);
             made_progress = 1;
             break;
+
+        case RP1_OP_PDI_LOAD: {
+            const rp1_payload_pdi_load_t *p = &node->payload.pdi_load;
+            int rc = rp1_pdi_load(p->pdi_addr_lo, p->pdi_addr_hi,
+                                  p->timeout_cycles);
+
+            if (rc == 0) {
+                g_node_status[i] = RP1_NODE_DONE;
+                g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+                write_cq_entry(node->flags, i, RP1_CQ_OK, 0);
+            } else {
+                g_node_status[i] = RP1_NODE_ERROR;
+                g_ctrl->rp1_error_code = 3; /* ERR_PDI_TIMEOUT */
+                write_cq_entry(node->flags, i, RP1_CQ_TIMEOUT, 0);
+
+                if (node->flags & RP1_FLAG_HALT_ON_ERROR) {
+                    g_ctrl->rp1_state = RP1_STATE_ERROR;
+                    return -1;
+                }
+
+                /* Non-fatal: set barriers so dependents can proceed. */
+                g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+            }
+            made_progress = 1;
+            break;
+        }
 
         case RP1_OP_LOOP: {
             const rp1_payload_loop_t *lp = &node->payload.loop;
@@ -384,16 +416,16 @@ int rp1_loop(void)
         if (activated < 0)
             return activated;
 
-        int inflight_rc = check_inflight();
-        if (inflight_rc < 0)
-            return inflight_rc;
+        int inflight_progress = check_inflight();
+        if (inflight_progress < 0)
+            return inflight_progress;
 
 #ifdef QEMU_SEMIHOSTING
         if (hooks && hooks->on_scan_pass)
             hooks->on_scan_pass();
 #endif
 
-        if (!activated) {
+        if (!activated && !inflight_progress) {
             /* No scan progress — check for dispatched kernels. */
             uint32_t has_dispatched = 0;
             for (uint32_t i = 0; i < node_count; i++) {

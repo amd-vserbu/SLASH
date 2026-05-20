@@ -41,6 +41,7 @@ set(RP1_SOURCES
     src/rp1_store.c
     src/rp1_loop.c
     src/rp1_run.c
+    src/rp1_pdi.c
 )
 
 # In semihosting mode rp1_test.c provides rp1_main(); otherwise rp1_main.c does.
@@ -70,15 +71,21 @@ if(RP1_POLLING_BRINGUP)
     target_compile_definitions(rp1.elf PRIVATE RP1_POLLING_BRINGUP)
 endif()
 
+# -Wl,--build-id=none suppresses the .note.gnu.build-id section. Newer
+# gccs (e.g. Vitis 2025.1's arm-none-eabi-gcc 13.3) emit it by default and
+# ld places it at LMA 0, where it collides with the .vectors section
+# anchored at the start of r5_1_atcm in rp1_lscript.ld.
 target_link_libraries(rp1.elf
     "-T${LINKER_SCRIPT}"
     "-nostdlib"
+    "-Wl,--build-id=none"
     "-lgcc"
 )
 
 target_link_libraries(rp1_memtest.elf
     "-T${LINKER_SCRIPT}"
     "-nostdlib"
+    "-Wl,--build-id=none"
     "-lgcc"
 )
 
