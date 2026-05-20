@@ -102,11 +102,21 @@ static int slash_bar_dmabuf_attach(struct dma_buf *dmabuf, struct dma_buf_attach
 
     if (!priv->p2pdma_registered) {
         mutex_unlock(&priv->mode_lock);
+        dev_warn_ratelimited(&priv->pdev->dev,
+                             "slash: BAR%d dma-buf attach rejected: "
+                             "BAR not registered with pci_p2pdma_add_resource() "
+                             "(BAR not prefetchable, or kernel lacks CONFIG_PCI_P2PDMA)\n",
+                             priv->bar_number);
         return -EOPNOTSUPP;
     }
 
     if (atomic_read(&priv->cpu_mmap_count) > 0) {
         mutex_unlock(&priv->mode_lock);
+        dev_warn_ratelimited(&priv->pdev->dev,
+                             "slash: BAR%d dma-buf attach rejected: "
+                             "%d active CPU mmap(s) (Phase-1 exclusivity)\n",
+                             priv->bar_number,
+                             atomic_read(&priv->cpu_mmap_count));
         return -EBUSY;
     }
 
@@ -132,7 +142,10 @@ static int slash_bar_dmabuf_attach(struct dma_buf *dmabuf, struct dma_buf_attach
 
     return 0;
 #else
-    dev_dbg(attach->dev, "%s: CONFIG_PCI_P2PDMA disabled", SLASH_NAME);
+    dev_warn_once(attach->dev,
+                  "slash: BAR%d dma-buf attach rejected: "
+                  "kernel built without CONFIG_PCI_P2PDMA\n",
+                  priv->bar_number);
     return -EOPNOTSUPP;
 #endif
 }

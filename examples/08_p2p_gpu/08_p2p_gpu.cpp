@@ -76,12 +76,15 @@ __global__ void slash_add_gpu(
         }                                                                   \
     } while (0)
 
+/* HSA_STATUS_INFO_BREAK is the documented "success, stopped early" return
+ * from iterator APIs (hsa_iterate_agents et al.) when the user callback
+ * asks iteration to terminate.  It is not an error and must not throw. */
 #define HSA_CHECK(call)                                                     \
     do {                                                                    \
         hsa_status_t _s = (call);                                           \
-        if (_s != HSA_STATUS_SUCCESS) {                                     \
+        if (_s != HSA_STATUS_SUCCESS && _s != HSA_STATUS_INFO_BREAK) {      \
             const char* _msg = nullptr;                                     \
-            hsa_status_string(_s, &_msg);                                   \
+            hsa_status_string(_s, &_msg);                                  \
             throw std::runtime_error(                                       \
                 std::string("HSA error in " #call ": ") +                  \
                 (_msg ? _msg : "unknown") + " (" __FILE__ ":" +            \

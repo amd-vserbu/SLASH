@@ -212,15 +212,20 @@ static int slash_ctldev_set_bar_info(struct pci_dev *pdev, struct slash_ctldev *
             p2p_ret = pci_p2pdma_add_resource(pdev, i, 0, 0);
             if (p2p_ret) {
                 dev_warn(&pdev->dev,
-                         "ctldev: BAR%d P2PDMA registration failed: %d\n",
+                         "ctldev: BAR%d P2PDMA registration failed: %d "
+                         "(BAR may not be prefetchable in the running bitstream)\n",
                          i, p2p_ret);
             } else {
                 ctldev->bars[i].p2pdma_registered = 1;
-                dev_dbg(&pdev->dev,
-                        "ctldev: BAR%d registered with P2PDMA\n",
-                        i);
+                dev_info(&pdev->dev,
+                         "ctldev: BAR%d registered with P2PDMA\n",
+                         i);
             }
         }
+#else
+        dev_warn_once(&pdev->dev,
+                      "ctldev: kernel built without CONFIG_PCI_P2PDMA; "
+                      "GPU<->FPGA peer-to-peer DMA will not be available\n");
 #endif
 
 

@@ -255,11 +255,65 @@ static void node_set_header(rp1_node_t *n, uint16_t opcode,
     n->status               = RP1_NODE_PENDING;
 }
 
+/* Pre-submission sanity check.  Refuses to submit when the firmware is
+ * mid-processing or wedged (e.g. stuck in a hung AXI read), which would
+ * otherwise silently no-op a graph_seq write and waste the full host
+ * timeout polling for a completion that can never come.  Read-only
+ * subcommands (dump) don't need this check. */
+static int check_firmware_ready(volatile rp1_ctrl_t *c)
+{
+    if (c->magic != RP1_CTRL_MAGIC) {
+        fprintf(stderr,
+                "ERROR: firmware magic = 0x%08" PRIx32
+                ", expected 0x%08" PRIx32 " (\"SQR1\").\n"
+                "       RP1 firmware not loaded -- load rp1.elf onto R5-1 via xsdb.\n",
+                c->magic, (uint32_t)RP1_CTRL_MAGIC);
+        return -1;
+    }
+    if (c->graph_seq != c->graph_done_seq || c->rp1_state != RP1_STATE_READY) {
+        fprintf(stderr,
+                "ERROR: firmware not READY for a new submission.\n"
+                "       rp1_state=%" PRIu32 " (%s), graph_seq=%" PRIu32
+                ", graph_done_seq=%" PRIu32 ", heartbeat=%" PRIu32 "\n"
+                "       The firmware is either mid-processing or wedged (hung AXI access).\n"
+                "       Re-read this dev a moment later; if heartbeat is not advancing,\n"
+                "       reload rp1.elf onto R5-1 via xsdb to reset the state.\n",
+                c->rp1_state, rp1_state_str(c->rp1_state),
+                c->graph_seq, c->graph_done_seq, c->heartbeat);
+        return -1;
+    }
+    return 0;
+}
+
+/* Wait for graph_done_seq to catch up.  Returns 0 on success, -1 on
+ * timeout, -2 on detected firmware hang (heartbeat stuck for > 500 ms,
+ * which means the R5 is stalled inside an AXI access that never
+ * completed -- typical for unmapped user-region addresses on a
+ * bitstream whose rpu_sc -> NoC path isn't wired). */
 static int wait_for_seq(volatile rp1_ctrl_t *c, uint32_t want_seq)
 {
-    long long deadline = monotonic_ns() + POLL_TIMEOUT_NS;
+    const long long stall_window_ns = 500LL * 1000LL * 1000LL;  /* 500 ms */
+    long long deadline      = monotonic_ns() + POLL_TIMEOUT_NS;
+    uint32_t  last_hb       = c->heartbeat;
+    long long last_hb_tick  = monotonic_ns();
+
     while (c->graph_done_seq < want_seq) {
-        if (monotonic_ns() > deadline) {
+        long long now = monotonic_ns();
+
+        uint32_t hb = c->heartbeat;
+        if (hb != last_hb) {
+            last_hb = hb;
+            last_hb_tick = now;
+        } else if (now - last_hb_tick > stall_window_ns) {
+            fprintf(stderr,
+                    "STALLED: heartbeat=%" PRIu32 " has not advanced in "
+                    "500 ms -- R5 is hung on an AXI access.\n"
+                    "         Reload rp1.elf onto R5-1 via xsdb to recover.\n",
+                    hb);
+            return -2;
+        }
+
+        if (now > deadline) {
             fprintf(stderr,
                     "TIMEOUT: graph_done_seq=%" PRIu32 " (want %" PRIu32 ")\n",
                     c->graph_done_seq, want_seq);
@@ -307,6 +361,8 @@ static int cmd_signal(volatile void *bar)
     volatile rp1_ctrl_t       *c     = get_ctrl(bar);
     rp1_node_t                *nodes = get_nodes(bar);
     volatile rp1_signal_slot_t *sigs = get_sigs(bar);
+
+    if (check_firmware_ready(c) != 0) return 1;
 
     bar_zero((volatile void *)&nodes[0], sizeof(rp1_node_t));
     node_set_header(&nodes[0], RP1_OP_SIGNAL,
@@ -372,6 +428,8 @@ static int cmd_kernel(volatile void *bar, uint32_t kernel_r5_addr,
     rp1_node_t                *nodes = get_nodes(bar);
     uint32_t                  *argbuf = get_args(bar);
     volatile rp1_signal_slot_t *sigs = get_sigs(bar);
+
+    if (check_firmware_ready(c) != 0) return 1;
 
     /* ---- Stage args (if any) at arg_buffer_offset=0 ---- */
     for (size_t i = 0; i < arg_count; i++)
@@ -453,6 +511,92 @@ static int cmd_kernel(volatile void *bar, uint32_t kernel_r5_addr,
 }
 
 /* -------------------------------------------------------------------------
+ * Subcommand: peek
+ *
+ * Submits a 2-node graph:
+ *   Node 0: SCALAR_READ <r5_addr>     -> signal slot 0
+ *   Node 1: SIGNAL      slot 1 = PEEK_MAGIC  (gated on node 0)
+ *
+ * No KERNEL_DISPATCH, no ap_start, no busy-loop -- just one AXI-Lite read
+ * from R5 through the NoC to wherever <r5_addr> points.  The smallest
+ * possible probe of the rpu_sc -> S_AXILITE_INI path.
+ *
+ * Interpreting slot[0] for HLS s_axilite kernels at offset 0x00 (ap_ctrl):
+ *   0x4                idle (ap_idle=1)        -- kernel is there, never run
+ *   0x6                idle + done             -- kernel ran previously
+ *   0x0                running, or no slave    -- ambiguous; try another offset
+ *   0xFFFFFFFF         DECERR all-1s default   -- nothing wired at that addr
+ *
+ * Sanity-check the SCALAR_READ infrastructure itself by peeking the
+ * firmware's own control block at R5 0x30000000:
+ *   ./rp1_bringup peek /dev/slash_ctl0 0x30000000
+ * That should print slot[0]=0x53515231 ("SQR1").
+ * ---------------------------------------------------------------------- */
+
+#define PEEK_MAGIC  0xBEEF0042u
+
+static int cmd_peek(volatile void *bar, uint32_t r5_addr)
+{
+    volatile rp1_ctrl_t        *c     = get_ctrl(bar);
+    rp1_node_t                 *nodes = get_nodes(bar);
+    volatile rp1_signal_slot_t *sigs  = get_sigs(bar);
+
+    if (check_firmware_ready(c) != 0) return 1;
+
+    bar_zero((volatile void *)&nodes[0], 2 * sizeof(rp1_node_t));
+
+    /* Node 0: SCALAR_READ source_addr -> slot 0. */
+    node_set_header(&nodes[0], RP1_OP_SCALAR_READ,
+                    /* await */ 0, 0x0,
+                    /* set   */ 0, 0x1);
+    nodes[0].payload.scalar_read.source_addr = r5_addr;
+    nodes[0].payload.scalar_read.target_slot = 0;
+
+    /* Node 1: sentinel SIGNAL, gated on node 0's barrier bit. */
+    node_set_header(&nodes[1], RP1_OP_SIGNAL,
+                    /* await */ 0, 0x1,
+                    /* set   */ 0, 0x2);
+    nodes[1].payload.signal.target_slot = 1;
+    nodes[1].payload.signal.value       = PEEK_MAGIC;
+    nodes[1].payload.signal.operation   = RP1_SIGOP_SET;
+
+    sigs[0].value = 0; sigs[0].last_writer_node = 0; sigs[0].flags = 0;
+    sigs[1].value = 0; sigs[1].last_writer_node = 0; sigs[1].flags = 0;
+
+    program_ctrl(c, /* node_count */ 2);
+
+    uint32_t want_seq = c->graph_done_seq + 1;
+    __sync_synchronize();
+    c->graph_seq = want_seq;
+    __sync_synchronize();
+
+    printf("peek: submitted seq=%" PRIu32 " (R5 0x%08" PRIx32 "), polling...\n",
+           want_seq, r5_addr);
+    if (wait_for_seq(c, want_seq) != 0) {
+        dump_ctrl(c);
+        return 1;
+    }
+
+    __sync_synchronize();
+    uint32_t value    = sigs[0].value;
+    uint32_t sentinel = sigs[1].value;
+
+    if (sentinel != PEEK_MAGIC) {
+        fprintf(stderr,
+                "FAIL: sentinel slot 1 = 0x%08" PRIx32 ", expected 0x%08" PRIx32
+                " -- graph did not complete\n",
+                sentinel, PEEK_MAGIC);
+        dump_ctrl(c);
+        return 1;
+    }
+
+    printf("PASS: R5 0x%08" PRIx32 " -> 0x%08" PRIx32 "  (slot[1]=0x%08" PRIx32
+           ", cq_write_idx=%" PRIu32 ", state=%s)\n",
+           r5_addr, value, sentinel, c->cq_write_idx, rp1_state_str(c->rp1_state));
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Subcommand: diamond
  *
  *   A → {B, C} → D → SIGNAL
@@ -474,6 +618,8 @@ static int cmd_diamond(volatile void *bar)
     rp1_node_t                 *nodes  = get_nodes(bar);
     uint32_t                   *argbuf = get_args(bar);
     volatile rp1_signal_slot_t *sigs   = get_sigs(bar);
+
+    if (check_firmware_ready(c) != 0) return 1;
 
     const size_t arg_count = sizeof(DIAMOND_ARGS) / sizeof(DIAMOND_ARGS[0]);
 
@@ -568,12 +714,17 @@ static void usage(const char *argv0)
             "Usage:\n"
             "  %s dump    <slash_ctl_path>\n"
             "  %s signal  <slash_ctl_path>\n"
+            "  %s peek    <slash_ctl_path> <r5_addr_hex>\n"
             "  %s kernel  <slash_ctl_path> <kernel_r5_addr_hex> [arg0_hex ...]\n"
             "  %s diamond <slash_ctl_path>\n"
             "\n"
+            "  peek:    passive SCALAR_READ from <r5_addr_hex>; no ap_start.\n"
+            "           HLS kernels at offset 0 report 0x4 (ap_idle) when reachable.\n"
+            "           Sanity-check the path by peeking the RP1 ctrl block magic:\n"
+            "             %s peek <slash_ctl_path> 0x30000000   -> 0x53515231 (SQR1)\n"
             "  kernel:  <kernel_r5_addr_hex> = xml_addr - 0x0202_0000_0000 + 0x8800_0000\n"
             "  diamond: addresses + args are hardcoded at the top of rp1_bringup.c\n",
-            argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -639,6 +790,22 @@ int main(int argc, char **argv)
         rc = cmd_dump(bar);
     } else if (strcmp(mode, "signal") == 0) {
         rc = cmd_signal(bar);
+    } else if (strcmp(mode, "peek") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "peek mode requires <r5_addr_hex>\n");
+            usage(argv[0]);
+            rc = 1;
+        } else {
+            errno = 0;
+            char *endp = NULL;
+            uint64_t r5 = strtoull(argv[3], &endp, 0);
+            if (errno != 0 || endp == argv[3] || r5 > 0xFFFFFFFFu) {
+                fprintf(stderr, "Invalid r5_addr_hex '%s'\n", argv[3]);
+                rc = 1;
+            } else {
+                rc = cmd_peek(bar, (uint32_t)r5);
+            }
+        }
     } else if (strcmp(mode, "kernel") == 0) {
         if (argc < 4) {
             fprintf(stderr, "kernel mode requires <kernel_r5_addr_hex>\n");
