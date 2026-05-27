@@ -50,11 +50,16 @@
 #define VRT_GRAPH_DEVICE_FPGA_DEVICE_HPP
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
+#include <vrt/buffer.hpp>
+#include <vrt/device.hpp>
 #include <vrt/graph/device/device.hpp>
 #include <vrt/graph/device/dgraph.hpp>
 #include <vrt/graph/device/fpga/rp1_bar_window.hpp>
@@ -63,6 +68,9 @@
 namespace vrt::graph {
 
 class Graph;
+namespace fpga {
+class FpgaVbinSpec;
+}
 
 /**
  * @brief Resolves a kernel's logical name to its AXI-Lite base address
@@ -106,6 +114,12 @@ class FpgaDevicePlan;
  * first compiled plan calls `launch()`.  Multiple plans built by the
  * same `FpgaDevice` share a single `Rp1Submitter`, so kernel
  * submissions are serialised across the device by construction.
+ *
+ * Buffer arguments use the RP1-visible DDR window as a staging arena.
+ * Kernel arguments are packed as all scalar inputs first, followed by
+ * 64-bit DDR addresses for `IOTypeMap::inputBuffers`,
+ * `IOTypeMap::outputBuffers`, and then each RW buffer pair's input and
+ * output addresses in declaration order.
  */
 class FpgaDevice : public IDevice {
    public:
@@ -113,6 +127,12 @@ class FpgaDevice : public IDevice {
                std::shared_ptr<fpga::Rp1BarWindow> window,
                FpgaKernelLocationLookup           lookup,
                std::uint32_t                      cq_size = fpga::kDefaultCqSize);
+
+    FpgaDevice(std::string                       id,
+               std::shared_ptr<fpga::Rp1BarWindow> window,
+               std::shared_ptr<fpga::FpgaVbinSpec> vbinSpec,
+               std::string                       initialImageId = "",
+               std::uint32_t                     cq_size = fpga::kDefaultCqSize);
 
     ~FpgaDevice() override;
 
@@ -125,6 +145,31 @@ class FpgaDevice : public IDevice {
     std::string id()   const override { return id_; }
 
     std::unique_ptr<IDevicePlan> compilePlan(const DGraph& dg) override;
+
+    // ---- BAR-backed buffer accessors (also used by CPU↔FPGA bridges) --
+
+    /**
+     * @brief Supply or preallocate data for a root-scope FPGA buffer.
+     *
+     * If @p data is null and @p sizeBytes is non-zero, the buffer is
+     * zero-filled.  @p bufferName may be either a plain root-scope name
+     * or an already-scoped key (`scope:N:name`).
+     */
+    void setInputBuffer(const std::string& bufferName,
+                        const void*        data,
+                        std::size_t        sizeBytes);
+
+    /**
+     * @brief Read back a BAR-backed FPGA buffer into host memory.
+     */
+    void getOutputBuffer(const std::string& bufferName,
+                         void*              data,
+                         std::size_t        sizeBytes) const;
+
+    /**
+     * @brief Returns the current logical size of @p bufferName.
+     */
+    std::size_t bufferSize(const std::string& bufferName) const;
 
     // ---- FpgaDevice-specific configuration --------------------------
 
@@ -142,6 +187,14 @@ class FpgaDevice : public IDevice {
     void                       setWaitTimeout(std::chrono::milliseconds t);
     std::chrono::milliseconds  waitTimeout() const noexcept { return waitTimeout_; }
 
+    /**
+     * @brief Provide the VRT hardware device used to stage partial PDIs.
+     *
+     * Reprogram PDIs must be copied into DDR via QDMA, and RP1 receives the
+     * resulting DDR physical address in its PDI_LOAD packet.
+     */
+    void setPdiStagingDevice(::vrt::Device device);
+
     // ---- Shared backplane (used by tests and FpgaDevicePlan) --------
 
     /// Shared submitter; FpgaDevicePlan calls into this.
@@ -153,13 +206,47 @@ class FpgaDevice : public IDevice {
    private:
     friend class FpgaDevicePlan;
 
+    struct BufferRecord {
+        std::uint32_t offset = 0;     ///< Window-relative byte offset.
+        std::size_t   size = 0;       ///< Logical bytes currently valid.
+        std::size_t   capacity = 0;   ///< Allocated bytes in the BAR arena.
+        BufferType    type = BufferType::U8;
+    };
+
+    struct StagedPdiRecord {
+        std::unique_ptr<::vrt::Buffer<std::uint8_t>> buffer;
+        std::uint64_t                                physAddr = 0;
+        std::size_t                                  size = 0;
+    };
+
+    static std::string normalizeBufferKey(const std::string& bufferName);
+
+    BufferRecord ensureBuffer(const GraphBuffer& buffer, std::size_t sizeBytes);
+    std::uint64_t bufferDeviceAddress(const GraphBuffer& buffer, std::size_t sizeBytes);
+    FpgaKernelLocation resolveKernelLocation(const KernelDescriptor& kernel) const;
+    std::uint64_t stagePdiBytes(const std::string& cacheKey,
+                                const std::vector<std::uint8_t>& bytes);
+    std::uint64_t stagePdiFile(const std::string& pdiPath);
+    void setActiveImage(std::string imageId);
+    std::string activeImageId() const;
+
     std::string                            id_;
     std::shared_ptr<fpga::Rp1BarWindow>    window_;
     FpgaKernelLocationLookup               lookup_;
+    std::shared_ptr<fpga::FpgaVbinSpec>     vbinSpec_;
     std::shared_ptr<fpga::Rp1Submitter>    submitter_;
     std::uint32_t                          sentinelSlot_  = kDefaultSentinelSlot;
     std::uint32_t                          sentinelValue_ = kDefaultSentinelValue;
     std::chrono::milliseconds              waitTimeout_   = kDefaultFpgaWaitTimeout;
+
+    mutable std::mutex                     bufferMutex_;
+    std::map<std::string, BufferRecord>    buffers_;
+    std::uint32_t                          nextBufferOffset_ = 0;
+    mutable std::mutex                     pdiMutex_;
+    std::shared_ptr<::vrt::Device>          pdiStagingDevice_;
+    std::map<std::string, StagedPdiRecord>  stagedPdis_;
+    mutable std::mutex                     imageMutex_;
+    std::string                            activeImageId_;
 };
 
 }  // namespace vrt::graph

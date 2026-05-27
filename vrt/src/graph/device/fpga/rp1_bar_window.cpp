@@ -183,8 +183,16 @@ void Rp1BarWindow::readAt(std::uint32_t offset, void* dst, std::size_t n) {
 
 void Rp1BarWindow::writeAt(std::uint32_t offset, const void* src, std::size_t n) {
     if (n == 0) return;
-    const auto abs = impl_->absoluteOffset(offset, n);
-    impl_->backend->writeBytes(abs, src, n);
+    static constexpr std::size_t kChunk = 1u << 20;  // Keep BAR sync windows bounded.
+    const auto* bytes = static_cast<const std::uint8_t*>(src);
+    while (n > 0) {
+        const std::size_t step = (n < kChunk) ? n : kChunk;
+        const auto abs = impl_->absoluteOffset(offset, step);
+        impl_->backend->writeBytes(abs, bytes, step);
+        offset += static_cast<std::uint32_t>(step);
+        bytes  += step;
+        n      -= step;
+    }
 }
 
 void Rp1BarWindow::zeroAt(std::uint32_t offset, std::size_t n) {

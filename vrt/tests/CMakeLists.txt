@@ -39,6 +39,7 @@ add_vrt_test(semaphore_pool_test semaphore_pool_test.cpp)
 add_vrt_test(rp1_bar_window_test rp1_bar_window_test.cpp)
 add_vrt_test(rp1_submitter_test rp1_submitter_test.cpp)
 add_vrt_test(fpga_device_test fpga_device_test.cpp)
+add_vrt_test(fpga_vbin_spec_test fpga_vbin_spec_test.cpp)
 
 # --- GPU graph tests (conditional on HIP) ---
 if(VRT_HAS_GPU)

@@ -21,10 +21,12 @@
 #include <vrt/graph/crossdevice/cpu_fpga_bridge.hpp>
 
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include <vrt/graph/crossdevice/bridge_op.hpp>
 #include <vrt/graph/device/cpu_device.hpp>
+#include <vrt/graph/device/fpga_device.hpp>
 
 namespace vrt::graph {
 
@@ -51,7 +53,18 @@ struct CpuFpgaBarrierOp : IBridgeOp {
 
 CpuFpgaBridge::CpuFpgaBridge(IDevice& src, IDevice& dst)
     : srcCpu_(dynamic_cast<CpuDevice*>(&src)),
-      dstCpu_(dynamic_cast<CpuDevice*>(&dst)) {}
+      srcFpga_(dynamic_cast<FpgaDevice*>(&src)),
+      dstCpu_(dynamic_cast<CpuDevice*>(&dst)),
+      dstFpga_(dynamic_cast<FpgaDevice*>(&dst)) {
+    const bool srcOk = (srcCpu_ != nullptr) || (srcFpga_ != nullptr);
+    const bool dstOk = (dstCpu_ != nullptr) || (dstFpga_ != nullptr);
+    const bool hasCpu = (srcCpu_ != nullptr) || (dstCpu_ != nullptr);
+    const bool hasFpga = (srcFpga_ != nullptr) || (dstFpga_ != nullptr);
+    if (!srcOk || !dstOk || !hasCpu || !hasFpga) {
+        throw std::runtime_error(
+            "CpuFpgaBridge: endpoints must be one CpuDevice and one FpgaDevice");
+    }
+}
 
 BridgeStepPair CpuFpgaBridge::makeTransfer(IDevice&            /*src*/,
                                             IDevice&            /*dst*/,
@@ -63,18 +76,25 @@ BridgeStepPair CpuFpgaBridge::makeTransfer(IDevice&            /*src*/,
     op->pool = &pool_;
     op->sem  = pool_.allocate();
 
-    const std::string bufName = buffer.name();
-    auto* srcCpu = srcCpu_;
-    auto* dstCpu = dstCpu_;
+    const std::string bufName = scopedBufferKey(buffer.scopeId(), buffer.name());
+    auto* srcCpu  = srcCpu_;
+    auto* srcFpga = srcFpga_;
+    auto* dstCpu  = dstCpu_;
+    auto* dstFpga = dstFpga_;
 
-    // Producer: snapshot the source buffer (CPU side) into staging and signal.
-    auto producerClosure = [op, srcCpu, bufName]() {
+    // Producer: snapshot the source buffer into staging and signal.
+    auto producerClosure = [op, srcCpu, srcFpga, bufName]() {
+        size_t sz = 0;
         if (srcCpu) {
-            size_t sz = srcCpu->bufferSize(bufName);
-            op->staging.resize(sz);
-            if (sz > 0) srcCpu->getOutputBuffer(bufName, op->staging.data(), sz);
+            sz = srcCpu->bufferSize(bufName);
+        } else {
+            sz = srcFpga->bufferSize(bufName);
         }
-        // else: FPGA-side producer — needs FpgaDevice accessor (TODO).
+        op->staging.resize(sz);
+        if (sz > 0) {
+            if (srcCpu) srcCpu->getOutputBuffer(bufName, op->staging.data(), sz);
+            else        srcFpga->getOutputBuffer(bufName, op->staging.data(), sz);
+        }
         op->pool->signal(op->sem);
     };
 
@@ -82,11 +102,12 @@ BridgeStepPair CpuFpgaBridge::makeTransfer(IDevice&            /*src*/,
     auto tryReady = [op]() -> bool {
         return op->pool->tryAwait(op->sem);
     };
-    auto consumerAction = [op, dstCpu, bufName]() {
+    auto consumerAction = [op, dstCpu, dstFpga, bufName]() {
         if (dstCpu) {
             dstCpu->setInputBuffer(bufName, op->staging.data(), op->staging.size());
+        } else {
+            dstFpga->setInputBuffer(bufName, op->staging.data(), op->staging.size());
         }
-        // else: FPGA-side consumer — needs FpgaDevice accessor (TODO).
     };
 
     return BridgeStepPair{op,

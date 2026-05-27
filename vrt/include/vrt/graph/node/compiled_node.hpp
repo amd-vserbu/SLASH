@@ -63,6 +63,15 @@ struct CompiledBridgeOpNode {
     std::function<bool()> tryReady = []{ return true; };
 };
 
+struct CompiledReprogramNode {
+    std::string id;
+    std::string deviceId;
+    std::string imageId;
+    std::string pdiPath;
+    uint32_t timeoutCycles = 0;
+    std::vector<std::string> dependsOn;
+};
+
 struct CompiledScalarBoundaryCopy {
     std::string sourceName;
     uint64_t sourceScopeId = 0;
@@ -170,6 +179,7 @@ struct CompiledConditionalNode {
 
 using CompiledNode = std::variant<CompiledKernelNode,
                                   CompiledBridgeOpNode,
+                                  CompiledReprogramNode,
                                   CompiledBoundaryNode,
                                   CompiledLoopNode,
                                   CompiledConditionalNode>;

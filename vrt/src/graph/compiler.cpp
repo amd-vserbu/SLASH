@@ -778,6 +778,9 @@ std::string describeProducer(const RegionOp& op) {
     if (std::holds_alternative<SubgraphBoundaryOp>(op)) {
         return "boundary op '" + opId + "'";
     }
+    if (std::holds_alternative<ReprogramOp>(op)) {
+        return "reprogram op '" + opId + "'";
+    }
     if (std::holds_alternative<KernelOp>(op)) {
         return "kernel op '" + opId + "'";
     }
@@ -1897,6 +1900,32 @@ std::string resolveKernelDevice(
         "' for node '" + node.id + "'");
 }
 
+std::string resolveReprogramDevice(
+    const ReprogramOp& node,
+    const std::map<std::string, std::shared_ptr<IDevice>>& devices) {
+    if (!node.deviceHint.empty()) {
+        auto it = devices.find(node.deviceHint);
+        if (it == devices.end()) {
+            throw std::runtime_error(
+                "GraphCompiler: deviceHint '" + node.deviceHint +
+                "' for reprogram node '" + node.id + "' does not match any registered device");
+        }
+        if (it->second->type() != DeviceType::FPGA) {
+            throw std::runtime_error(
+                "GraphCompiler: reprogram node '" + node.id +
+                "' must target an FPGA device");
+        }
+        return node.deviceHint;
+    }
+
+    for (const auto& [did, dev] : devices) {
+        if (dev->type() == DeviceType::FPGA) return did;
+    }
+
+    throw std::runtime_error(
+        "GraphCompiler: no FPGA device registered for reprogram node '" + node.id + "'");
+}
+
 DGraphChild makeDGraphChild(std::string parentNodeId,
                             DGraphChildRole role,
                             std::vector<DGraph> dgraphs) {
@@ -1917,6 +1946,15 @@ CompiledNode makeCompiledRegionNode(const RegionOp& op,
     if (const auto* kernel = std::get_if<KernelOp>(&op)) {
         return CompiledKernelNode{
             kernel->id, kernel->kernel, deviceId, kernel->ioMap, {}};
+    }
+    if (const auto* reprogram = std::get_if<ReprogramOp>(&op)) {
+        CompiledReprogramNode node;
+        node.id = reprogram->id;
+        node.deviceId = deviceId;
+        node.imageId = reprogram->imageId;
+        node.pdiPath = reprogram->pdiPath;
+        node.timeoutCycles = reprogram->timeoutCycles;
+        return node;
     }
     if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
         const auto side = (boundary->side == BoundarySide::Start)
@@ -2187,6 +2225,8 @@ class RegionCompiler {
             const RegionOp& op = *rc.opById.at(id);
             if (const auto* kernel = std::get_if<KernelOp>(&op)) {
                 rc.nodeDevice[id] = resolveKernelDevice(*kernel, devices_);
+            } else if (const auto* reprogram = std::get_if<ReprogramOp>(&op)) {
+                rc.nodeDevice[id] = resolveReprogramDevice(*reprogram, devices_);
             } else if (std::holds_alternative<LoopOp>(op) ||
                        std::holds_alternative<ConditionalOp>(op)) {
                 if (!rc.cpuDevice) {

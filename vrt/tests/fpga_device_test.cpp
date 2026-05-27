@@ -58,6 +58,7 @@
 #include <vrt/graph/device/cpu_device.hpp>
 #include <vrt/graph/device/fpga/rp1_bar_window.hpp>
 #include <vrt/graph/device/fpga/rp1_submitter.hpp>
+#include <vrt/graph/device/fpga/vbin_spec.hpp>
 #include <vrt/graph/device/fpga_device.hpp>
 #include <vrt/graph/graph.hpp>
 #include <vrt/graph/node/io_map.hpp>
@@ -65,6 +66,7 @@
 #include <vrt/graph/node/kernel_descriptor.hpp>
 
 #include "test_support/control_specs.hpp"
+#include "test_helpers.hpp"
 
 using namespace vrt::graph;
 
@@ -95,6 +97,9 @@ struct DdrView {
                                          base + kWindowOff + RP1_DEFAULT_ARG_BUF_OFFSET); }
     rp1_signal_slot_t* signals()   { return reinterpret_cast<rp1_signal_slot_t*>(
                                          base + kWindowOff + RP1_DEFAULT_SIG_ARRAY_OFFSET); }
+    std::byte*         rp1Ptr(std::uint64_t rp1Addr) {
+        return base + kWindowOff + static_cast<std::size_t>(rp1Addr - RP1_CTRL_PHYS_ADDR);
+    }
 };
 
 class FakeRp1 {
@@ -130,6 +135,23 @@ class FakeRp1 {
         const std::uint32_t cq_size = c.cq_size;
         for (std::uint32_t i = 0; i < count; ++i) {
             rp1_node_t& n = ddr_.nodes()[i];
+            if (n.opcode == RP1_OP_KERNEL_DISPATCH) {
+                const auto& kd = n.payload.kernel_dispatch;
+                if (kd.arg_count >= 5) {
+                    const std::uint32_t* args =
+                        ddr_.args() + (kd.arg_buffer_offset / sizeof(std::uint32_t));
+                    const std::uint32_t bytes = args[0];
+                    const std::uint64_t src =
+                        static_cast<std::uint64_t>(args[1]) |
+                        (static_cast<std::uint64_t>(args[2]) << 32);
+                    const std::uint64_t dst =
+                        static_cast<std::uint64_t>(args[3]) |
+                        (static_cast<std::uint64_t>(args[4]) << 32);
+                    if (bytes > 0) {
+                        std::memcpy(ddr_.rp1Ptr(dst), ddr_.rp1Ptr(src), bytes);
+                    }
+                }
+            }
             if (n.opcode == RP1_OP_SIGNAL) {
                 const auto& pl = n.payload.signal;
                 ddr_.signals()[pl.target_slot].value = pl.value;
@@ -204,7 +226,8 @@ TEST_F(FpgaDeviceFixture, ConstructorRejectsNullWindow) {
 }
 
 TEST_F(FpgaDeviceFixture, ConstructorRejectsNullLookup) {
-    EXPECT_THROW(FpgaDevice("fpga:0", window_, {}), std::invalid_argument);
+    EXPECT_THROW(FpgaDevice("fpga:0", window_, FpgaKernelLocationLookup{}),
+                 std::invalid_argument);
 }
 
 TEST_F(FpgaDeviceFixture, TypeAndIdMatchIDeviceContract) {
@@ -240,10 +263,10 @@ class CopyKernel : public CpuKernel {
 
 }  // namespace
 
-TEST_F(FpgaDeviceFixture, CrossDeviceBufferEdgesAreRejected) {
+TEST_F(FpgaDeviceFixture, CpuToFpgaBufferEdgeCopiesIntoFpgaStore) {
     // CPU kernel produces a buffer; FPGA kernel consumes it. The compiler
-    // splices a CompiledBridgeOpNode into the FPGA DGraph (consumer-side
-    // closure) which FpgaDevice's compilePlan refuses in phase 1.
+    // splices a consumer-side bridge into the FPGA DGraph, which now copies
+    // the bytes into the FPGA BAR-backed buffer store before kernel dispatch.
     Graph g = Graph::withDefaults();
     g.cpuDevice()->registerKernel(std::make_shared<CopyKernel>());
 
@@ -268,7 +291,165 @@ TEST_F(FpgaDeviceFixture, CrossDeviceBufferEdgesAreRejected) {
     io2.bindInputBuffer("in", staged);
     g.addNode(fpgaKernel("kA", fpgaIo), std::move(io2), "fpga:0");
 
-    EXPECT_THROW(g.compile(), std::logic_error);
+    const std::vector<std::int32_t> input = {1, 2, 3, 4};
+    g.cpuDevice()->setInputBuffer("raw", input.data(), input.size() * sizeof(input[0]));
+
+    ASSERT_NO_THROW(g.compile());
+    ASSERT_NO_THROW(g.run());
+
+    std::vector<std::int32_t> echoed(input.size(), 0);
+    dev->getOutputBuffer(staged.name(), echoed.data(), echoed.size() * sizeof(echoed[0]));
+    EXPECT_EQ(echoed, input);
+}
+
+TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
+    auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
+
+    Graph g = Graph::withDefaults();
+    g.cpuDevice()->registerKernel(std::make_shared<CopyKernel>());
+    g.registerDevice(dev);
+
+    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
+
+    IOTypeMap cpuIo;
+    cpuIo.inputBuffers.push_back({"in", BufferType::I32});
+    cpuIo.outputBuffers.push_back({"out", BufferType::I32});
+    KernelDescriptor cpu{"copy", DeviceType::CPU, std::nullopt, cpuIo};
+
+    IOMap cpuProduceIo;
+    GraphBuffer toFpga;
+    cpuProduceIo.bindInputBuffer("in", raw)
+                .bindOutputBuffer("out", BufferType::I32, toFpga);
+    const std::string cpuProducer = g.addNode(cpu, std::move(cpuProduceIo), "cpu");
+
+    IOTypeMap fpgaIo;
+    fpgaIo.inputScalars.push_back({"bytes", ScalarType::U32});
+    fpgaIo.inputBuffers.push_back({"in", BufferType::I32});
+    fpgaIo.outputBuffers.push_back({"out", BufferType::I32});
+
+    IOMap fpgaCopyIo;
+    GraphBuffer fromFpga;
+    constexpr std::uint32_t kBytes = 4u * sizeof(std::int32_t);
+    fpgaCopyIo.bindScalar("bytes", GraphScalar::constant<std::uint32_t>(kBytes))
+              .bindInputBuffer("in", toFpga)
+              .bindOutputBuffer("out", BufferType::I32, fromFpga);
+    g.addNode(fpgaKernel("kA", fpgaIo), std::move(fpgaCopyIo), "fpga:0", {cpuProducer});
+
+    IOMap cpuConsumeIo;
+    GraphBuffer finalOut;
+    cpuConsumeIo.bindInputBuffer("in", fromFpga)
+                .bindOutputBuffer("out", BufferType::I32, finalOut);
+    g.addNode(cpu, std::move(cpuConsumeIo), "cpu");
+
+    const std::vector<std::int32_t> input = {10, 20, 30, 40};
+    g.cpuDevice()->setInputBuffer("raw", input.data(), input.size() * sizeof(input[0]));
+
+    ASSERT_NO_THROW(g.compile());
+    ASSERT_NO_THROW(g.run());
+
+    std::vector<std::int32_t> output(input.size(), 0);
+    g.cpuDevice()->getOutputBuffer(finalOut.name(), output.data(),
+                                   output.size() * sizeof(output[0]));
+    EXPECT_EQ(output, input);
+
+    // The fake RP1 copied through the addresses packed after the scalar byte count.
+    EXPECT_GE(ddr_.nodes()[0].payload.kernel_dispatch.arg_count, 5u);
+}
+
+TEST_F(FpgaDeviceFixture, GraphReprogramNodeCompilesIntoFpgaDGraph) {
+    auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
+    Graph g = Graph::withDefaults();
+    g.registerDevice(dev);
+
+    ReprogramSpec spec;
+    spec.imageId = "imageB";
+    spec.pdiPath = "imageB.pdi";
+    spec.deviceHint = "fpga:0";
+
+    const std::string reprogramId = g.addReprogram(std::move(spec));
+    ASSERT_NO_THROW(g.compile());
+
+    const DGraph* fpgaDg = nullptr;
+    for (const DGraph& dg : g.dgraphs()) {
+        if (dg.deviceId == "fpga:0") fpgaDg = &dg;
+    }
+    ASSERT_NE(fpgaDg, nullptr);
+    ASSERT_EQ(fpgaDg->nodes.size(), 1u);
+    const auto* node = std::get_if<CompiledReprogramNode>(&fpgaDg->nodes[0]);
+    ASSERT_NE(node, nullptr);
+    EXPECT_EQ(node->id, reprogramId);
+    EXPECT_EQ(node->imageId, "imageB");
+    EXPECT_EQ(node->pdiPath, "imageB.pdi");
+}
+
+TEST_F(FpgaDeviceFixture, ReprogramNodeLowersToPdiLoad) {
+    const auto tmpDir = makeTempDir("fpga-reprogram-test");
+    const std::string pdiPath = writeTempFile(tmpDir, "imageB.pdi", "fake-pdi-bytes");
+
+    auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
+
+    DGraph dg;
+    dg.deviceId = "fpga:0";
+    dg.device = dev;
+
+    CompiledReprogramNode rp;
+    rp.id = "rp";
+    rp.deviceId = "fpga:0";
+    rp.imageId = "imageB";
+    rp.pdiPath = pdiPath;
+    rp.timeoutCycles = 12345u;
+    dg.nodes.emplace_back(rp);
+
+    auto plan = dev->compilePlan(dg);
+    ASSERT_NO_THROW(plan->launch());
+    ASSERT_NO_THROW(plan->wait());
+
+    EXPECT_EQ(ddr_.nodes()[0].opcode, RP1_OP_PDI_LOAD);
+    EXPECT_EQ(ddr_.nodes()[0].payload.pdi_load.timeout_cycles, 12345u);
+    const std::uint64_t pdiAddr =
+        static_cast<std::uint64_t>(ddr_.nodes()[0].payload.pdi_load.pdi_addr_lo) |
+        (static_cast<std::uint64_t>(ddr_.nodes()[0].payload.pdi_load.pdi_addr_hi) << 32);
+    EXPECT_GE(pdiAddr, static_cast<std::uint64_t>(RP1_CTRL_PHYS_ADDR));
+    EXPECT_EQ(ddr_.nodes()[1].opcode, RP1_OP_SIGNAL);
+    EXPECT_EQ(ddr_.signals()[kDefaultSentinelSlot].value, kDefaultSentinelValue);
+
+    std::filesystem::remove_all(tmpDir);
+}
+
+TEST_F(FpgaDeviceFixture, KernelImageMismatchRequiresReprogram) {
+    auto spec = std::make_shared<fpga::FpgaVbinSpec>();
+    fpga::FpgaImageSpec imageA;
+    imageA.id = "imageA";
+    imageA.pdiPath = "a.pdi";
+    fpga::FpgaKernelSpec kernelA;
+    kernelA.name = "kA";
+    kernelA.r5_base_addr = kKernelA_R5;
+    imageA.kernels.emplace("kA", kernelA);
+    spec->addImage(std::move(imageA));
+
+    fpga::FpgaImageSpec imageB;
+    imageB.id = "imageB";
+    imageB.pdiPath = "b.pdi";
+    fpga::FpgaKernelSpec kernelB;
+    kernelB.name = "kA";
+    kernelB.r5_base_addr = kKernelB_R5;
+    imageB.kernels.emplace("kA", kernelB);
+    spec->addImage(std::move(imageB));
+
+    auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, spec, "imageA");
+
+    DGraph dg;
+    dg.deviceId = "fpga:0";
+    dg.device = dev;
+
+    CompiledKernelNode k;
+    k.id = "kA";
+    k.deviceId = "fpga:0";
+    k.kernel = fpgaKernel("kA");
+    k.kernel.image = "imageB";
+    dg.nodes.emplace_back(k);
+
+    EXPECT_THROW(dev->compilePlan(dg), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

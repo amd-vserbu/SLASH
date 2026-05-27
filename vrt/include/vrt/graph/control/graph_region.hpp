@@ -82,6 +82,25 @@ class GraphRegion : public std::enable_shared_from_this<GraphRegion> {
         return nodeId;
     }
 
+    std::string addReprogram(ReprogramSpec spec) {
+        if (spec.imageId.empty()) {
+            throw std::invalid_argument("GraphRegion::addReprogram: image id must not be empty");
+        }
+        if (spec.pdiPath.empty()) {
+            throw std::invalid_argument("GraphRegion::addReprogram: PDI path must not be empty");
+        }
+        ReprogramOp op;
+        op.id = nextOpId("reprogram");
+        op.imageId = std::move(spec.imageId);
+        op.pdiPath = std::move(spec.pdiPath);
+        op.deviceHint = std::move(spec.deviceHint);
+        op.timeoutCycles = spec.timeoutCycles;
+        op.afterOps = std::move(spec.afterOps);
+        const std::string id = op.id;
+        addOp(std::move(op));
+        return id;
+    }
+
     /**
      * @brief Import parent-scope tokens into this region at its entry.
      *

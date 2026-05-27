@@ -39,14 +39,15 @@
 namespace vrt::graph {
 
 class CpuDevice;
+class FpgaDevice;
 
 class CpuFpgaBridge : public IBridge {
    public:
     /**
      * @brief Construct a bridge bound to a specific (src, dst) device pair.
      *
-     * Exactly one of the endpoints must be a CpuDevice; the other is the
-     * FPGA endpoint (currently a stub — see `makeTransfer`).
+     * Exactly one of the endpoints must be a CpuDevice; the other must be
+     * an FpgaDevice.
      */
     CpuFpgaBridge(IDevice& src, IDevice& dst);
 
@@ -65,7 +66,9 @@ class CpuFpgaBridge : public IBridge {
    private:
     SemaphorePool pool_;
     CpuDevice*    srcCpu_ = nullptr;
+    FpgaDevice*   srcFpga_ = nullptr;
     CpuDevice*    dstCpu_ = nullptr;
+    FpgaDevice*   dstFpga_ = nullptr;
 };
 
 /**

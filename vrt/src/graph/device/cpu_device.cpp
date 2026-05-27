@@ -25,6 +25,7 @@
 
 #include <vrt/graph/device/cpu_device.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -41,6 +42,8 @@
 namespace vrt::graph {
 
 namespace {
+
+constexpr std::chrono::seconds kBridgeWaitTimeout{35};
 
 template <typename T>
 T bitsAs(uint64_t bits) {
@@ -131,6 +134,9 @@ class CpuDevicePlan : public IDevicePlan {
                     } else if constexpr (std::is_same_v<T, CompiledConditionalNode>) {
                         rt.kind = NodeKind::Conditional;
                         rt.conditional = n;
+                    } else if constexpr (std::is_same_v<T, CompiledReprogramNode>) {
+                        throw std::runtime_error(
+                            "CpuDevice: reprogram nodes must execute on an FPGA device");
                     } else {
                         static_assert(sizeof(T) == 0, "Unhandled compiled node type");
                     }
@@ -266,11 +272,13 @@ class CpuDevicePlan : public IDevicePlan {
         };
 
         size_t rrCursor = 0;
+        auto idleSince = std::chrono::steady_clock::now();
         for (;;) {
             while (!readyKP.empty()) {
                 size_t idx = readyKP.front();
                 readyKP.pop_front();
                 runIndex(idx);
+                idleSince = std::chrono::steady_clock::now();
             }
             if (pendingCons.empty()) break;
 
@@ -283,11 +291,21 @@ class CpuDevicePlan : public IDevicePlan {
                                       static_cast<std::ptrdiff_t>(rrCursor));
                     runIndex(idx);
                     fired = true;
+                    idleSince = std::chrono::steady_clock::now();
                     break;
                 }
                 ++rrCursor;
             }
             if (!fired) {
+                if (std::chrono::steady_clock::now() - idleSince > kBridgeWaitTimeout) {
+                    std::string pending;
+                    for (size_t idx : pendingCons) {
+                        if (!pending.empty()) pending += ", ";
+                        pending += runtime_[idx].id;
+                    }
+                    throw std::runtime_error(
+                        "CpuDevice: timed out waiting for bridge consumer(s): " + pending);
+                }
                 std::this_thread::yield();
             }
         }

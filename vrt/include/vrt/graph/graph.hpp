@@ -472,6 +472,12 @@ class Graph {
         return nodeId;
     }
 
+    std::string addReprogram(ReprogramSpec spec) {
+        const std::string id = rootRegion_->addReprogram(std::move(spec));
+        invalidateCompiledState();
+        return id;
+    }
+
     std::string addLoop(LoopSpec spec) {
         const std::string id = rootRegion_->addLoop(std::move(spec));
         invalidateCompiledState();

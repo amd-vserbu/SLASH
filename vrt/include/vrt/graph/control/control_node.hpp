@@ -72,6 +72,25 @@ struct KernelOp {
     std::vector<std::string> afterOps;
 };
 
+struct ReprogramSpec {
+    std::string imageId;
+    std::string pdiPath;
+    std::string deviceHint;
+    uint32_t timeoutCycles = 0;
+    std::vector<std::string> afterOps;
+};
+
+struct ReprogramOp {
+    std::string id;
+    std::string imageId;
+    std::string pdiPath;
+    std::string deviceHint;
+    uint32_t timeoutCycles = 0;
+    IOTypeMap ioType;
+    IOMap ioMap;
+    std::vector<std::string> afterOps;
+};
+
 struct SubgraphBoundaryOp {
     std::string id;
     BoundarySide side = BoundarySide::Start;
@@ -139,7 +158,7 @@ struct ConditionalOp {
     std::vector<std::string> afterOps;
 };
 
-using RegionOp = std::variant<KernelOp, SubgraphBoundaryOp, LoopOp, ConditionalOp>;
+using RegionOp = std::variant<KernelOp, ReprogramOp, SubgraphBoundaryOp, LoopOp, ConditionalOp>;
 
 inline const std::string& regionOpId(const RegionOp& op) {
     return std::visit(
