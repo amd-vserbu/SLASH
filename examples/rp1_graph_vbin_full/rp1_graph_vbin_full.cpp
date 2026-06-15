@@ -448,17 +448,9 @@ int main(int argc, char** argv) try {
         "cpu",
         {fpgaNodeB});
 
-    IOTypeMap loopIoType;
-    loopIoType.outputBuffers.push_back({"out", BufferType::I32});
-    IOMap loopIo;
-    GraphBuffer loopOut;
-    loopIo.bindOutputBuffer("out", BufferType::I32, loopOut, graph.rootRegion().scopeId());
-
-    body->exportToParent(std::vector<BufferBoundaryMapping>{{finalized, loopOut}}, {finalize});
+    body->exportToParent(std::vector<BufferBoundaryMapping>{{finalized, preState}}, {finalize});
 
     LoopSpec loop;
-    loop.ioType = std::move(loopIoType);
-    loop.ioMap = std::move(loopIo);
     loop.tripCount = LoopTripCount::constant<std::uint32_t>(cli.iterations);
     loop.body = body;
     loop.afterOps = {preprocess};
@@ -466,7 +458,7 @@ int main(int argc, char** argv) try {
 
     GraphBuffer finalOut;
     graph.addNode(KernelDescriptor{"cpu_report", DeviceType::CPU, std::nullopt, cpuVectorIo()},
-                  bindCpuVector(loopOut, BufferType::I32, finalOut, graph.rootRegion().scopeId()),
+                  bindCpuVector(preState, BufferType::I32, finalOut, graph.rootRegion().scopeId()),
                   "cpu",
                   {loopId});
 

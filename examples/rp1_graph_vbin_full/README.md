@@ -6,6 +6,8 @@ End-to-end example for the VRT graph FPGA backend with:
 - two exclusive user-region vbins loaded through `FpgaVbinSpec`;
 - explicit `Graph::addReprogram(...)` nodes lowering to RP1 `PDI_LOAD`;
 - a fixed-count graph loop that repeats CPU -> reprogram -> FPGA -> CPU -> reprogram -> FPGA -> CPU.
+- loop-carried state, where each iteration imports the previous iteration's
+  parent-scope buffer and exports the finalized state back to the same token.
 
 This example is intended as a runnable template for hardware bring-up. It builds
 the host application without Vivado when `BUILD_KERNELS=OFF`, but executing the
@@ -13,7 +15,9 @@ graph requires a V80 with RP1 firmware and both hardware vbins.
 
 ## Graph
 
-For each loop iteration:
+For each loop iteration, the loop body imports the current parent-scope state
+buffer, transforms it, and exports the finalized result back to that same parent
+state token:
 
 ```text
 CPU stage
@@ -26,7 +30,9 @@ CPU stage
 ```
 
 The root graph also has `cpu_preprocess` before the loop and `cpu_report`
-after the loop.
+after the loop. `cpu_report` reads the loop-carried state after all iterations
+complete, so `--iterations N` validates that data flows from iteration `i` into
+iteration `i + 1`.
 
 ## Files
 
@@ -106,3 +112,15 @@ ports but does not carry element type.
 Every loop iteration explicitly reprograms image A before the image A kernel
 and image B before the image B kernel. That makes the active-image transitions
 visible in graph authoring and avoids relying on out-of-band initial state.
+
+The loop body uses matching child-region boundaries:
+
+```text
+parent state -> child loop_in
+child finalized -> parent state
+```
+
+The compiler treats this as intentional loop-carried state. The loop consumes
+the initial `cpu_preprocess` output, republishes the same parent token after each
+iteration, and downstream `cpu_report` depends on the loop rather than on the
+pre-loop producer.
