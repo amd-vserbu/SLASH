@@ -763,6 +763,73 @@ std::vector<ConsumedBufferRef> consumedBufferRefs(const RegionOp& op);
 std::vector<std::string> consumedBufferKeys(const RegionOp& op);
 std::vector<std::string> producedBufferKeys(const RegionOp& op);
 
+struct ProducerMapInfo {
+    std::map<std::string, std::string> producers;
+    std::map<std::pair<std::string, std::string>, std::string> loopCarriedInitialProducers;
+};
+
+std::set<std::string> loopCarriedBufferKeys(const LoopOp& loop) {
+    std::set<std::string> imports;
+    std::set<std::string> exports;
+
+    for (const RegionOp& childOp : loop.body->ops()) {
+        const auto* boundary = std::get_if<SubgraphBoundaryOp>(&childOp);
+        if (!boundary) continue;
+        if (boundary->side == BoundarySide::Start) {
+            for (const auto& mapping : boundary->bufferMappings) {
+                if (mapping.source.scopeId() == boundary->parentScopeId) {
+                    imports.insert(scopedBufferKey(mapping.source.scopeId(), mapping.source.name()));
+                }
+            }
+        } else {
+            for (const auto& mapping : boundary->bufferMappings) {
+                if (mapping.target.scopeId() == boundary->parentScopeId) {
+                    exports.insert(scopedBufferKey(mapping.target.scopeId(), mapping.target.name()));
+                }
+            }
+        }
+    }
+
+    std::set<std::string> carried;
+    std::set_intersection(imports.begin(), imports.end(),
+                          exports.begin(), exports.end(),
+                          std::inserter(carried, carried.begin()));
+    return carried;
+}
+
+std::set<std::string> loopCarriedScalarKeys(const LoopOp& loop) {
+    std::set<std::string> imports;
+    std::set<std::string> exports;
+
+    for (const RegionOp& childOp : loop.body->ops()) {
+        const auto* boundary = std::get_if<SubgraphBoundaryOp>(&childOp);
+        if (!boundary) continue;
+        if (boundary->side == BoundarySide::Start) {
+            for (const auto& mapping : boundary->scalarMappings) {
+                if (!mapping.source.isConstant() &&
+                    mapping.source.scopeId() == boundary->parentScopeId) {
+                    imports.insert(scopedScalarKey(mapping.source.scopeId(),
+                                                   mapping.source.varName()));
+                }
+            }
+        } else {
+            for (const auto& mapping : boundary->scalarMappings) {
+                if (!mapping.target.isConstant() &&
+                    mapping.target.scopeId() == boundary->parentScopeId) {
+                    exports.insert(scopedScalarKey(mapping.target.scopeId(),
+                                                   mapping.target.varName()));
+                }
+            }
+        }
+    }
+
+    std::set<std::string> carried;
+    std::set_intersection(imports.begin(), imports.end(),
+                          exports.begin(), exports.end(),
+                          std::inserter(carried, carried.begin()));
+    return carried;
+}
+
 /// Build a "string about producer X" hint that mentions the boundary-mutation
 /// case explicitly. Helps authors spot stacked writes from a control op's
 /// end-boundary on top of an explicit producer port.
@@ -796,42 +863,65 @@ std::string multipleProducersMessage(const std::string& kind, const std::string&
            "sequence the writes via afterOps.";
 }
 
-std::map<std::string, std::string> buildRegionProducerMap(
-    const std::vector<const RegionOp*>& ops) {
-    std::map<std::string, std::string> producers;
+bool isLoopCarriedKey(const RegionOp& op, const std::string& key, bool scalar) {
+    const auto* loop = std::get_if<LoopOp>(&op);
+    if (!loop) return false;
+    const auto carried = scalar ? loopCarriedScalarKeys(*loop) : loopCarriedBufferKeys(*loop);
+    return carried.count(key) != 0;
+}
+
+ProducerMapInfo buildRegionProducerMapInfo(const std::vector<const RegionOp*>& ops,
+                                           bool scalar) {
+    ProducerMapInfo info;
     std::map<std::string, const RegionOp*> producerOps;
     for (const RegionOp* opPtr : ops) {
         const RegionOp& op = *opPtr;
         const std::string& opId = regionOpId(op);
-        for (const auto& key : producedBufferKeys(op)) {
-            auto [existing, inserted] = producers.emplace(key, opId);
+        const auto producedKeys = scalar ? producedScalarKeys(op) : producedBufferKeys(op);
+        for (const auto& key : producedKeys) {
+            auto [existing, inserted] = info.producers.emplace(key, opId);
             if (!inserted && existing->second != opId) {
-                throw std::runtime_error(multipleProducersMessage(
-                    "buffer", key, *producerOps[key], op));
+                const RegionOp& existingOp = *producerOps[key];
+                const bool existingIsCarriedLoop = isLoopCarriedKey(existingOp, key, scalar);
+                const bool currentIsCarriedLoop = isLoopCarriedKey(op, key, scalar);
+
+                if (existingIsCarriedLoop == currentIsCarriedLoop) {
+                    throw std::runtime_error(multipleProducersMessage(
+                        scalar ? "scalar" : "buffer", key, existingOp, op));
+                }
+
+                const std::string& loopId = existingIsCarriedLoop ? existing->second : opId;
+                const std::string& initialId = existingIsCarriedLoop ? opId : existing->second;
+                const auto initialKey = std::make_pair(loopId, key);
+                auto [initialIt, initialInserted] =
+                    info.loopCarriedInitialProducers.emplace(initialKey, initialId);
+                if (!initialInserted && initialIt->second != initialId) {
+                    throw std::runtime_error(
+                        "GraphCompiler: loop op '" + loopId +
+                        "' has multiple initial producers for carried " +
+                        std::string(scalar ? "scalar" : "buffer") + " '" + key + "'");
+                }
+
+                if (currentIsCarriedLoop) {
+                    existing->second = opId;
+                    producerOps[key] = &op;
+                }
+                continue;
             }
             if (inserted) producerOps[key] = &op;
         }
     }
-    return producers;
+    return info;
+}
+
+std::map<std::string, std::string> buildRegionProducerMap(
+    const std::vector<const RegionOp*>& ops) {
+    return buildRegionProducerMapInfo(ops, /*scalar=*/false).producers;
 }
 
 std::map<std::string, std::string> buildRegionScalarProducerMap(
     const std::vector<const RegionOp*>& ops) {
-    std::map<std::string, std::string> producers;
-    std::map<std::string, const RegionOp*> producerOps;
-    for (const RegionOp* opPtr : ops) {
-        const RegionOp& op = *opPtr;
-        const std::string& opId = regionOpId(op);
-        for (const auto& key : producedScalarKeys(op)) {
-            auto [existing, inserted] = producers.emplace(key, opId);
-            if (!inserted && existing->second != opId) {
-                throw std::runtime_error(multipleProducersMessage(
-                    "scalar", key, *producerOps[key], op));
-            }
-            if (inserted) producerOps[key] = &op;
-        }
-    }
-    return producers;
+    return buildRegionProducerMapInfo(ops, /*scalar=*/true).producers;
 }
 
 /**
@@ -843,9 +933,9 @@ std::map<std::string, std::string> buildRegionScalarProducerMap(
  * any test fixture that matches by id.
  */
 std::map<std::string, std::vector<std::string>> buildRegionAdjacency(
-    const std::vector<const RegionOp*>& ops) {
-    auto producers = buildRegionProducerMap(ops);
-    auto scalarProducers = buildRegionScalarProducerMap(ops);
+    const std::vector<const RegionOp*>& ops,
+    const ProducerMapInfo& bufferProducers,
+    const ProducerMapInfo& scalarProducers) {
 
     std::map<std::string, std::vector<std::string>> adj;
     for (const RegionOp* opPtr : ops) {
@@ -856,15 +946,29 @@ std::map<std::string, std::vector<std::string>> buildRegionAdjacency(
         const RegionOp& op = *opPtr;
         const std::string& opId = regionOpId(op);
         for (const auto& key : consumedBufferKeys(op)) {
-            auto producerIt = producers.find(key);
-            if (producerIt != producers.end() && producerIt->second != opId) {
-                adj[producerIt->second].push_back(opId);
+            auto carriedIt = bufferProducers.loopCarriedInitialProducers.find({opId, key});
+            std::string producerId;
+            if (carriedIt != bufferProducers.loopCarriedInitialProducers.end()) {
+                producerId = carriedIt->second;
+            } else if (auto producerIt = bufferProducers.producers.find(key);
+                       producerIt != bufferProducers.producers.end()) {
+                producerId = producerIt->second;
+            }
+            if (!producerId.empty() && producerId != opId) {
+                adj[producerId].push_back(opId);
             }
         }
         for (const auto& key : consumedScalarKeys(op)) {
-            auto producerIt = scalarProducers.find(key);
-            if (producerIt != scalarProducers.end() && producerIt->second != opId) {
-                adj[producerIt->second].push_back(opId);
+            auto carriedIt = scalarProducers.loopCarriedInitialProducers.find({opId, key});
+            std::string producerId;
+            if (carriedIt != scalarProducers.loopCarriedInitialProducers.end()) {
+                producerId = carriedIt->second;
+            } else if (auto producerIt = scalarProducers.producers.find(key);
+                       producerIt != scalarProducers.producers.end()) {
+                producerId = producerIt->second;
+            }
+            if (!producerId.empty() && producerId != opId) {
+                adj[producerId].push_back(opId);
             }
         }
         for (const auto& after : regionOpAfterOps(op)) {
@@ -2071,6 +2175,10 @@ class RegionCompiler {
         std::map<std::string, std::vector<DGraphChild>> childrenByControlId;
         std::map<std::string, std::string>              scalarProducerMap;
         std::map<std::string, std::string>              bufferProducerMap;
+        std::map<std::pair<std::string, std::string>, std::string>
+            loopCarriedInitialScalarProducers;
+        std::map<std::pair<std::string, std::string>, std::string>
+            loopCarriedInitialBufferProducers;
         std::map<std::string, CompiledLoopOutputPlacement>        loopOutputPlacements;
         std::map<std::string, CompiledConditionalOutputPlacement> conditionalOutputPlacements;
         uint32_t                                                  controlOutputBridgeCounter = 0;
@@ -2143,8 +2251,14 @@ class RegionCompiler {
     /// Build scalar / buffer producer maps and verify that every consumed
     /// token has a producer in scope (or is a graph-global).
     void validateProvenance(const GraphRegion& region, RegionCompilation& rc) const {
-        rc.scalarProducerMap = buildRegionScalarProducerMap(rc.ops);
-        rc.bufferProducerMap = buildRegionProducerMap(rc.ops);
+        ProducerMapInfo scalarProducers = buildRegionProducerMapInfo(rc.ops, /*scalar=*/true);
+        ProducerMapInfo bufferProducers = buildRegionProducerMapInfo(rc.ops, /*scalar=*/false);
+        rc.scalarProducerMap = std::move(scalarProducers.producers);
+        rc.bufferProducerMap = std::move(bufferProducers.producers);
+        rc.loopCarriedInitialScalarProducers =
+            std::move(scalarProducers.loopCarriedInitialProducers);
+        rc.loopCarriedInitialBufferProducers =
+            std::move(bufferProducers.loopCarriedInitialProducers);
         validateRegionScalarProvenance(region, rc.ops, rc.scalarProducerMap);
         validateRegionBufferProvenance(region, rc.ops, rc.bufferProducerMap);
     }
@@ -2218,7 +2332,13 @@ class RegionCompiler {
     /// Topologically sort the region's ops and pin each one to a device
     /// (kernels via deviceHint, control / boundary ops to the singleton CPU).
     void assignDevices(RegionCompilation& rc) const {
-        const auto adj = buildRegionAdjacency(rc.ops);
+        ProducerMapInfo bufferProducers;
+        bufferProducers.producers = rc.bufferProducerMap;
+        bufferProducers.loopCarriedInitialProducers = rc.loopCarriedInitialBufferProducers;
+        ProducerMapInfo scalarProducers;
+        scalarProducers.producers = rc.scalarProducerMap;
+        scalarProducers.loopCarriedInitialProducers = rc.loopCarriedInitialScalarProducers;
+        const auto adj = buildRegionAdjacency(rc.ops, bufferProducers, scalarProducers);
         rc.sortedIds = topoSortRegion(rc.ops, adj);
 
         for (const auto& id : rc.sortedIds) {
@@ -2326,9 +2446,16 @@ class RegionCompiler {
                     pushBufferDependency(rc, did, node, seen, ref);
                 }
                 for (const auto& scalarKey : consumedScalarKeys(source)) {
-                    auto producerIt = rc.scalarProducerMap.find(scalarKey);
-                    if (producerIt == rc.scalarProducerMap.end()) continue;
-                    const std::string& producerNodeId = producerIt->second;
+                    std::string producerNodeId;
+                    auto carriedIt = rc.loopCarriedInitialScalarProducers.find(
+                        {compiledNodeId(node), scalarKey});
+                    if (carriedIt != rc.loopCarriedInitialScalarProducers.end()) {
+                        producerNodeId = carriedIt->second;
+                    } else if (auto producerIt = rc.scalarProducerMap.find(scalarKey);
+                               producerIt != rc.scalarProducerMap.end()) {
+                        producerNodeId = producerIt->second;
+                    }
+                    if (producerNodeId.empty()) continue;
                     const std::string& producerDeviceId = rc.nodeDevice.at(producerNodeId);
                     if (producerDeviceId != did) {
                         throw std::runtime_error(
@@ -2459,9 +2586,16 @@ class RegionCompiler {
                                      const std::string& consumerDevId,
                                      const GraphBuffer& bufObj) {
         const std::string bufKey = scopedBufferKey(bufObj.scopeId(), bufObj.name());
-        auto prodIt = rc.bufferProducerMap.find(bufKey);
-        if (prodIt == rc.bufferProducerMap.end()) return;
-        const std::string& producerNodeId = prodIt->second;
+        std::string producerNodeId;
+        auto carriedIt = rc.loopCarriedInitialBufferProducers.find(
+            {regionOpId(consumerOp), bufKey});
+        if (carriedIt != rc.loopCarriedInitialBufferProducers.end()) {
+            producerNodeId = carriedIt->second;
+        } else if (auto prodIt = rc.bufferProducerMap.find(bufKey);
+                   prodIt != rc.bufferProducerMap.end()) {
+            producerNodeId = prodIt->second;
+        }
+        if (producerNodeId.empty()) return;
         const std::string& producerDevId = rc.nodeDevice.at(producerNodeId);
         if (producerDevId == consumerDevId) return;
 
@@ -2580,9 +2714,16 @@ class RegionCompiler {
                               std::set<std::string>& seen,
                               const ConsumedBufferRef& ref) const {
         auto pit = rc.bufferProducerMap.find(ref.key);
-        if (pit == rc.bufferProducerMap.end()) return;
-        if (rc.nodeDevice.at(pit->second) == did) {
-            addDep(node, seen, pit->second);
+        std::string producerNodeId;
+        auto carriedIt = rc.loopCarriedInitialBufferProducers.find({compiledNodeId(node), ref.key});
+        if (carriedIt != rc.loopCarriedInitialBufferProducers.end()) {
+            producerNodeId = carriedIt->second;
+        } else if (pit != rc.bufferProducerMap.end()) {
+            producerNodeId = pit->second;
+        }
+        if (producerNodeId.empty()) return;
+        if (rc.nodeDevice.at(producerNodeId) == did) {
+            addDep(node, seen, producerNodeId);
             return;
         }
         auto bridgeIt = rc.remoteConsumerBridgeIds.find({ref.key, did});
