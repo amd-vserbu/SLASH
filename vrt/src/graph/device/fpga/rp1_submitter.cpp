@@ -73,6 +73,20 @@ void Rp1Submitter::ensureReady(std::chrono::milliseconds timeout) {
     waitForMagic(timeout);
     waitForState(RP1_STATE_READY, timeout);
 
+    // Reject a half-deployed firmware/host mix.  The on-wire layout
+    // (notably the KERNEL_DISPATCH argument buffer) is version-specific, so
+    // running mismatched halves silently corrupts dispatched kernels.  The
+    // firmware publishes its protocol version into the control block once it
+    // reaches READY; assert it matches what this host was built against.
+    const std::uint32_t fw_version = window_->readU32(offsetof(rp1_ctrl_t, version));
+    if (fw_version != RP1_PROTOCOL_VERSION) {
+        throw std::runtime_error(
+            "Rp1Submitter: RP1 firmware protocol version mismatch (firmware reports v" +
+            std::to_string(fw_version) + ", host built for v" +
+            std::to_string(RP1_PROTOCOL_VERSION) +
+            "); reflash rp1.elf and rebuild libvrt from the same tree before running");
+    }
+
     // Program the recommended base addresses + cq_size by writing
     // host-owned fields individually.  We must NOT bulk-write the 4 KB
     // control block here: the firmware concurrently updates its own
