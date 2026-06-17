@@ -128,13 +128,19 @@ Bit 3-15: reserved
 ```
 0x10    4B    kernel_base_addr    -- AXI-Lite base address (R5 address space)
 0x14    4B    arg_buffer_offset   -- Offset into DDR arg buffer for staged arguments
-0x18    2B    arg_count           -- Number of 32-bit argument words
+0x18    2B    arg_count           -- Number of (reg_offset, value) argument pairs
 0x1A    2B    ctrl_flags          -- Bit 0: auto-restart
 0x1C    4B    timeout_cycles      -- Watchdog timeout (0 = default 10M cycles)
 0x20    28B   reserved
 ```
 
-The host pre-stages kernel arguments contiguously in the argument buffer. RP1 reads `arg_count` words from `arg_buffer_offset` and writes them sequentially to `kernel_base_addr + 0x10, 0x14, 0x18, ...` (standard HLS argument register offsets). Then writes 0x01 to `kernel_base_addr + 0x00` (ap_start).
+The host pre-stages kernel arguments in the argument buffer as an array of
+`rp1_kernel_arg_t` `(reg_offset, value)` pairs (protocol v2). RP1 reads
+`arg_count` pairs from `arg_buffer_offset` and writes each `value` to
+`kernel_base_addr + reg_offset`. This honours the non-contiguous register
+layout real HLS `s_axilite` maps produce (e.g. `n@0x10`, `in@0x1c`, `out@0x28`
+with reserved gaps); a 64-bit argument is two consecutive pairs. Then RP1
+writes 0x01 to `kernel_base_addr + 0x00` (ap_start).
 
 All kernel dispatches are non-blocking from the scanner's perspective. The scanner launches the kernel, marks the node DISPATCHED (or DONE if INFINITE), and continues scanning. When `ap_done` fires (detected by `check_inflight_kernels()`), the node transitions to DONE and its barriers are set.
 
@@ -597,9 +603,9 @@ HALT opcode is supplemental. It provides an explicit early exit for graphs that 
 When the scanner executes KERNEL_DISPATCH:
 
 ```
-1. Read arg_count words from arg_buffer[arg_buffer_offset]
+1. args = (rp1_kernel_arg_t *) &arg_buffer[arg_buffer_offset]
 2. For i in 0..arg_count-1:
-     AXI_WRITE(kernel_base_addr + 0x10 + i*4, arg_buffer[i])
+     AXI_WRITE(kernel_base_addr + args[i].reg_offset, args[i].value)
 3. DSB()                                    // Ensure all args written
 4. AXI_WRITE(kernel_base_addr + 0x00, 0x01) // ap_start
 5. Add to inflight table, continue scanning
@@ -945,7 +951,7 @@ internal plumbing):
 |-------|--------|------|
 | `Rp1BarWindow` | `device/fpga/rp1_bar_window.hpp` | Owns the `vrtd::BarFile` for BAR4. Each method brackets exactly one BAR access through `BarFile::getPtr<T>(Direction, offset)` so the dma-buf `SYNC_START` / `SYNC_END` contract is honoured. |
 | `Rp1Submitter` | `device/fpga/rp1_submitter.hpp` | Programs the control block on first use (`ensureReady`), stages a fully-realised `Rp1GraphImage`, bumps `graph_seq`, polls `graph_done_seq`. Knows nothing about graphs or kernels. |
-| `FpgaDevice : IDevice` | `device/fpga_device.hpp` | Lowers a `vrt::graph::DGraph` into an `Rp1GraphImage`. Walks the topologically-ordered `CompiledKernelNode`s, allocates one barrier bit per kernel in bucket 0 (bit 31 reserved for the sentinel), packs scalar args from each `IOMap` into a contiguous argument buffer, and appends a trailing `RP1_OP_SIGNAL` whose `await_mask` is the OR of every leaf kernel's set-bit. |
+| `FpgaDevice : IDevice` | `device/fpga_device.hpp` | Lowers a `vrt::graph::DGraph` into an `Rp1GraphImage`. Walks the topologically-ordered `CompiledKernelNode`s, allocates one barrier bit per kernel in bucket 0 (bit 31 reserved for the sentinel), packs scalar args from each `IOMap` into the argument buffer as `(reg_offset, value)` pairs (using each kernel's `system_map` register offsets), and appends a trailing `RP1_OP_SIGNAL` whose `await_mask` is the OR of every leaf kernel's set-bit. |
 
 Authoring stays in `vrt::graph::Graph` — there is no separate
 `GraphBuilder` type. The user calls `Graph::withDefaults()`,
