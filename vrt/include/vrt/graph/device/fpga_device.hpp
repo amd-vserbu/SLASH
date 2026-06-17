@@ -56,8 +56,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
+#include <vrt/allocator/allocator.hpp>
 #include <vrt/buffer.hpp>
 #include <vrt/device.hpp>
 #include <vrt/graph/device/device.hpp>
@@ -76,9 +78,10 @@ class FpgaVbinSpec;
  * @brief Resolves a kernel's logical name to its AXI-Lite base address
  *        in R5 address space.
  *
- * The R5 address is what the firmware writes to as `+0x10, +0x14, ...`
- * for arguments and `+0x00` for `ap_start`.  Convert from the host-view
- * address in `system_map.xml` via:
+ * The R5 address is the AXI-Lite base; the firmware writes `+0x00` for
+ * `ap_start` and each argument at its own register byte offset (from the
+ * system_map, e.g. `+0x10`, `+0x1c`, `+0x28` — not necessarily contiguous).
+ * Convert from the host-view address in `system_map.xml` via:
  *
  *     r5_addr = xml_addr - 0x0202'0000'0000 + 0x8800'0000
  */
@@ -207,10 +210,14 @@ class FpgaDevice : public IDevice {
     friend class FpgaDevicePlan;
 
     struct BufferRecord {
-        std::uint32_t offset = 0;     ///< Window-relative byte offset.
+        std::uint32_t offset = 0;     ///< Window-relative byte offset (BAR mode).
         std::size_t   size = 0;       ///< Logical bytes currently valid.
-        std::size_t   capacity = 0;   ///< Allocated bytes in the BAR arena.
+        std::size_t   capacity = 0;   ///< Allocated bytes.
         BufferType    type = BufferType::U8;
+        /// Device-memory backing (HBM/DDR) when the kernel's m_axi region is
+        /// known and a staging device is configured.  When null the buffer
+        /// lives in the BAR window at @ref offset (mock/test fallback).
+        std::shared_ptr<::vrt::Buffer<std::uint8_t>> mem;
     };
 
     struct StagedPdiRecord {
@@ -222,8 +229,39 @@ class FpgaDevice : public IDevice {
     static std::string normalizeBufferKey(const std::string& bufferName);
 
     BufferRecord ensureBuffer(const GraphBuffer& buffer, std::size_t sizeBytes);
+    /// Unified allocation core (caller must hold @ref bufferMutex_).  Allocates
+    /// in device memory when @ref bufferRegion_ has @p key and a staging device
+    /// is configured; otherwise carves space from the BAR-window arena.
+    BufferRecord ensureBufferByKey(const std::string& key, BufferType type,
+                                   std::size_t sizeBytes);
     std::uint64_t bufferDeviceAddress(const GraphBuffer& buffer, std::size_t sizeBytes);
+    /// Walk a DGraph's kernel buffer bindings and record each bound buffer's
+    /// m_axi memory region into @ref bufferRegion_ (keyed by scoped buffer
+    /// name) so later allocation lands in the region the kernel can reach.
+    void populateBufferRegions(const DGraph& dg);
     FpgaKernelLocation resolveKernelLocation(const KernelDescriptor& kernel) const;
+    /// Maps each functional-arg name to its AXI-Lite register byte offset
+    /// (from the system_map of the active/declared image).  Returns an empty
+    /// map when no vbin spec is configured (e.g. the mock lookup path), in
+    /// which case the argument packer falls back to a contiguous layout from
+    /// `0x10`.
+    std::map<std::string, std::uint32_t> kernelArgOffsets(const KernelDescriptor& kernel) const;
+    /// Map a kernel descriptor's (possibly user-renamed) buffer/scalar port
+    /// names to the underlying system_map argument names, by positional
+    /// (per-category, declaration-order) correspondence between the
+    /// descriptor's IOTypeMap and the spec's canonical IOTypeMap.  This lets
+    /// graphs bind ports by arbitrary names (e.g. `image_a_out`) while the
+    /// register offsets and memory regions still resolve against the real
+    /// HLS arg names (e.g. `out_r`).  Empty on the mock/lookup path.
+    std::map<std::string, std::string> descriptorPortToArgName(
+        const KernelDescriptor& kernel) const;
+    /// Resolve the m_axi memory region a kernel buffer port is wired to (from
+    /// the active/declared image's system_map connections), applying the same
+    /// `<name>_out` alias the argument packer uses.  Returns `std::nullopt`
+    /// when no vbin spec/connection is available (mock path or unconnected
+    /// port), in which case the caller falls back to the BAR-window arena.
+    std::optional<::vrt::MemoryConfig> resolveBufferRegion(
+        const KernelDescriptor& kernel, const std::string& portName) const;
     std::uint64_t stagePdiBytes(const std::string& cacheKey,
                                 const std::vector<std::uint8_t>& bytes);
     std::uint64_t stagePdiFile(const std::string& pdiPath);
@@ -241,6 +279,7 @@ class FpgaDevice : public IDevice {
 
     mutable std::mutex                     bufferMutex_;
     std::map<std::string, BufferRecord>    buffers_;
+    std::map<std::string, ::vrt::MemoryConfig> bufferRegion_;
     std::uint32_t                          nextBufferOffset_ = 0;
     mutable std::mutex                     pdiMutex_;
     std::shared_ptr<::vrt::Device>          pdiStagingDevice_;

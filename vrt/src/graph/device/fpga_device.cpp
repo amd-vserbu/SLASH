@@ -22,9 +22,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -34,6 +36,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -158,6 +161,86 @@ void ensureArgCapacity(std::uint32_t cursor_words,
     }
 }
 
+/// Default AXI-Lite register offset of the first argument when no system_map
+/// is available (mock/lookup path).  Matches HLS' conventional AP-block base
+/// and the historical contiguous layout.
+constexpr std::uint32_t kApArgBlockBase = 0x10u;
+
+/// Resolves the AXI-Lite register byte offset for each kernel port.
+///
+/// When constructed from a non-empty `system_map` offset table (real vbin),
+/// every port must be present and its offset is honoured exactly.  When the
+/// table is empty (mock/lookup path) offsets are handed out contiguously from
+/// `kApArgBlockBase`, reproducing the historical dense layout.
+class ArgLayout {
+   public:
+    ArgLayout(std::map<std::string, std::uint32_t> offsets,
+              std::string kernelName)
+        : offsets_(std::move(offsets)),
+          kernelName_(std::move(kernelName)),
+          haveSpec_(!offsets_.empty()) {}
+
+    /// Returns the base register offset for a port occupying @p words 32-bit
+    /// words.  On the contiguous path this also advances the running cursor.
+    std::uint32_t take(const std::string& port, std::uint32_t words) {
+        if (haveSpec_) {
+            return baseFor(port);
+        }
+        const std::uint32_t base = fallback_;
+        fallback_ += words * 4u;
+        return base;
+    }
+
+   private:
+    std::uint32_t baseFor(const std::string& port) const {
+        auto it = offsets_.find(port);
+        if (it != offsets_.end()) {
+            return it->second;
+        }
+        // An RW buffer's synthetic "<name>_out" port shares the single HLS
+        // pointer register named "<name>".  (Phase-1 limitation: in and out
+        // addresses are both written to that one register; tracked for a
+        // future protocol revision that distinguishes them.)
+        if (port.size() > 4 &&
+            port.compare(port.size() - 4, 4, "_out") == 0) {
+            auto in = offsets_.find(port.substr(0, port.size() - 4));
+            if (in != offsets_.end()) {
+                return in->second;
+            }
+        }
+        throw std::runtime_error(
+            "FpgaDevice: kernel '" + kernelName_ + "' port '" + port +
+            "' has no s_axilite register offset in the system_map");
+    }
+
+    std::map<std::string, std::uint32_t> offsets_;
+    std::string                          kernelName_;
+    bool                                 haveSpec_;
+    std::uint32_t                        fallback_ = kApArgBlockBase;
+};
+
+/// Appends @p width (reg_offset, value) pairs to @p arg_buf, one per 32-bit
+/// value word, with register offset `base_offset + 4*w`.  Returns the arg_buf
+/// word index of the first *value* word (every other word from there, because
+/// the pairs interleave offset/value) — used to patch deferred scalars later.
+std::uint32_t appendArgWordsAsPairs(std::vector<std::uint32_t>& arg_buf,
+                                    std::uint32_t& cursor_words,
+                                    std::uint32_t base_offset,
+                                    const std::uint32_t* words,
+                                    std::uint32_t width,
+                                    const std::string& kernelName,
+                                    const std::string& portName) {
+    ensureArgCapacity(cursor_words, width * 2u, kernelName, portName);
+    arg_buf.resize(cursor_words + width * 2u, 0u);
+    const std::uint32_t firstValueWord = cursor_words + 1u;
+    for (std::uint32_t w = 0; w < width; ++w) {
+        arg_buf[cursor_words + 2u * w]      = base_offset + 4u * w;
+        arg_buf[cursor_words + 2u * w + 1u] = words[w];
+    }
+    cursor_words += width * 2u;
+    return firstValueWord;
+}
+
 /// Bookkeeping for a single global-scalar binding that must be
 /// re-read from the per-graph scalar map at launch time.
 struct DeferredScalar {
@@ -165,7 +248,9 @@ struct DeferredScalar {
     std::string  fallbackKey;        // bare varName (used iff scopeId==0)
     bool         hasFallback;
     ScalarType   type;
-    std::uint32_t arg_word_offset;   // absolute index in arg_buf
+    std::uint32_t arg_word_offset;   // arg_buf index of the first *value* word
+                                     // of this scalar's (offset,value) pairs;
+                                     // subsequent words are at +2 each.
     std::string  diagnostic;         // "<kernelId>.<portName>"
 };
 
@@ -377,8 +462,14 @@ class FpgaDevicePlan : public IDevicePlan {
                     "FpgaDevicePlan: global scalar bound to port '" + d.diagnostic +
                     "' is not set in the graph scalar map (key='" + d.scopedKey + "')");
             }
-            writeScalarToArgWords(d.type, it->second,
-                                  image_.arg_buf.data() + d.arg_word_offset);
+            // Values live in the odd (value) words of the interleaved
+            // (reg_offset, value) pairs, so scatter them at a stride of 2.
+            std::uint32_t words[2] = {0u, 0u};
+            writeScalarToArgWords(d.type, it->second, words);
+            const std::uint32_t width = scalarWidthInWords(d.type);
+            for (std::uint32_t w = 0; w < width; ++w) {
+                image_.arg_buf[d.arg_word_offset + 2u * w] = words[w];
+            }
         }
     }
 
@@ -426,16 +517,18 @@ class FpgaDevicePlan : public IDevicePlan {
 
     void appendBufferAddress(fpga::Rp1GraphImage& image,
                              const CompiledKernelNode& node,
+                             ArgLayout& layout,
                              const std::string& portName,
                              const GraphBuffer& buffer,
                              std::size_t sizeBytes,
                              std::uint32_t& cursor_words,
                              std::uint32_t& arg_count) {
-        ensureArgCapacity(cursor_words, 2u, node.kernel.name, portName);
-        image.arg_buf.resize(cursor_words + 2u, 0u);
         const std::uint64_t addr = device_->bufferDeviceAddress(buffer, sizeBytes);
-        writeU64ToArgWords(addr, image.arg_buf.data() + cursor_words);
-        cursor_words += 2u;
+        std::uint32_t words[2] = {0u, 0u};
+        writeU64ToArgWords(addr, words);
+        const std::uint32_t base = layout.take(portName, 2u);
+        appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, 2u,
+                              node.kernel.name, portName);
         arg_count += 2u;
     }
 
@@ -443,6 +536,8 @@ class FpgaDevicePlan : public IDevicePlan {
                                  const CompiledKernelNode& node) {
         std::uint32_t cursor_words = static_cast<std::uint32_t>(image.arg_buf.size());
         std::uint32_t arg_count = 0;
+
+        ArgLayout layout(device_->kernelArgOffsets(node.kernel), node.kernel.name);
 
         const auto& boundScalars = node.ioMap.scalars();
         for (const ScalarPort& port : node.kernel.ioType.inputScalars) {
@@ -453,12 +548,13 @@ class FpgaDevicePlan : public IDevicePlan {
                     "' input scalar port '" + port.name + "' has no IOMap binding");
             }
             const std::uint32_t width = scalarWidthInWords(port.type);
-            ensureArgCapacity(cursor_words, width, node.kernel.name, port.name);
-            image.arg_buf.resize(cursor_words + width, 0u);
+            std::uint32_t words[2] = {0u, 0u};
             writeScalarToArgWords(port.type,
                                   scalarBits(it->second, node.id + "." + port.name),
-                                  image.arg_buf.data() + cursor_words);
-            cursor_words += width;
+                                  words);
+            const std::uint32_t base = layout.take(port.name, width);
+            appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, width,
+                                  node.kernel.name, port.name);
             arg_count += width;
         }
 
@@ -479,7 +575,7 @@ class FpgaDevicePlan : public IDevicePlan {
                     "FpgaDevice: kernel '" + node.kernel.name +
                     "' input buffer port '" + port.name + "' has no IOMap binding");
             }
-            appendBufferAddress(image, node, port.name, it->second,
+            appendBufferAddress(image, node, layout, port.name, it->second,
                                 currentBufferSize(it->second), cursor_words, arg_count);
         }
 
@@ -491,7 +587,7 @@ class FpgaDevicePlan : public IDevicePlan {
                     "' output buffer port '" + port.name + "' has no IOMap binding");
             }
             const std::size_t existing = currentBufferSize(it->second);
-            appendBufferAddress(image, node, port.name, it->second,
+            appendBufferAddress(image, node, layout, port.name, it->second,
                                 std::max(defaultSize, existing), cursor_words, arg_count);
         }
 
@@ -509,9 +605,9 @@ class FpgaDevicePlan : public IDevicePlan {
                     port.out.name + "' have no IOMap binding");
             }
             const std::size_t inSize = currentBufferSize(it->in);
-            appendBufferAddress(image, node, port.in.name, it->in,
+            appendBufferAddress(image, node, layout, port.in.name, it->in,
                                 inSize, cursor_words, arg_count);
-            appendBufferAddress(image, node, port.out.name, it->out,
+            appendBufferAddress(image, node, layout, port.out.name, it->out,
                                 std::max(inSize, currentBufferSize(it->out)),
                                 cursor_words, arg_count);
         }
@@ -519,9 +615,31 @@ class FpgaDevicePlan : public IDevicePlan {
         if (arg_count > UINT16_MAX) {
             throw std::logic_error(
                 "FpgaDevice: kernel '" + node.kernel.name + "' has " +
-                std::to_string(arg_count) + " arg words, exceeds uint16_t cap");
+                std::to_string(arg_count) + " arg pairs, exceeds uint16_t cap");
         }
         return arg_count;
+    }
+
+    // Opt-in diagnostic: dump the kernel base and the (reg_offset, value)
+    // argument pairs RP1 will write.  Enabled by setting VRT_FPGA_DEBUG_ARGS
+    // in the environment; invaluable for confirming the v2 packing against a
+    // real s_axilite register map during hardware bring-up.
+    static void dumpKernelArgs(const std::string& kernelName,
+                               const rp1_payload_kernel_dispatch_t& kd,
+                               const std::vector<std::uint32_t>& arg_buf) {
+        static const bool enabled = (std::getenv("VRT_FPGA_DEBUG_ARGS") != nullptr);
+        if (!enabled) return;
+        const std::uint32_t firstWord = kd.arg_buffer_offset / sizeof(std::uint32_t);
+        std::cerr << "[FpgaDevice] dispatch '" << kernelName << "' base=0x" << std::hex
+                  << kd.kernel_base_addr << std::dec << " arg_count=" << kd.arg_count
+                  << " (reg_offset, value) pairs:";
+        for (std::uint32_t i = 0; i < kd.arg_count; ++i) {
+            const std::uint32_t w = firstWord + 2u * i;
+            if (w + 1u >= arg_buf.size()) break;
+            std::cerr << "\n    +0x" << std::hex << arg_buf[w]
+                      << " = 0x" << arg_buf[w + 1u] << std::dec;
+        }
+        std::cerr << std::endl;
     }
 
     void executeKernel(const KernelRuntime& kernel) {
@@ -549,6 +667,8 @@ class FpgaDevicePlan : public IDevicePlan {
         kd.arg_count = static_cast<std::uint16_t>(argCount);
         kd.ctrl_flags = 0;
         kd.timeout_cycles = location.timeout_cycles;
+
+        dumpKernelArgs(kernel.node.kernel.name, kd, image.arg_buf);
 
         rp1_node_t& sentinel = image.nodes[1];
         sentinel.opcode = RP1_OP_SIGNAL;
@@ -792,41 +912,103 @@ std::string FpgaDevice::normalizeBufferKey(const std::string& bufferName) {
     return scopedBufferKey(0, bufferName);
 }
 
+FpgaDevice::BufferRecord FpgaDevice::ensureBufferByKey(const std::string& key,
+                                                       BufferType type,
+                                                       std::size_t sizeBytes) {
+    // Caller must hold bufferMutex_.
+    auto regionIt = bufferRegion_.find(key);
+    const bool deviceMode = (pdiStagingDevice_ != nullptr) &&
+                            (regionIt != bufferRegion_.end());
+
+    auto it = buffers_.find(key);
+    if (it != buffers_.end() && it->second.capacity >= sizeBytes &&
+        ((it->second.mem != nullptr) == deviceMode)) {
+        if (it->second.size < sizeBytes) it->second.size = sizeBytes;
+        it->second.type = type;
+        return it->second;
+    }
+
+    BufferRecord rec;
+    rec.size = sizeBytes;
+    rec.capacity = sizeBytes;
+    rec.type = type;
+
+    if (deviceMode) {
+        // Allocate in the region the kernel's m_axi master can reach.  vrt
+        // buffers are fixed-size, so allocate at least one byte and grow by
+        // reallocation when a later size exceeds the current capacity.
+        const std::size_t allocBytes = std::max<std::size_t>(sizeBytes, 1u);
+        rec.mem = std::make_shared<::vrt::Buffer<std::uint8_t>>(
+            *pdiStagingDevice_, allocBytes, regionIt->second);
+        rec.capacity = allocBytes;
+    } else {
+        const std::uint32_t alignedOffset = alignUp(nextBufferOffset_, 64u);
+        const std::uint64_t end = static_cast<std::uint64_t>(alignedOffset) +
+                                  static_cast<std::uint64_t>(sizeBytes);
+        if (end > fpga::Rp1BarWindow::kWindowSize) {
+            throw std::out_of_range(
+                "FpgaDevice: BAR-backed buffer arena exhausted while allocating '" +
+                key + "' (" + std::to_string(sizeBytes) + " bytes)");
+        }
+        rec.offset = alignedOffset;
+        nextBufferOffset_ = static_cast<std::uint32_t>(end);
+    }
+
+    buffers_[key] = rec;
+    return rec;
+}
+
 FpgaDevice::BufferRecord FpgaDevice::ensureBuffer(const GraphBuffer& buffer,
                                                   std::size_t sizeBytes) {
     const std::string key = scopedBufferKey(buffer.scopeId(), buffer.name());
     std::lock_guard<std::mutex> lk(bufferMutex_);
-
-    auto it = buffers_.find(key);
-    if (it != buffers_.end() && it->second.capacity >= sizeBytes) {
-        if (it->second.size < sizeBytes) it->second.size = sizeBytes;
-        it->second.type = buffer.type();
-        return it->second;
-    }
-
-    const std::uint32_t alignedOffset = alignUp(nextBufferOffset_, 64u);
-    const std::uint64_t end =
-        static_cast<std::uint64_t>(alignedOffset) + static_cast<std::uint64_t>(sizeBytes);
-    if (end > fpga::Rp1BarWindow::kWindowSize) {
-        throw std::out_of_range(
-            "FpgaDevice: BAR-backed buffer arena exhausted while allocating '" +
-            buffer.name() + "' (" + std::to_string(sizeBytes) + " bytes)");
-    }
-
-    BufferRecord rec;
-    rec.offset = alignedOffset;
-    rec.size = sizeBytes;
-    rec.capacity = sizeBytes;
-    rec.type = buffer.type();
-    buffers_[key] = rec;
-    nextBufferOffset_ = static_cast<std::uint32_t>(end);
-    return rec;
+    return ensureBufferByKey(key, buffer.type(), sizeBytes);
 }
 
 std::uint64_t FpgaDevice::bufferDeviceAddress(const GraphBuffer& buffer,
                                               std::size_t sizeBytes) {
     const BufferRecord rec = ensureBuffer(buffer, sizeBytes);
+    if (rec.mem) {
+        return rec.mem->getPhysAddr();
+    }
     return RP1_CTRL_PHYS_ADDR + static_cast<std::uint64_t>(rec.offset);
+}
+
+void FpgaDevice::populateBufferRegions(const DGraph& dg) {
+    auto record = [&](const KernelDescriptor& kernel, const std::string& portName,
+                      const GraphBuffer& buffer) {
+        auto region = resolveBufferRegion(kernel, portName);
+        if (!region) return;
+        const std::string key = scopedBufferKey(buffer.scopeId(), buffer.name());
+        std::lock_guard<std::mutex> lk(bufferMutex_);
+        bufferRegion_[key] = *region;
+    };
+
+    for (const CompiledNode& node : dg.nodes) {
+        const auto* k = std::get_if<CompiledKernelNode>(&node);
+        if (!k) continue;
+
+        for (const BufferPort& port : k->kernel.ioType.inputBuffers) {
+            auto it = k->ioMap.inputBuffers().find(port.name);
+            if (it != k->ioMap.inputBuffers().end()) {
+                record(k->kernel, port.name, it->second);
+            }
+        }
+        for (const BufferPort& port : k->kernel.ioType.outputBuffers) {
+            auto it = k->ioMap.outputBuffers().find(port.name);
+            if (it != k->ioMap.outputBuffers().end()) {
+                record(k->kernel, port.name, it->second);
+            }
+        }
+        for (const RWBufferPort& port : k->kernel.ioType.rwBuffers) {
+            for (const IOMap::RWBinding& binding : k->ioMap.rwBuffers()) {
+                if (binding.inPort == port.in.name && binding.outPort == port.out.name) {
+                    record(k->kernel, port.in.name, binding.in);
+                    record(k->kernel, port.out.name, binding.out);
+                }
+            }
+        }
+    }
 }
 
 FpgaKernelLocation FpgaDevice::resolveKernelLocation(const KernelDescriptor& kernel) const {
@@ -855,6 +1037,150 @@ FpgaKernelLocation FpgaDevice::resolveKernelLocation(const KernelDescriptor& ker
             kernel.name + "' (likely unmapped name)");
     }
     return loc;
+}
+
+std::map<std::string, std::string>
+FpgaDevice::descriptorPortToArgName(const KernelDescriptor& kernel) const {
+    std::map<std::string, std::string> out;
+    if (!vbinSpec_) {
+        return out;
+    }
+    const std::string active = activeImageId();
+    const std::string imageId = kernel.image ? *kernel.image : active;
+    if (imageId.empty() || !vbinSpec_->hasImage(imageId)) {
+        return out;
+    }
+    const auto& kernels = vbinSpec_->image(imageId).kernels;
+    auto kit = kernels.find(kernel.name);
+    if (kit == kernels.end()) {
+        return out;
+    }
+    const IOTypeMap& d = kernel.ioType;  // descriptor (possibly renamed)
+
+    // Map the descriptor's (possibly renamed) ports to the canonical system_map
+    // arg names by positional correspondence, grouped only by scalar-vs-buffer.
+    //
+    // We deliberately do NOT trust the canonical IOTypeMap's input/output buffer
+    // categories: the system_map marks every HLS m_axi pointer register as
+    // write-only (r=0, w=1, because the *host* writes the pointer address), so
+    // ioTypeMapFromFunctionalArgs lumps all buffer pointers into inputBuffers
+    // regardless of data-flow direction.  A descriptor that splits ports into
+    // input/output by intent would then fail to line up per-category.  Instead
+    // we use the spec's idx-ordered `args` (the authoritative argument order)
+    // and split scalar vs buffer by the arg type (matching the classification
+    // in ioTypeMapFromFunctionalArgs), not by the m_axi port (a buffer may have
+    // no connection and an empty port).
+    auto isBufferArg = [](const fpga::FpgaKernelArgSpec& arg) {
+        std::string t = arg.type;
+        std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return t == "buffer" || t.find('*') != std::string::npos;
+    };
+    std::vector<std::string> specScalars;
+    std::vector<std::string> specBuffers;
+    for (const fpga::FpgaKernelArgSpec& arg : kit->second.args) {
+        if (isBufferArg(arg)) {
+            specBuffers.push_back(arg.name);
+        } else {
+            specScalars.push_back(arg.name);
+        }
+    }
+
+    // Flatten the descriptor ports in the order the packer emits them
+    // (scalars first, then input/output buffers, then RW in-pointers).
+    std::vector<std::string> descScalars;
+    std::vector<std::string> descBuffers;
+    for (const ScalarPort& p : d.inputScalars)  descScalars.push_back(p.name);
+    for (const ScalarPort& p : d.outputScalars) descScalars.push_back(p.name);
+    for (const BufferPort& p : d.inputBuffers)  descBuffers.push_back(p.name);
+    for (const BufferPort& p : d.outputBuffers) descBuffers.push_back(p.name);
+    // An RW pair collapses onto a single underlying pointer arg: its in-port
+    // consumes one buffer slot; its out-port aliases the same arg afterwards.
+    for (const RWBufferPort& p : d.rwBuffers) descBuffers.push_back(p.in.name);
+
+    for (std::size_t i = 0; i < descScalars.size() && i < specScalars.size(); ++i) {
+        out[descScalars[i]] = specScalars[i];
+    }
+    for (std::size_t i = 0; i < descBuffers.size() && i < specBuffers.size(); ++i) {
+        out[descBuffers[i]] = specBuffers[i];
+    }
+    for (const RWBufferPort& p : d.rwBuffers) {
+        auto it = out.find(p.in.name);
+        if (it != out.end()) {
+            out[p.out.name] = it->second;
+        }
+    }
+    return out;
+}
+
+std::map<std::string, std::uint32_t>
+FpgaDevice::kernelArgOffsets(const KernelDescriptor& kernel) const {
+    std::map<std::string, std::uint32_t> offsets;
+    if (!vbinSpec_) {
+        return offsets;  // mock/lookup path: caller falls back to 0x10 layout
+    }
+    const std::string active = activeImageId();
+    const std::string imageId = kernel.image ? *kernel.image : active;
+    if (imageId.empty() || !vbinSpec_->hasImage(imageId)) {
+        return offsets;
+    }
+    const auto& kernels = vbinSpec_->image(imageId).kernels;
+    auto kit = kernels.find(kernel.name);
+    if (kit == kernels.end()) {
+        return offsets;
+    }
+    std::map<std::string, std::uint32_t> byArgName;
+    for (const fpga::FpgaKernelArgSpec& arg : kit->second.args) {
+        byArgName[arg.name] = arg.offset;
+    }
+    // Key offsets by the descriptor's port names so the packer (which iterates
+    // node.kernel.ioType) finds them even when ports were renamed.
+    const auto trans = descriptorPortToArgName(kernel);
+    for (const auto& [descPort, argName] : trans) {
+        auto a = byArgName.find(argName);
+        if (a != byArgName.end()) {
+            offsets[descPort] = a->second;
+        }
+    }
+    // Fallback for descriptors with no IOTypeMap to zip against: key by arg
+    // name (preserves behaviour for specs whose port names already match).
+    if (offsets.empty()) {
+        offsets = std::move(byArgName);
+    }
+    return offsets;
+}
+
+std::optional<::vrt::MemoryConfig>
+FpgaDevice::resolveBufferRegion(const KernelDescriptor& kernel,
+                                const std::string& portName) const {
+    if (!vbinSpec_) {
+        return std::nullopt;  // mock/lookup path: caller uses the BAR arena
+    }
+    const std::string active = activeImageId();
+    const std::string imageId = kernel.image ? *kernel.image : active;
+    if (imageId.empty() || !vbinSpec_->hasImage(imageId)) {
+        return std::nullopt;
+    }
+    const auto& kernels = vbinSpec_->image(imageId).kernels;
+    auto kit = kernels.find(kernel.name);
+    if (kit == kernels.end()) {
+        return std::nullopt;
+    }
+    const auto& argMemory = kit->second.argMemory;
+
+    // Translate the (possibly renamed) descriptor port to its system_map arg
+    // name, using the same correspondence the offset packer uses so regions
+    // and offsets stay consistent.
+    const auto trans = descriptorPortToArgName(kernel);
+    auto t = trans.find(portName);
+    const std::string& argName = (t != trans.end()) ? t->second : portName;
+
+    auto it = argMemory.find(argName);
+    if (it != argMemory.end()) {
+        return it->second;
+    }
+    return std::nullopt;
 }
 
 std::uint64_t FpgaDevice::stagePdiBytes(const std::string& cacheKey,
@@ -946,37 +1272,28 @@ void FpgaDevice::setInputBuffer(const std::string& bufferName,
                                 const void*        data,
                                 std::size_t        sizeBytes) {
     const std::string key = normalizeBufferKey(bufferName);
-    BufferRecord rec;
-    {
-        std::lock_guard<std::mutex> lk(bufferMutex_);
-        auto it = buffers_.find(key);
-        if (it == buffers_.end() || it->second.capacity < sizeBytes) {
-            const std::uint32_t alignedOffset = alignUp(nextBufferOffset_, 64u);
-            const std::uint64_t end =
-                static_cast<std::uint64_t>(alignedOffset) + static_cast<std::uint64_t>(sizeBytes);
-            if (end > fpga::Rp1BarWindow::kWindowSize) {
-                throw std::out_of_range(
-                    "FpgaDevice: BAR-backed buffer arena exhausted while setting '" +
-                    bufferName + "' (" + std::to_string(sizeBytes) + " bytes)");
-            }
-            BufferRecord fresh;
-            fresh.offset = alignedOffset;
-            fresh.size = sizeBytes;
-            fresh.capacity = sizeBytes;
-            fresh.type = (it == buffers_.end()) ? BufferType::U8 : it->second.type;
-            it = buffers_.insert_or_assign(key, fresh).first;
-            nextBufferOffset_ = static_cast<std::uint32_t>(end);
-        } else {
-            it->second.size = sizeBytes;
-        }
-        rec = it->second;
+    std::lock_guard<std::mutex> lk(bufferMutex_);
 
-        if (sizeBytes == 0) return;
+    BufferType type = BufferType::U8;
+    if (auto existing = buffers_.find(key); existing != buffers_.end()) {
+        type = existing->second.type;
+    }
+    const BufferRecord rec = ensureBufferByKey(key, type, sizeBytes);
+
+    if (sizeBytes == 0) return;
+    if (rec.mem) {
+        // Device-memory mode: stage into the host mapping and DMA to the
+        // region the kernel reads from.
         if (data) {
-            window_->writeAt(rec.offset, data, sizeBytes);
+            std::memcpy(rec.mem->get(), data, sizeBytes);
         } else {
-            window_->zeroAt(rec.offset, sizeBytes);
+            std::memset(rec.mem->get(), 0, sizeBytes);
         }
+        rec.mem->sync(::vrt::SyncType::HOST_TO_DEVICE);
+    } else if (data) {
+        window_->writeAt(rec.offset, data, sizeBytes);
+    } else {
+        window_->zeroAt(rec.offset, sizeBytes);
     }
 }
 
@@ -1000,7 +1317,13 @@ void FpgaDevice::getOutputBuffer(const std::string& bufferName,
             " bytes but buffer '" + bufferName + "' holds " +
             std::to_string(it->second.size));
     }
-    window_->readAt(it->second.offset, data, sizeBytes);
+    if (it->second.mem) {
+        // Device-memory mode: DMA the kernel's results back before copying out.
+        it->second.mem->sync(::vrt::SyncType::DEVICE_TO_HOST);
+        std::memcpy(data, it->second.mem->get(), sizeBytes);
+    } else {
+        window_->readAt(it->second.offset, data, sizeBytes);
+    }
 }
 
 std::size_t FpgaDevice::bufferSize(const std::string& bufferName) const {
@@ -1011,6 +1334,11 @@ std::size_t FpgaDevice::bufferSize(const std::string& bufferName) const {
 }
 
 std::unique_ptr<IDevicePlan> FpgaDevice::compilePlan(const DGraph& dg) {
+    // Resolve each kernel buffer's m_axi memory region up front so later
+    // allocation (which may happen at bridge-consumer time, before the kernel
+    // is packed) lands where the kernel master can reach it.
+    populateBufferRegions(dg);
+
     // -------------------------------------------------------------------
     // Pass 1: reject unsupported node variants and collect kernel nodes
     //         in topological (= DGraph) order.
@@ -1122,8 +1450,12 @@ std::unique_ptr<IDevicePlan> FpgaDevice::compilePlan(const DGraph& dg) {
         const FpgaKernelLocation loc = resolveKernelLocation(k.kernel);
 
         // ---- Pack scalar args in IOTypeMap::inputScalars order. ----
+        // Protocol v2: the arg buffer is an array of (reg_offset, value)
+        // pairs; arg_count counts pairs.  Register offsets come from the
+        // system_map (or a contiguous 0x10 fallback on the mock path).
         const std::uint32_t this_arg_offset = cursor_words;
         std::uint32_t this_arg_count = 0;
+        ArgLayout layout(kernelArgOffsets(k.kernel), k.kernel.name);
 
         const auto& boundScalars = k.ioMap.scalars();
         for (const ScalarPort& port : k.kernel.ioType.inputScalars) {
@@ -1135,31 +1467,26 @@ std::unique_ptr<IDevicePlan> FpgaDevice::compilePlan(const DGraph& dg) {
             }
             const GraphScalar& gs    = bit->second;
             const std::uint32_t width = scalarWidthInWords(port.type);
+            const std::uint32_t base  = layout.take(port.name, width);
 
-            const std::uint64_t total = static_cast<std::uint64_t>(cursor_words) + width;
-            if (total > (RP1_DEFAULT_SIG_ARRAY_OFFSET - RP1_DEFAULT_ARG_BUF_OFFSET) /
-                            sizeof(std::uint32_t)) {
-                throw std::logic_error(
-                    "FpgaDevice: argument buffer overflow while packing kernel '" +
-                    k.kernel.name + "' port '" + port.name + "'");
-            }
-
-            image.arg_buf.resize(cursor_words + width, 0u);
-
+            std::uint32_t words[2] = {0u, 0u};
             if (gs.isConstant()) {
-                writeScalarToArgWords(port.type, gs.constantBits(),
-                                       image.arg_buf.data() + cursor_words);
-            } else {
+                writeScalarToArgWords(port.type, gs.constantBits(), words);
+            }
+            const std::uint32_t firstValueWord = appendArgWordsAsPairs(
+                image.arg_buf, cursor_words, base, words, width,
+                k.kernel.name, port.name);
+
+            if (!gs.isConstant()) {
                 DeferredScalar d;
                 d.scopedKey       = scopedScalarKey(gs.scopeId(), gs.varName());
                 d.fallbackKey     = gs.varName();
                 d.hasFallback     = (gs.scopeId() == 0);
                 d.type            = port.type;
-                d.arg_word_offset = cursor_words;
+                d.arg_word_offset = firstValueWord;
                 d.diagnostic      = k.id + "." + port.name;
                 deferred.push_back(std::move(d));
             }
-            cursor_words   += width;
             this_arg_count += width;
         }
 
@@ -1203,11 +1530,12 @@ std::unique_ptr<IDevicePlan> FpgaDevice::compilePlan(const DGraph& dg) {
         auto appendAddress = [&](const std::string& portName,
                                  const GraphBuffer& buffer,
                                  std::size_t sizeBytes) {
-            ensureArgCapacity(cursor_words, 2u, k.kernel.name, portName);
-            image.arg_buf.resize(cursor_words + 2u, 0u);
             const std::uint64_t addr = bufferDeviceAddress(buffer, sizeBytes);
-            writeU64ToArgWords(addr, image.arg_buf.data() + cursor_words);
-            cursor_words += 2u;
+            std::uint32_t words[2] = {0u, 0u};
+            writeU64ToArgWords(addr, words);
+            const std::uint32_t base = layout.take(portName, 2u);
+            appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, 2u,
+                                  k.kernel.name, portName);
             this_arg_count += 2u;
         };
 
@@ -1251,7 +1579,7 @@ std::unique_ptr<IDevicePlan> FpgaDevice::compilePlan(const DGraph& dg) {
         if (this_arg_count > UINT16_MAX) {
             throw std::logic_error(
                 "FpgaDevice: kernel '" + k.kernel.name + "' has " +
-                std::to_string(this_arg_count) + " arg words, exceeds uint16_t cap");
+                std::to_string(this_arg_count) + " arg pairs, exceeds uint16_t cap");
         }
 
         // ---- Compose the KERNEL_DISPATCH packet. ----

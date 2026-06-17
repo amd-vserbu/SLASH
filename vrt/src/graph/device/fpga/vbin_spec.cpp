@@ -140,6 +140,21 @@ FpgaKernelSpec fpgaKernelSpecFromKernel(const Kernel& kernel,
             arg.readable,
             arg.writable,
             arg.port});
+
+        // Record the m_axi memory region for buffer arguments so the graph
+        // backend can allocate kernel buffers where the kernel master can
+        // actually reach them.  Scalars have no AXI port; buffer args without
+        // a system_map <connection> are simply left unmapped (the backend
+        // falls back to its BAR-window arena in that case).
+        const std::string type = lower(arg.type);
+        const bool isBuffer = (type == "buffer" || type.find('*') != std::string::npos);
+        if (isBuffer && !arg.port.empty()) {
+            try {
+                spec.argMemory[arg.name] = kernel.argMemoryConfig(arg.name);
+            } catch (const std::exception&) {
+                // No connection recorded for this port; leave unmapped.
+            }
+        }
     }
     return spec;
 }

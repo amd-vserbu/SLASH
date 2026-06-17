@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include <vrt/allocator/allocator.hpp>
 #include <vrt/kernel.hpp>
 #include <vrt/utils/platform.hpp>
 #include <vrt/graph/node/io_type_map.hpp>
@@ -53,6 +54,10 @@ struct FpgaKernelSpec {
     std::uint32_t r5_base_addr = 0;
     IOTypeMap ioType;
     std::vector<FpgaKernelArgSpec> args;
+    /// Memory region (DDR/HBM/HBM_VNOC) each buffer argument's m_axi port is
+    /// wired to, from the system_map <connection> entries.  Keyed by arg name
+    /// (same key as @ref args).  Absent for args without a port/connection.
+    std::map<std::string, ::vrt::MemoryConfig> argMemory;
 
     KernelDescriptor descriptor(const std::string& imageId) const {
         return KernelDescriptor{name, DeviceType::FPGA, imageId, ioType};
