@@ -100,6 +100,12 @@ struct DdrView {
     std::byte*         rp1Ptr(std::uint64_t rp1Addr) {
         return base + kWindowOff + static_cast<std::size_t>(rp1Addr - RP1_CTRL_PHYS_ADDR);
     }
+    // True if [rp1Addr, rp1Addr+bytes) maps within the BAR backing buffer.
+    bool inWindow(std::uint64_t rp1Addr, std::uint64_t bytes) const {
+        if (rp1Addr < RP1_CTRL_PHYS_ADDR) return false;
+        const std::uint64_t off = rp1Addr - RP1_CTRL_PHYS_ADDR;
+        return kWindowOff + off + bytes <= kBarSize;
+    }
 };
 
 class FakeRp1 {
@@ -138,16 +144,24 @@ class FakeRp1 {
             if (n.opcode == RP1_OP_KERNEL_DISPATCH) {
                 const auto& kd = n.payload.kernel_dispatch;
                 if (kd.arg_count >= 5) {
+                    // Protocol v2: the argument buffer is an array of
+                    // (reg_offset, value) pairs, so the actual values live in
+                    // the odd words.  The copy kernel packs
+                    // [bytes, src_lo, src_hi, dst_lo, dst_hi].
                     const std::uint32_t* args =
                         ddr_.args() + (kd.arg_buffer_offset / sizeof(std::uint32_t));
-                    const std::uint32_t bytes = args[0];
+                    const std::uint32_t bytes = args[1];
                     const std::uint64_t src =
-                        static_cast<std::uint64_t>(args[1]) |
-                        (static_cast<std::uint64_t>(args[2]) << 32);
-                    const std::uint64_t dst =
                         static_cast<std::uint64_t>(args[3]) |
-                        (static_cast<std::uint64_t>(args[4]) << 32);
-                    if (bytes > 0) {
+                        (static_cast<std::uint64_t>(args[5]) << 32);
+                    const std::uint64_t dst =
+                        static_cast<std::uint64_t>(args[7]) |
+                        (static_cast<std::uint64_t>(args[9]) << 32);
+                    // Only emulate the copy when the request lands inside the
+                    // BAR backing; other kernels (e.g. plain graph_kernel) also
+                    // satisfy arg_count >= 5 but are not copies.
+                    if (bytes > 0 && ddr_.inWindow(src, bytes) &&
+                        ddr_.inWindow(dst, bytes)) {
                         std::memcpy(ddr_.rp1Ptr(dst), ddr_.rp1Ptr(src), bytes);
                     }
                 }
@@ -544,10 +558,13 @@ TEST_F(FpgaDeviceFixture, ScalarArgsAreConstantsBakedAtCompileTime) {
     g.launch();
     g.wait();
 
-    // Both args staged at arg_buf[0..1] in IOTypeMap declaration order:
-    // size=123 (1 word), flags=7 (1 word zero-extended).
-    EXPECT_EQ(ddr_.args()[0], 123u);
-    EXPECT_EQ(ddr_.args()[1], 7u);
+    // Protocol v2: each arg is a (reg_offset, value) pair.  On the mock
+    // lookup path offsets are handed out contiguously from 0x10, so:
+    //   size=123 @ 0x10, flags=7 (zero-extended) @ 0x14.
+    EXPECT_EQ(ddr_.args()[0], 0x10u);
+    EXPECT_EQ(ddr_.args()[1], 123u);
+    EXPECT_EQ(ddr_.args()[2], 0x14u);
+    EXPECT_EQ(ddr_.args()[3], 7u);
     EXPECT_EQ(ddr_.nodes()[0].payload.kernel_dispatch.arg_count, 2u);
 }
 
@@ -568,8 +585,11 @@ TEST_F(FpgaDeviceFixture, U64ScalarArgsConsumeTwoArgWords) {
     g.launch();
     g.wait();
 
-    EXPECT_EQ(ddr_.args()[0], 0xCAFEBABEu);
-    EXPECT_EQ(ddr_.args()[1], 0xDEADBEEFu);
+    // A U64 occupies two registers (0x10, 0x14), emitted as two v2 pairs.
+    EXPECT_EQ(ddr_.args()[0], 0x10u);
+    EXPECT_EQ(ddr_.args()[1], 0xCAFEBABEu);
+    EXPECT_EQ(ddr_.args()[2], 0x14u);
+    EXPECT_EQ(ddr_.args()[3], 0xDEADBEEFu);
     EXPECT_EQ(ddr_.nodes()[0].payload.kernel_dispatch.arg_count, 2u);
 }
 
@@ -620,14 +640,16 @@ TEST_F(FpgaDeviceFixture, DeferredScalarsResolvedAtLaunch) {
     dg.device = dev;
     auto plan = dev->compilePlan(dg);
 
+    // Protocol v2: arg[0] is the reg_offset (0x10), arg[1] the patched value.
     plan->launch();
     plan->wait();
-    EXPECT_EQ(ddr_.args()[0], 0xAAAAu);
+    EXPECT_EQ(ddr_.args()[0], 0x10u);
+    EXPECT_EQ(ddr_.args()[1], 0xAAAAu);
 
     (*scalarValues)["scope:0:size"] = 0xBBBBu;
     plan->launch();
     plan->wait();
-    EXPECT_EQ(ddr_.args()[0], 0xBBBBu);
+    EXPECT_EQ(ddr_.args()[1], 0xBBBBu);
 }
 
 TEST_F(FpgaDeviceFixture, ArgBufferIsContiguousAcrossMultipleKernels) {
@@ -651,11 +673,12 @@ TEST_F(FpgaDeviceFixture, ArgBufferIsContiguousAcrossMultipleKernels) {
     g.launch();
     g.wait();
 
-    EXPECT_EQ(ddr_.args()[0], 0x11u);
-    EXPECT_EQ(ddr_.args()[1], 0x22u);
-    EXPECT_EQ(ddr_.args()[2], 0x33u);
+    // Each kernel contributes one (reg_offset=0x10, value) pair = two words.
+    EXPECT_EQ(ddr_.args()[1], 0x11u);
+    EXPECT_EQ(ddr_.args()[3], 0x22u);
+    EXPECT_EQ(ddr_.args()[5], 0x33u);
 
-    // Each kernel's arg_buffer_offset must point at its own slot.
+    // Each kernel's arg_buffer_offset must point at its own (2-word) slot.
     auto findOffsetFor = [&](std::uint32_t r5) -> std::uint32_t {
         for (std::size_t i = 0; i < 3; ++i) {
             const auto& kd = ddr_.nodes()[i].payload.kernel_dispatch;
@@ -664,8 +687,156 @@ TEST_F(FpgaDeviceFixture, ArgBufferIsContiguousAcrossMultipleKernels) {
         return UINT32_MAX;
     };
     EXPECT_EQ(findOffsetFor(kKernelA_R5), 0u * sizeof(std::uint32_t));
-    EXPECT_EQ(findOffsetFor(kKernelB_R5), 1u * sizeof(std::uint32_t));
-    EXPECT_EQ(findOffsetFor(kKernelC_R5), 2u * sizeof(std::uint32_t));
+    EXPECT_EQ(findOffsetFor(kKernelB_R5), 2u * sizeof(std::uint32_t));
+    EXPECT_EQ(findOffsetFor(kKernelC_R5), 4u * sizeof(std::uint32_t));
+}
+
+TEST_F(FpgaDeviceFixture, NonContiguousSystemMapOffsetsAreHonored) {
+    // Regression guard for the rp1_graph_vbin_full bug: the HLS s_axilite map
+    // for graph_kernel(ap_uint<64> n, const int* in, int* out) places args at
+    // non-contiguous offsets with reserved gaps -- n@0x10, in@0x1c, out@0x28.
+    // The protocol-v2 packer must emit (reg_offset, value) pairs that land
+    // each argument at its own register, not dense from 0x10.
+    auto spec = std::make_shared<fpga::FpgaVbinSpec>();
+    fpga::FpgaImageSpec image;
+    image.id = "imageA";
+    image.pdiPath = "a.pdi";
+
+    fpga::FpgaKernelSpec k;
+    k.name = "graph_kernel";
+    k.r5_base_addr = kKernelA_R5;
+    k.ioType.inputScalars.push_back({"n", ScalarType::U64});
+    k.ioType.inputBuffers.push_back({"in", BufferType::I32});
+    k.ioType.outputBuffers.push_back({"out", BufferType::I32});
+    k.args.push_back({0u, "n",   "ap_uint<64>", 0x10u, 64u, false, false, ""});
+    k.args.push_back({1u, "in",  "int*",        0x1cu, 64u, false, false, ""});
+    k.args.push_back({2u, "out", "int*",        0x28u, 64u, true,  false, ""});
+    image.kernels.emplace("graph_kernel", k);
+    spec->addImage(std::move(image));
+
+    auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, spec, "imageA");
+
+    DGraph dg;
+    dg.deviceId = "fpga:0";
+    dg.device   = dev;
+
+    CompiledKernelNode node;
+    node.id       = "k0";
+    node.deviceId = "fpga:0";
+    node.kernel   = KernelDescriptor{"graph_kernel", DeviceType::FPGA,
+                                     std::string("imageA"), k.ioType};
+    GraphBuffer outTok;
+    node.ioMap
+        .bindScalar("n", GraphScalar::constant<std::uint64_t>(0x1122'3344'5566'7788ull))
+        .bindInputBuffer("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
+        .bindOutputBuffer("out", BufferType::I32, outTok);
+    dg.nodes.push_back(std::move(node));
+
+    auto plan = dev->compilePlan(dg);
+    plan->launch();
+    plan->wait();
+
+    const auto& kd = ddr_.nodes()[0].payload.kernel_dispatch;
+    EXPECT_EQ(ddr_.nodes()[0].opcode, RP1_OP_KERNEL_DISPATCH);
+    EXPECT_EQ(kd.kernel_base_addr, kKernelA_R5);
+    // n(2) + in(2) + out(2) = 6 (reg_offset, value) pairs.
+    EXPECT_EQ(kd.arg_count, 6u);
+
+    const std::uint32_t* a =
+        ddr_.args() + (kd.arg_buffer_offset / sizeof(std::uint32_t));
+    // n @ 0x10/0x14 == 0x1122334455667788 (little-endian words).
+    EXPECT_EQ(a[0], 0x10u);
+    EXPECT_EQ(a[1], 0x55667788u);
+    EXPECT_EQ(a[2], 0x14u);
+    EXPECT_EQ(a[3], 0x11223344u);
+    // in @ 0x1c/0x20.
+    EXPECT_EQ(a[4], 0x1cu);
+    EXPECT_EQ(a[6], 0x20u);
+    // out @ 0x28/0x2c -- the register that was previously never written.
+    EXPECT_EQ(a[8], 0x28u);
+    EXPECT_EQ(a[10], 0x2cu);
+
+    const std::uint64_t inAddr =
+        static_cast<std::uint64_t>(a[5]) | (static_cast<std::uint64_t>(a[7]) << 32);
+    const std::uint64_t outAddr =
+        static_cast<std::uint64_t>(a[9]) | (static_cast<std::uint64_t>(a[11]) << 32);
+    EXPECT_GE(inAddr, static_cast<std::uint64_t>(RP1_CTRL_PHYS_ADDR));
+    EXPECT_GE(outAddr, static_cast<std::uint64_t>(RP1_CTRL_PHYS_ADDR));
+}
+
+TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
+    // Regression guard for the hardware finding: examples rename FPGA kernel
+    // ports (e.g. the HLS args "in_r"/"out_r" become graph ports "in"/
+    // "image_out" via fpgaVectorIo/refinedGraphKernel).  The packer must still
+    // resolve each port's register offset against the real system_map arg name.
+    //
+    // Crucially this mirrors the real hardware system_map: every HLS m_axi
+    // pointer register is write-only (r=0, w=1, the *host* writes the pointer),
+    // so ioTypeMapFromFunctionalArgs lumps BOTH buffer args into inputBuffers
+    // regardless of data-flow direction.  The descriptor, by contrast, splits
+    // them into input/output by intent.  Mapping must therefore be by
+    // scalar-vs-buffer position over the idx-ordered args, not by per-category
+    // correspondence (which would leave the renamed output port unmapped).
+    auto spec = std::make_shared<fpga::FpgaVbinSpec>();
+    fpga::FpgaImageSpec image;
+    image.id = "imageA";
+    image.pdiPath = "a.pdi";
+
+    fpga::FpgaKernelSpec k;
+    k.name = "graph_kernel_0";
+    k.r5_base_addr = kKernelA_R5;
+    // Canonical IOTypeMap as ioTypeMapFromFunctionalArgs would build it from the
+    // real flags: both pointer args land in inputBuffers (write-only registers).
+    k.ioType.inputScalars.push_back({"n", ScalarType::U64});
+    k.ioType.inputBuffers.push_back({"in_r", BufferType::I32});
+    k.ioType.inputBuffers.push_back({"out_r", BufferType::I32});
+    k.args.push_back({0u, "n",     "ap_uint<64>", 0x10u, 64u, false, false, ""});
+    k.args.push_back({1u, "in_r",  "int*",        0x1cu, 64u, false, true,  "m_axi_gmem0"});
+    k.args.push_back({2u, "out_r", "int*",        0x28u, 64u, false, true,  "m_axi_gmem1"});
+    image.kernels.emplace("graph_kernel_0", k);
+    spec->addImage(std::move(image));
+
+    auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, spec, "imageA");
+
+    DGraph dg;
+    dg.deviceId = "fpga:0";
+    dg.device   = dev;
+
+    // Descriptor renames the buffer ports, as the real example does.
+    IOTypeMap renamed;
+    renamed.inputScalars.push_back({"n", ScalarType::U64});
+    renamed.inputBuffers.push_back({"in", BufferType::I32});
+    renamed.outputBuffers.push_back({"image_out", BufferType::I32});
+
+    CompiledKernelNode node;
+    node.id       = "k0";
+    node.deviceId = "fpga:0";
+    node.kernel   = KernelDescriptor{"graph_kernel_0", DeviceType::FPGA,
+                                     std::string("imageA"), renamed};
+    GraphBuffer outTok;
+    node.ioMap
+        .bindScalar("n", GraphScalar::constant<std::uint64_t>(0x1122'3344'5566'7788ull))
+        .bindInputBuffer("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
+        .bindOutputBuffer("image_out", BufferType::I32, outTok);
+    dg.nodes.push_back(std::move(node));
+
+    auto plan = dev->compilePlan(dg);
+    plan->launch();
+    plan->wait();
+
+    const auto& kd = ddr_.nodes()[0].payload.kernel_dispatch;
+    EXPECT_EQ(kd.arg_count, 6u);
+    const std::uint32_t* a =
+        ddr_.args() + (kd.arg_buffer_offset / sizeof(std::uint32_t));
+    // n -> arg "n" @ 0x10/0x14.
+    EXPECT_EQ(a[0], 0x10u);
+    EXPECT_EQ(a[2], 0x14u);
+    // "in" -> arg "in_r" @ 0x1c/0x20.
+    EXPECT_EQ(a[4], 0x1cu);
+    EXPECT_EQ(a[6], 0x20u);
+    // "image_out" -> arg "out_r" @ 0x28/0x2c.
+    EXPECT_EQ(a[8], 0x28u);
+    EXPECT_EQ(a[10], 0x2cu);
 }
 
 TEST_F(FpgaDeviceFixture, LookupReturningZeroAddressIsRejected) {
