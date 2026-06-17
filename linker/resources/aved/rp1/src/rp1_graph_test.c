@@ -348,13 +348,18 @@ static int test_diamond_dag(void)
 {
     setup_graph(/* node_count */ 4, /* fake_kernels */ 4);
 
-    /* One arg per kernel: arg[i] = i, parked at G_ARGS[i] (byte offset i*4). */
-    for (uint32_t i = 0; i < 4; i++) G_ARGS[i] = i;
+    /* Protocol v2: one (reg_offset, value) pair per kernel -- write value i to
+     * register 0x10.  Each pair is two words, so kernel i's pair lives at byte
+     * offset i*8. */
+    for (uint32_t i = 0; i < 4; i++) {
+        G_ARGS[2u * i]      = 0x10u;  /* reg_offset */
+        G_ARGS[2u * i + 1u] = i;      /* value      */
+    }
 
-    make_kernel(&G_NODES[0], 0, 0, 0x00, 0, 0x01, 0u * 4u, 1);
-    make_kernel(&G_NODES[1], 1, 0, 0x01, 0, 0x02, 1u * 4u, 1);
-    make_kernel(&G_NODES[2], 2, 0, 0x01, 0, 0x04, 2u * 4u, 1);
-    make_kernel(&G_NODES[3], 3, 0, 0x06, 0, 0x08, 3u * 4u, 1);
+    make_kernel(&G_NODES[0], 0, 0, 0x00, 0, 0x01, 0u * 8u, 1);
+    make_kernel(&G_NODES[1], 1, 0, 0x01, 0, 0x02, 1u * 8u, 1);
+    make_kernel(&G_NODES[2], 2, 0, 0x01, 0, 0x04, 2u * 8u, 1);
+    make_kernel(&G_NODES[3], 3, 0, 0x06, 0, 0x08, 3u * 8u, 1);
 
     int rc = rp1_run(&s_hooks);
     CHECK_EQ32(rc, 0u, "diamond: rp1_run rc");
@@ -393,7 +398,9 @@ static int test_kernel_unblocks_signal(void)
 {
     setup_graph(/* node_count */ 3, /* fake_kernels */ 1);
 
-    G_ARGS[0] = 0x12345678u;
+    /* Protocol v2: a single (reg_offset, value) pair writing 0x12345678 to 0x10. */
+    G_ARGS[0] = 0x10u;
+    G_ARGS[1] = 0x12345678u;
 
     make_signal(&G_NODES[0], 0, 0xBEEFBEEFu, RP1_SIGOP_SET,
                 0, 0x00, 0, 0x1);

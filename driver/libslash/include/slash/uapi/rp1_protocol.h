@@ -148,11 +148,30 @@ typedef enum {
  * Payload structures (each 48 bytes, embedded in rp1_node_t)
  * ====================================================================== */
 
-/* KERNEL_DISPATCH (0x0010) */
+/* Single kernel argument register write -- protocol v2.
+ *
+ * The KERNEL_DISPATCH argument buffer is an array of these pairs.  Each pair
+ * names an AXI-Lite register by its byte offset from kernel_base_addr and the
+ * 32-bit value to write there.  This replaces the v1 dense-word layout (which
+ * assumed contiguous registers starting at +0x10) and supports the reserved
+ * gaps real HLS s_axilite maps leave between arguments.  A 64-bit argument is
+ * emitted as two consecutive pairs: (off, lo) then (off + 4, hi). */
+typedef struct {
+    uint32_t reg_offset;   /* Byte offset from kernel_base_addr (AXI-Lite)    */
+    uint32_t value;        /* 32-bit value to write                           */
+} rp1_kernel_arg_t;
+
+/* KERNEL_DISPATCH (0x0010)
+ *
+ * arg_buffer_offset is the byte offset into the shared argument buffer where
+ * this kernel's rp1_kernel_arg_t[] begins; arg_count is the number of
+ * (reg_offset, value) pairs there (each 64-bit argument counts as two pairs).
+ * launch_kernel writes kernel_base_addr + reg_offset = value for each pair,
+ * then pulses ap_start at +0x00. */
 typedef struct {
     uint32_t kernel_base_addr;   /* AXI-Lite base in R5 address space        */
     uint32_t arg_buffer_offset;  /* Byte offset into argument buffer          */
-    uint16_t arg_count;          /* Number of 32-bit argument words           */
+    uint16_t arg_count;          /* Number of (reg_offset, value) arg pairs   */
     uint16_t ctrl_flags;         /* Bit 0: auto-restart                       */
     uint32_t timeout_cycles;     /* Watchdog (0 = default 10M cycles)         */
     uint8_t  _reserved[32];
@@ -383,7 +402,7 @@ typedef struct {
 #define RP1_MAX_SIGNALS   256
 #define RP1_MAX_BUCKETS    32
 
-#define RP1_PROTOCOL_VERSION  1u
+#define RP1_PROTOCOL_VERSION  2u
 
 /* =========================================================================
  * Static assertions -- enforced on every translation unit that includes
@@ -402,6 +421,10 @@ RP1_STATIC_ASSERT(sizeof(rp1_node_t) == 64,
                   "rp1_node_t must be exactly 64 bytes");
 RP1_STATIC_ASSERT(offsetof(rp1_node_t, payload) == 16,
                   "rp1_node_t payload must start at byte 16");
+
+/* Kernel argument pair (protocol v2) must be exactly 8 bytes. */
+RP1_STATIC_ASSERT(sizeof(rp1_kernel_arg_t) == 8,
+                  "rp1_kernel_arg_t must be exactly 8 bytes");
 
 /* Each payload variant must fit in the 48-byte payload union. */
 RP1_STATIC_ASSERT(sizeof(rp1_payload_kernel_dispatch_t) == 48,

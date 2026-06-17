@@ -108,10 +108,14 @@ static void remove_inflight(uint32_t idx)
 static void launch_kernel(const rp1_node_t *node)
 {
     const rp1_payload_kernel_dispatch_t *kd = &node->payload.kernel_dispatch;
-    const uint32_t *args = g_arg_buf + kd->arg_buffer_offset / 4;
+    /* Protocol v2: the argument buffer is an array of (reg_offset, value)
+     * pairs.  Write each value to kernel_base_addr + reg_offset so the
+     * non-contiguous HLS s_axilite register map is honoured exactly. */
+    const rp1_kernel_arg_t *args =
+        (const rp1_kernel_arg_t *)(g_arg_buf + kd->arg_buffer_offset / 4);
 
     for (uint16_t i = 0; i < kd->arg_count; i++)
-        axi_write32(kd->kernel_base_addr + 0x10 + i * 4, args[i]);
+        axi_write32(kd->kernel_base_addr + args[i].reg_offset, args[i].value);
 
     dsb();
     axi_write32(kd->kernel_base_addr + 0x00, 0x01); /* ap_start */
