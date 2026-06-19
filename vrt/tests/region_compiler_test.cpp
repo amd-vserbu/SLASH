@@ -147,15 +147,14 @@ std::string addOutputKernel(GraphRegion& region,
 class AddI32BufferKernel : public CpuKernel {
    public:
     AddI32BufferKernel(std::string name, std::int32_t delta)
-        : name_(std::move(name)), delta_(delta) {
+        : CpuKernel(std::move(name)), delta_(delta) {
         ioType_.inputBuffers.push_back({"in", BufferType::I32});
         ioType_.outputBuffers.push_back({"out", BufferType::I32});
     }
 
-    const std::string& name() const override { return name_; }
-    const IOTypeMap& ioTypeMap() const override { return ioType_; }
+    IOTypeMap ioTypeMap() const override { return ioType_; }
 
-    void call(const CpuKernelArgs& args) override {
+    void run(Args& args) override {
         const auto& in = args.buffer("in");
         const auto& out = args.buffer("out");
         const auto* src = in.as<const std::int32_t>();
@@ -167,7 +166,6 @@ class AddI32BufferKernel : public CpuKernel {
     }
 
    private:
-    std::string name_;
     std::int32_t delta_ = 0;
     IOTypeMap ioType_;
 };

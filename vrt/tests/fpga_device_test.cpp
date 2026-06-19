@@ -250,6 +250,28 @@ TEST_F(FpgaDeviceFixture, TypeAndIdMatchIDeviceContract) {
     EXPECT_EQ(dev.id(), "fpga:0");
 }
 
+TEST_F(FpgaDeviceFixture, ImageNumericIdIsStableOneBasedAndZeroForUnguarded) {
+    // The mock/lookup path has no vbin spec, so the guard is disabled (0).
+    FpgaDevice lookupDev("fpga:0", window_, makeDiamondLookup());
+    EXPECT_EQ(lookupDev.imageNumericId("imageA"), 0u);
+    EXPECT_EQ(lookupDev.imageNumericId(""), 0u);
+
+    // A vbin-spec-backed device assigns 1-based ids in (name-sorted) order.
+    auto spec = std::make_shared<fpga::FpgaVbinSpec>();
+    fpga::FpgaImageSpec a;
+    a.id = "imageA";
+    fpga::FpgaImageSpec b;
+    b.id = "imageB";
+    spec->addImage(a);
+    spec->addImage(b);
+
+    FpgaDevice dev("fpga:0", window_, spec, /*initialImageId=*/std::string{});
+    EXPECT_EQ(dev.imageNumericId("imageA"), 1u);
+    EXPECT_EQ(dev.imageNumericId("imageB"), 2u);
+    EXPECT_EQ(dev.imageNumericId("imageC"), 0u);  // unknown -> unguarded
+    EXPECT_EQ(dev.imageNumericId(""), 0u);
+}
+
 // ---------------------------------------------------------------------------
 // compilePlan: rejection paths
 // ---------------------------------------------------------------------------
@@ -259,19 +281,17 @@ namespace {
 // CPU kernel that produces a buffer (so a CPU -> FPGA edge needs a bridge).
 class CopyKernel : public CpuKernel {
    public:
-    CopyKernel() {
+    CopyKernel() : CpuKernel("copy") {
         ioType_.inputBuffers.push_back({"in", BufferType::I32});
         ioType_.outputBuffers.push_back({"out", BufferType::I32});
     }
-    const std::string& name() const override { return name_; }
-    const IOTypeMap& ioTypeMap() const override { return ioType_; }
-    void call(const CpuKernelArgs& args) override {
+    IOTypeMap ioTypeMap() const override { return ioType_; }
+    void run(Args& args) override {
         const auto& in  = args.buffer("in");
         const auto& out = args.buffer("out");
         std::memcpy(out.data, in.data, std::min(in.sizeBytes, out.sizeBytes));
     }
    private:
-    std::string name_ = "copy";
     IOTypeMap   ioType_;
 };
 
@@ -929,20 +949,52 @@ TEST_F(FpgaDeviceFixture, KernelLocationLookupIsCalledOncePerKernel) {
     EXPECT_EQ(kBcalls, 1);
 }
 
-TEST_F(FpgaDeviceFixture, TooManyKernelsIsRejected) {
+TEST_F(FpgaDeviceFixture, ManyKernelsSpanMultipleBarrierBuckets) {
+    // >31 kernels no longer trip a per-bucket cap: they are submitted as one
+    // segment with barrier set-bits spread across multiple buckets.
     auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
     Graph g = Graph::withDefaults();
     g.registerDevice(dev);
-    // We only have 4 distinct names mapped; cycle them — that's fine,
-    // the same name maps to the same R5 addr for this test.  We just
-    // need >31 KERNEL_DISPATCH nodes to trip the per-bucket cap.
-    std::string prev;
     const char* names[] = {"kA", "kB", "kC", "kD"};
-    for (int i = 0; i < 32; ++i) {
+    std::string prev;
+    for (int i = 0; i < 40; ++i) {
         const std::vector<std::string> after = prev.empty()
             ? std::vector<std::string>{}
             : std::vector<std::string>{prev};
         prev = g.addNode(fpgaKernel(names[i % 4]), IOMap{}, "fpga:0", after);
     }
-    EXPECT_THROW(g.compile(), std::logic_error);
+    ASSERT_NO_THROW(g.compile());
+    ASSERT_NO_THROW(g.run());
+    // Whole 40-kernel chain went out as a single RP1 submission.
+    EXPECT_EQ(ddr_.ctrl().graph_seq, 1u);
+    EXPECT_EQ(ddr_.signals()[kDefaultSentinelSlot].value, kDefaultSentinelValue);
+}
+
+TEST_F(FpgaDeviceFixture, CrossBucketFanInInsertsJoinAggregator) {
+    // A kernel that depends on predecessors in two different barrier buckets
+    // forces a NOP join aggregator (a node can only await one bucket).
+    auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
+    Graph g = Graph::withDefaults();
+    g.registerDevice(dev);
+    const char* names[] = {"kA", "kB", "kC", "kD"};
+
+    // k0..k30 form a chain occupying bucket 0 (bits 0..30); k31 lands in
+    // bucket 1. The final kernel depends on both k0 (bucket 0) and k31
+    // (bucket 1) -> cross-bucket fan-in.
+    std::vector<std::string> ids;
+    std::string prev;
+    for (int i = 0; i < 32; ++i) {
+        const std::vector<std::string> after = prev.empty()
+            ? std::vector<std::string>{}
+            : std::vector<std::string>{prev};
+        prev = g.addNode(fpgaKernel(names[i % 4]), IOMap{}, "fpga:0", after);
+        ids.push_back(prev);
+    }
+    g.addNode(fpgaKernel("kD"), IOMap{}, "fpga:0",
+              std::vector<std::string>{ids.front(), ids.back()});
+
+    ASSERT_NO_THROW(g.compile());
+    ASSERT_NO_THROW(g.run());
+    EXPECT_EQ(ddr_.ctrl().graph_seq, 1u);
+    EXPECT_EQ(ddr_.signals()[kDefaultSentinelSlot].value, kDefaultSentinelValue);
 }

@@ -56,12 +56,11 @@ namespace {
 class CopyKernel : public CpuKernel {
    public:
     CopyKernel(std::string name, IOTypeMap ioType)
-        : name_(std::move(name)), ioType_(std::move(ioType)) {}
+        : CpuKernel(std::move(name)), ioType_(std::move(ioType)) {}
 
-    const std::string& name() const override { return name_; }
-    const IOTypeMap& ioTypeMap() const override { return ioType_; }
+    IOTypeMap ioTypeMap() const override { return ioType_; }
 
-    void call(const CpuKernelArgs& args) override {
+    void run(Args& args) override {
         const auto& in  = args.buffer("in");
         const auto& out = args.buffer("out");
         auto bytes      = std::min(in.sizeBytes, out.sizeBytes);
@@ -69,7 +68,6 @@ class CopyKernel : public CpuKernel {
     }
 
    private:
-    std::string name_;
     IOTypeMap   ioType_;
 };
 

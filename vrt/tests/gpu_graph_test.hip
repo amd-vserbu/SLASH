@@ -129,10 +129,11 @@ static GpuKernelBinding makeBinding(const void* func, std::vector<std::string> p
 
 class CpuAddKernel : public CpuKernel {
    public:
-    const std::string& name() const override { return name_; }
-    const IOTypeMap& ioTypeMap() const override { return ioType_; }
+    CpuAddKernel() : CpuKernel("cpu_add") {}
 
-    void call(const CpuKernelArgs& args) override {
+    IOTypeMap ioTypeMap() const override { return ioType_; }
+
+    void run(Args& args) override {
         auto in  = args.buffer("in").as<const float>();
         auto out = args.buffer("out").as<float>();
         auto n   = args.buffer("in").sizeBytes / sizeof(float);
@@ -142,7 +143,6 @@ class CpuAddKernel : public CpuKernel {
     }
 
    private:
-    std::string name_ = "cpu_add";
     IOTypeMap   ioType_;
 };
 

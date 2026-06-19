@@ -62,14 +62,12 @@ using TestKernelFn = std::function<void(const CpuKernelArgs&)>;
 class TestCpuKernel : public CpuKernel {
    public:
     TestCpuKernel(std::string name, TestKernelFn fn, IOTypeMap ioType = {})
-        : name_(std::move(name)), fn_(std::move(fn)), ioType_(std::move(ioType)) {}
+        : CpuKernel(std::move(name)), fn_(std::move(fn)), ioType_(std::move(ioType)) {}
 
-    const std::string& name() const override { return name_; }
-    const IOTypeMap& ioTypeMap() const override { return ioType_; }
-    void call(const CpuKernelArgs& args) override { fn_(args); }
+    IOTypeMap ioTypeMap() const override { return ioType_; }
+    void run(Args& args) override { fn_(args); }
 
    private:
-    std::string  name_;
     TestKernelFn fn_;
     IOTypeMap    ioType_;
 };
@@ -299,7 +297,7 @@ class MockCpuDevice : public IDevice {
         }
 
         CpuKernelArgs args(std::move(bufViews), std::move(scalars));
-        it->second->call(args);
+        it->second->run(args);
     }
 
     std::string bufferStorageKey(const GraphBuffer& buffer) const {
