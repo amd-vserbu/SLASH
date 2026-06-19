@@ -42,6 +42,16 @@ extern uint32_t g_loop_iters[RP1_MAX_LOOPS];
 extern rp1_inflight_t g_inflight[RP1_MAX_INFLIGHT];
 extern uint32_t       g_inflight_count;
 
+/*
+ * Image id last installed by a successful PDI_LOAD (0 = none loaded yet).
+ * This reflects physical partial-reconfiguration state, so unlike the other
+ * BTCM stores it PERSISTS across graph submissions and is deliberately not
+ * cleared by rp1_store_reset_graph(); only a PDI_LOAD node changes it. A
+ * KERNEL_DISPATCH with a non-zero expected_image_id that does not match this
+ * is failed fast instead of poking an absent kernel.
+ */
+extern uint32_t g_active_image_id;
+
 /* -------------------------------------------------------------------------
  * DDR-backed stores (pointers into shared DDR, set at graph init)
  * ---------------------------------------------------------------------- */

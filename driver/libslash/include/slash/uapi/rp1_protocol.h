@@ -103,6 +103,16 @@ typedef enum {
 } rp1_node_status_t;
 
 /* =========================================================================
+ * Error codes (written to rp1_ctrl_t.rp1_error_code)
+ * ====================================================================== */
+
+#define RP1_ERR_INFLIGHT_FULL   1u  /* in-flight kernel table exhausted        */
+#define RP1_ERR_KERNEL_TIMEOUT  2u  /* a dispatched kernel did not ap_done      */
+#define RP1_ERR_PDI_TIMEOUT     3u  /* PDI_LOAD IPI was not ACKed in time       */
+#define RP1_ERR_IMAGE_MISMATCH  4u  /* KERNEL_DISPATCH expected an image that is
+                                     * not the one last loaded by PDI_LOAD       */
+
+/* =========================================================================
  * Condition operators (used by LOOP and COND)
  * ====================================================================== */
 
@@ -174,7 +184,10 @@ typedef struct {
     uint16_t arg_count;          /* Number of (reg_offset, value) arg pairs   */
     uint16_t ctrl_flags;         /* Bit 0: auto-restart                       */
     uint32_t timeout_cycles;     /* Watchdog (0 = default 10M cycles)         */
-    uint8_t  _reserved[32];
+    uint32_t expected_image_id;  /* Image this kernel needs; 0 = no guard.
+                                  * If non-zero and != the image last loaded
+                                  * by PDI_LOAD, RP1 fails the node fast       */
+    uint8_t  _reserved[28];
 } rp1_payload_kernel_dispatch_t;
 
 /* SCALAR_WRITE (0x0011) -- up to 6 register writes, stop at first addr == 0. */
@@ -240,7 +253,9 @@ typedef struct {
     uint32_t pdi_addr_lo;     /* DDR physical address (low 32 bits)   */
     uint32_t pdi_addr_hi;     /* DDR physical address (high 32 bits)  */
     uint32_t timeout_cycles;  /* Watchdog (0 = default 10M cycles)    */
-    uint32_t _reserved0;
+    uint32_t image_id;        /* Image id this PDI installs; recorded as
+                               * the active image so KERNEL_DISPATCH can
+                               * guard against stale dispatches. 0 = none */
     uint8_t  _reserved1[32];
 } rp1_payload_pdi_load_t;
 

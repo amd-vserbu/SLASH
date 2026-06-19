@@ -228,7 +228,7 @@ static int check_inflight(void)
             if (k->timeout_remaining == 0) {
                 uint16_t flags = g_nodes[k->node_index].flags;
                 g_node_status[k->node_index] = RP1_NODE_ERROR;
-                g_ctrl->rp1_error_code = 2; /* ERR_KERNEL_TIMEOUT */
+                g_ctrl->rp1_error_code = RP1_ERR_KERNEL_TIMEOUT;
                 write_cq_entry(flags, k->node_index, RP1_CQ_TIMEOUT, 0);
 
                 if (flags & RP1_FLAG_HALT_ON_ERROR) {
@@ -277,9 +277,27 @@ static int activate_nodes(uint32_t node_count)
 
         switch (node->opcode) {
 
-        case RP1_OP_KERNEL_DISPATCH:
+        case RP1_OP_KERNEL_DISPATCH: {
+            /* Expected-image guard: a dispatch that names an image (non-zero)
+             * must match the image last installed by PDI_LOAD. Fail fast
+             * instead of poking an absent kernel and hanging. */
+            const rp1_payload_kernel_dispatch_t *kd = &node->payload.kernel_dispatch;
+            if (kd->expected_image_id != 0 &&
+                kd->expected_image_id != g_active_image_id) {
+                g_node_status[i] = RP1_NODE_ERROR;
+                g_ctrl->rp1_error_code = RP1_ERR_IMAGE_MISMATCH;
+                write_cq_entry(node->flags, i, RP1_CQ_ERROR, g_active_image_id);
+                if (node->flags & RP1_FLAG_HALT_ON_ERROR) {
+                    g_ctrl->rp1_state = RP1_STATE_ERROR;
+                    return -1;
+                }
+                /* Non-fatal: set barriers so dependents can proceed. */
+                g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+                made_progress = 1;
+                break;
+            }
             if (g_inflight_count >= RP1_MAX_INFLIGHT) {
-                g_ctrl->rp1_error_code = 1; /* ERR_INFLIGHT_FULL */
+                g_ctrl->rp1_error_code = RP1_ERR_INFLIGHT_FULL;
                 g_ctrl->rp1_state = RP1_STATE_ERROR;
                 return -1;
             }
@@ -294,6 +312,7 @@ static int activate_nodes(uint32_t node_count)
             add_inflight(node, i);
             made_progress = 1;
             break;
+        }
 
         case RP1_OP_PDI_LOAD: {
             const rp1_payload_pdi_load_t *p = &node->payload.pdi_load;
@@ -301,12 +320,14 @@ static int activate_nodes(uint32_t node_count)
                                   p->timeout_cycles);
 
             if (rc == 0) {
+                /* Record the now-active image for the dispatch guard. */
+                g_active_image_id = p->image_id;
                 g_node_status[i] = RP1_NODE_DONE;
                 g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
                 write_cq_entry(node->flags, i, RP1_CQ_OK, 0);
             } else {
                 g_node_status[i] = RP1_NODE_ERROR;
-                g_ctrl->rp1_error_code = 3; /* ERR_PDI_TIMEOUT */
+                g_ctrl->rp1_error_code = RP1_ERR_PDI_TIMEOUT;
                 write_cq_entry(node->flags, i, RP1_CQ_TIMEOUT, 0);
 
                 if (node->flags & RP1_FLAG_HALT_ON_ERROR) {

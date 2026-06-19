@@ -12,7 +12,7 @@ RP1 (ARM Cortex-R5 core 1) sits **on-die** with single-digit-nanosecond access t
 
 **Explicit parallelism.** If a node's barrier dependencies are satisfied, RP1 **will** dispatch it. This is a hard guarantee, not best-effort. It matters because kernels may communicate via AXI-Stream interfaces while co-executing. A stream producer kernel started before its consumer can block on backpressure, and the guarantee ensures the consumer will be started -- preventing deadlock. Kernels connected by streams must be designed for backpressure tolerance, but they can rely on RP1 dispatching both ends once barriers are met.
 
-**Explicit reprogram points (`PDI_LOAD`, opcode `0x0030`).** A graph can include a `PDI_LOAD` node that asks the PMC to partial-reconfigure the fabric from a host-staged DDR PDI; see Section A. The host MUST gate the node behind barriers that drain every kernel resident in the to-be-reconfigured region -- RP1 does not validate this. Updating the R5 kernel-base table to reach kernels that only exist in the new design is the graph creator's responsibility (it can be done by `SCALAR_WRITE` nodes or by re-submitting a fresh graph against the new layout).
+**Explicit reprogram points (`PDI_LOAD`, opcode `0x0030`).** A graph can include a `PDI_LOAD` node that asks the PMC to partial-reconfigure the fabric from a host-staged DDR PDI; see Section A. The host MUST gate the node behind barriers that drain every kernel resident in the to-be-reconfigured region -- RP1 does not validate the drain. RP1 does, however, track the image last installed by `PDI_LOAD` (its `image_id`) and rejects a `KERNEL_DISPATCH` whose non-zero `expected_image_id` does not match, so a stale dispatch fails fast instead of hanging on an absent kernel. Updating the R5 kernel-base table to reach kernels that only exist in the new design is the graph creator's responsibility (it can be done by `SCALAR_WRITE` nodes or by re-submitting a fresh graph against the new layout).
 
 **Future: graph regions.** For very large graphs (thousands of nodes), the host may partition the graph into regions with guaranteed non-overlapping execution. This also provides a natural boundary for partial reconfiguration. The flat scanner scales to current graph sizes; regions are the path for scaling further.
 
@@ -131,8 +131,19 @@ Bit 3-15: reserved
 0x18    2B    arg_count           -- Number of (reg_offset, value) argument pairs
 0x1A    2B    ctrl_flags          -- Bit 0: auto-restart
 0x1C    4B    timeout_cycles      -- Watchdog timeout (0 = default 10M cycles)
-0x20    28B   reserved
+0x20    4B    expected_image_id   -- Image this kernel needs; 0 = no guard
+0x24    24B   reserved
 ```
+
+**Expected-image guard.** When `expected_image_id` is non-zero, RP1 compares it
+against `g_active_image_id` -- the image id recorded by the most recent
+successful `PDI_LOAD` -- before launching. On mismatch the node fails fast:
+status `ERROR`, `rp1_error_code = RP1_ERR_IMAGE_MISMATCH (4)`, a `RP1_CQ_ERROR`
+CQ entry whose `error_detail` carries the active image id, and (when
+`HALT_ON_ERROR` is set) the scanner aborts. This is belt-and-braces behind the
+host compiler's static image-safety proof, so a stale dispatch fails instead of
+poking an absent kernel and hanging. `expected_image_id = 0` disables the check
+(no-image kernels and the mock/lookup host path).
 
 The host pre-stages kernel arguments in the argument buffer as an array of
 `rp1_kernel_arg_t` `(reg_offset, value)` pairs (protocol v2). RP1 reads
@@ -206,9 +217,15 @@ Phase 1: DDR-DDR only (R5 software memcpy). HOST/HBM deferred to Phase 2.
 0x10    4B    pdi_addr_lo         -- DDR physical address of partial PDI (low 32)
 0x14    4B    pdi_addr_hi         -- DDR physical address of partial PDI (high 32)
 0x18    4B    timeout_cycles      -- Poll budget for IPI ACK (0 = default 10M)
-0x1C    4B    reserved
+0x1C    4B    image_id            -- Image this PDI installs; recorded as active
 0x20    32B   reserved
 ```
+
+On success RP1 records `image_id` in `g_active_image_id`, which the
+`KERNEL_DISPATCH` expected-image guard checks. This state reflects physical
+reconfiguration and therefore **persists across graph submissions** (it is not
+cleared by the per-graph BTCM reset); only another `PDI_LOAD` changes it, and it
+starts at 0 (no image) at firmware boot. `image_id = 0` records "no image".
 
 Triggers a partial PDI reconfiguration by asking the PMC (PLM) to load
 the PDI staged at `(pdi_addr_hi << 32) | pdi_addr_lo` in DDR.  RP1 writes
@@ -232,10 +249,10 @@ barriers.  The "single user region" guarantee makes this trivial in the
 common case: every kernel in the graph is in the active region, so the
 `PDI_LOAD` simply awaits the graph's join barrier.
 
-On timeout RP1 marks the node `ERROR`, sets `rp1_error_code = 3`, and
-emits a `RP1_CQ_TIMEOUT` CQ entry.  If `HALT_ON_ERROR` is set, the
-graph aborts; otherwise the node's `barrier_set_mask` is still raised
-so downstream nodes can run.
+On timeout RP1 marks the node `ERROR`, sets
+`rp1_error_code = RP1_ERR_PDI_TIMEOUT (3)`, and emits a `RP1_CQ_TIMEOUT` CQ
+entry.  If `HALT_ON_ERROR` is set, the graph aborts; otherwise the node's
+`barrier_set_mask` is still raised so downstream nodes can run.
 
 #### LOOP (0x0040)
 

@@ -731,6 +731,86 @@ static int test_pdi_load_chained(void)
 }
 
 /* -------------------------------------------------------------------------
+ * test_image_guard
+ *
+ * Exercises the expected-image guard. g_active_image_id persists across graph
+ * submissions (it mirrors physical reconfig state and is not cleared by
+ * rp1_store_reset_graph), so the three sub-runs below share it:
+ *
+ *   Run 1 (match):      PDI_LOAD{image_id=7} -> DISPATCH{expected=7} launches.
+ *   Run 2 (mismatch):   DISPATCH{expected=9} with active image still 7 fails
+ *                       fast -- NODE_ERROR, ERR_IMAGE_MISMATCH, CQ ERROR, and
+ *                       the kernel is never launched (ctrl reg untouched).
+ *   Run 3 (unguarded):  DISPATCH{expected=0} launches regardless of image.
+ * ---------------------------------------------------------------------- */
+
+static int test_image_guard(void)
+{
+    /* ---- Run 1: PDI sets image 7, matching dispatch launches. ---- */
+    setup_graph(/* node_count */ 2, /* fake_kernels */ 1);
+    pdi_override_reset();
+
+    make_pdi_load(&G_NODES[0],
+                  /* addr_lo */ 0x10000000u, /* addr_hi */ 0x00000001u,
+                  /* timeout */ 0u, /* flags */ 0,
+                  /* await   */ 0, 0x00, /* set */ 0, 0x01);
+    G_NODES[0].payload.pdi_load.image_id = 7u;
+
+    make_kernel(&G_NODES[1], /* kernel_idx */ 0,
+                /* await */ 0, 0x01, /* set */ 0, 0x02,
+                /* arg_buf_offset */ 0u, /* arg_count */ 0);
+    G_NODES[1].payload.kernel_dispatch.expected_image_id = 7u;
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "image_guard[match]: rp1_run rc");
+    CHECK_EQ32(g_active_image_id, 7u, "image_guard[match]: active image recorded");
+    CHECK_EQ32(g_node_status[1], RP1_NODE_DONE, "image_guard[match]: dispatch DONE");
+    {
+        volatile uint32_t *ctrl = (volatile uint32_t *)(uintptr_t)FAKE_KERNEL(0);
+        CHECK_EQ32(ctrl[0], 0x3u, "image_guard[match]: kernel launched (ap_start|ap_done)");
+    }
+    CHECK_EQ32(G_CTRL->rp1_error_code, 0u, "image_guard[match]: no error");
+
+    /* ---- Run 2: separate submission, stale expected image -> fail fast. ---- */
+    setup_graph(/* node_count */ 1, /* fake_kernels */ 1);
+
+    make_kernel(&G_NODES[0], /* kernel_idx */ 0,
+                /* await */ 0, 0x00, /* set */ 0, 0x01,
+                /* arg_buf_offset */ 0u, /* arg_count */ 0);
+    G_NODES[0].payload.kernel_dispatch.expected_image_id = 9u;  /* active is still 7 */
+
+    rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "image_guard[mismatch]: rp1_run rc (non-fatal)");
+    CHECK_EQ32(g_active_image_id, 7u, "image_guard[mismatch]: active image unchanged");
+    CHECK_EQ32(g_node_status[0], RP1_NODE_ERROR, "image_guard[mismatch]: node ERROR");
+    CHECK_EQ32(G_CTRL->rp1_error_code, RP1_ERR_IMAGE_MISMATCH,
+               "image_guard[mismatch]: err code");
+    CHECK_EQ32(G_CQ[0].status, RP1_CQ_ERROR, "image_guard[mismatch]: CQ ERROR");
+    CHECK_EQ32(G_CQ[0].error_detail, 7u, "image_guard[mismatch]: CQ carries active image");
+    {
+        volatile uint32_t *ctrl = (volatile uint32_t *)(uintptr_t)FAKE_KERNEL(0);
+        CHECK_EQ32(ctrl[0], 0u, "image_guard[mismatch]: kernel NOT launched");
+    }
+
+    /* ---- Run 3: expected_image_id 0 disables the guard. ---- */
+    setup_graph(/* node_count */ 1, /* fake_kernels */ 1);
+
+    make_kernel(&G_NODES[0], /* kernel_idx */ 0,
+                /* await */ 0, 0x00, /* set */ 0, 0x01,
+                /* arg_buf_offset */ 0u, /* arg_count */ 0);
+    G_NODES[0].payload.kernel_dispatch.expected_image_id = 0u;
+
+    rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "image_guard[unguarded]: rp1_run rc");
+    CHECK_EQ32(g_node_status[0], RP1_NODE_DONE, "image_guard[unguarded]: dispatch DONE");
+    {
+        volatile uint32_t *ctrl = (volatile uint32_t *)(uintptr_t)FAKE_KERNEL(0);
+        CHECK_EQ32(ctrl[0], 0x3u, "image_guard[unguarded]: kernel launched");
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Runner
  * ---------------------------------------------------------------------- */
 
@@ -753,6 +833,7 @@ void rp1_graph_test_run(void)
     run("pdi_load_basic",   test_pdi_load_basic);
     run("pdi_load_timeout", test_pdi_load_timeout);
     run("pdi_load_chained", test_pdi_load_chained);
+    run("image_guard",      test_image_guard);
 }
 
 #endif /* QEMU_SEMIHOSTING */

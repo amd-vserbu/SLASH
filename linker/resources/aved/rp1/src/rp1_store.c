@@ -27,6 +27,9 @@ uint32_t      g_loop_iters[RP1_MAX_LOOPS]  BTCM_SECTION;
 rp1_inflight_t g_inflight[RP1_MAX_INFLIGHT] BTCM_SECTION;
 uint32_t      g_inflight_count             BTCM_SECTION;
 
+/* Persists across graphs (physical reconfig state); zeroed only at boot. */
+uint32_t      g_active_image_id            BTCM_SECTION;
+
 /* -------------------------------------------------------------------------
  * DDR-backed pointer table (set by rp1_store_init)
  * ---------------------------------------------------------------------- */
