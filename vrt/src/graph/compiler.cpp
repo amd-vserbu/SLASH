@@ -439,6 +439,21 @@ void validateRootScopeBufferReferences(const GraphRegion& rootRegion) {
             }
         }
     };
+    // Loop / conditional control ops publish to the parent scope through their
+    // body/branch end boundaries (the struct-literal authoring API binds
+    // `.outputs` this way rather than via the control op's own IOMap), so scan
+    // those end-boundary targets too.
+    auto recordControlPublications = [&](const GraphRegion& child) {
+        for (const RegionOp& childOp : child.ops()) {
+            const auto* boundary = std::get_if<SubgraphBoundaryOp>(&childOp);
+            if (!boundary || boundary->side != BoundarySide::End) continue;
+            for (const auto& mapping : boundary->bufferMappings) {
+                if (mapping.target.scopeId() == rootScopeId) {
+                    producedAtRoot.insert(mapping.target.name());
+                }
+            }
+        }
+    };
     for (const RegionOp& op : rootRegion.ops()) {
         std::visit(
             [&](const auto& concrete) {
@@ -447,8 +462,11 @@ void validateRootScopeBufferReferences(const GraphRegion& rootRegion) {
                     recordProduced(concrete.ioMap);
                 } else if constexpr (std::is_same_v<T, LoopOp>) {
                     recordProduced(concrete.ioMap);
+                    if (concrete.body) recordControlPublications(*concrete.body);
                 } else if constexpr (std::is_same_v<T, ConditionalOp>) {
                     recordProduced(concrete.ioMap);
+                    if (concrete.thenRegion) recordControlPublications(*concrete.thenRegion);
+                    if (concrete.elseRegion) recordControlPublications(*concrete.elseRegion);
                 } else if constexpr (std::is_same_v<T, SubgraphBoundaryOp>) {
                     for (const auto& mapping : concrete.bufferMappings) {
                         if (mapping.target.scopeId() == rootScopeId) {
@@ -870,6 +888,41 @@ bool isLoopCarriedKey(const RegionOp& op, const std::string& key, bool scalar) {
     return carried.count(key) != 0;
 }
 
+/// Verify FPGA dispatch image safety: every FPGA kernel that names an image
+/// must be gated behind a reprogram of that same image via its afterOps. The
+/// user region starts with no active image, so an ungated FPGA dispatch would
+/// poke an absent kernel; reject it at compile() instead.
+void validateFpgaImageSafety(const std::vector<const RegionOp*>& ops) {
+    std::map<std::string, const RegionOp*> byId;
+    for (const RegionOp* opPtr : ops) byId[regionOpId(*opPtr)] = opPtr;
+
+    for (const RegionOp* opPtr : ops) {
+        const auto* kernel = std::get_if<KernelOp>(opPtr);
+        if (!kernel) continue;
+        if (kernel->kernel.type != DeviceType::FPGA || !kernel->kernel.image) continue;
+
+        const std::string& image = *kernel->kernel.image;
+        bool gated = false;
+        for (const auto& afterId : kernel->afterOps) {
+            auto it = byId.find(afterId);
+            if (it == byId.end()) continue;
+            if (const auto* reprog = std::get_if<ReprogramOp>(it->second)) {
+                if (reprog->imageId == image) {
+                    gated = true;
+                    break;
+                }
+            }
+        }
+        if (!gated) {
+            throw std::runtime_error(
+                "GraphCompiler: FPGA kernel '" + kernel->kernel.name + "' (op '" + kernel->id +
+                "') requires image '" + image +
+                "' but is not gated behind a reprogram of that image; declare "
+                "`.after = {<reprogram of " + image + ">}` on the dispatch");
+        }
+    }
+}
+
 ProducerMapInfo buildRegionProducerMapInfo(const std::vector<const RegionOp*>& ops,
                                            bool scalar) {
     ProducerMapInfo info;
@@ -925,6 +978,77 @@ std::map<std::string, std::string> buildRegionScalarProducerMap(
 }
 
 /**
+ * Derived side-effect ordering edges, returned as `successor -> [predecessors]`.
+ *
+ * These are NOT data dependencies and are never author-listed:
+ *  (a) Reprogram drain: a reprogram R chaining to a prior reprogram P (via
+ *      afterOps) must wait on every op gated behind P (every op listing P in
+ *      its afterOps), so the old image fully drains before reconfiguration.
+ *  (b) Readers-before-mutator: an in-place (inout) op consuming token K must
+ *      run after every pure-input reader of K.
+ *
+ * They must feed BOTH the topological sort (buildRegionAdjacency) AND the
+ * runtime dependsOn barriers (populateDependsOn). The latter is essential: on
+ * the asynchronous FPGA scheduler only dependsOn barriers gate execution, so a
+ * drain edge that lives solely in the topo order does not actually keep a
+ * reprogram from reconfiguring before the kernels of the old image have drained.
+ */
+std::map<std::string, std::vector<std::string>> computeSideEffectOrderingEdges(
+    const std::vector<const RegionOp*>& ops) {
+    std::map<std::string, std::vector<std::string>> edges;  // succ -> preds
+
+    std::map<std::string, const RegionOp*> byId;
+    for (const RegionOp* opPtr : ops) byId[regionOpId(*opPtr)] = opPtr;
+
+    auto isReprogram = [&](const std::string& id) {
+        auto it = byId.find(id);
+        return it != byId.end() && std::holds_alternative<ReprogramOp>(*it->second);
+    };
+
+    // (a) Reprogram drain.
+    for (const RegionOp* opPtr : ops) {
+        const auto* reprog = std::get_if<ReprogramOp>(opPtr);
+        if (!reprog) continue;
+        for (const auto& prior : reprog->afterOps) {
+            if (!isReprogram(prior)) continue;
+            for (const RegionOp* otherPtr : ops) {
+                const std::string& otherId = regionOpId(*otherPtr);
+                if (otherId == reprog->id) continue;
+                const auto& otherAfter = regionOpAfterOps(*otherPtr);
+                if (std::find(otherAfter.begin(), otherAfter.end(), prior) !=
+                    otherAfter.end()) {
+                    edges[reprog->id].push_back(otherId);
+                }
+            }
+        }
+    }
+
+    // (b) Readers-before-mutator.
+    for (const RegionOp* opPtr : ops) {
+        const auto* mutator = std::get_if<KernelOp>(opPtr);
+        if (!mutator || mutator->ioMap.rwBuffers().empty()) continue;
+        for (const auto& rw : mutator->ioMap.rwBuffers()) {
+            const std::string inKey = scopedBufferKey(rw.in.scopeId(), rw.in.name());
+            for (const RegionOp* readerPtr : ops) {
+                const std::string& readerId = regionOpId(*readerPtr);
+                if (readerId == mutator->id) continue;
+                bool readsKey = false;
+                for (const auto& [port, buf] : regionOpIoMap(*readerPtr).inputBuffers()) {
+                    (void)port;
+                    if (scopedBufferKey(buf.scopeId(), buf.name()) == inKey) {
+                        readsKey = true;
+                        break;
+                    }
+                }
+                if (readsKey) edges[mutator->id].push_back(readerId);
+            }
+        }
+    }
+
+    return edges;
+}
+
+/**
  * Build the producer/consumer adjacency map for a region.
  *
  * Synthesised bridge node ids and DGraph ordering are stable for a given
@@ -973,6 +1097,15 @@ std::map<std::string, std::vector<std::string>> buildRegionAdjacency(
         }
         for (const auto& after : regionOpAfterOps(op)) {
             adj[after].push_back(opId);
+        }
+    }
+
+    // Side-effect ordering edges (reprogram drain, readers-before-mutator) feed
+    // the topological sort here and the runtime dependsOn barriers in
+    // populateDependsOn (see computeSideEffectOrderingEdges).
+    for (const auto& [succ, preds] : computeSideEffectOrderingEdges(ops)) {
+        for (const auto& pred : preds) {
+            adj[pred].push_back(succ);
         }
     }
 
@@ -2147,6 +2280,7 @@ class RegionCompiler {
         indexOps(rc);
         compileChildRegions(rc);
         validateOpsAndPortBindings(rc);
+        validateFpgaImageSafety(rc.ops);
         validateProvenance(region, rc);
         resolveControlOutputPlacements(rc);
         materializeControlOutputBridges(rc);
@@ -2430,6 +2564,10 @@ class RegionCompiler {
     /// Final dependsOn pass: turn buffer / scalar producer relationships and
     /// same-device afterOps into edges on the corresponding compiled nodes.
     void populateDependsOn(RegionCompilation& rc) {
+        // Derived side-effect ordering (reprogram drain, readers-before-mutator)
+        // must become real runtime barriers, not just topo-sort hints, so the
+        // async FPGA scheduler actually drains the old image before a reprogram.
+        const auto sideEdges = computeSideEffectOrderingEdges(rc.ops);
         for (auto& [did, nodes] : rc.nodesByDevice) {
             const auto& devIns = rc.insertions[did];
             for (size_t i = 0; i < nodes.size(); ++i) {
@@ -2477,6 +2615,19 @@ class RegionCompiler {
                             "' references unknown afterOps id '" + a + "'");
                     }
                     if (ndIt->second == did) addDep(node, seen, a);
+                }
+
+                // Derived drain / readers-before-mutator predecessors. Same
+                // device => a real barrier edge (this is what enforces the
+                // old-image drain on the FPGA scheduler).
+                if (auto seIt = sideEdges.find(compiledNodeId(node));
+                    seIt != sideEdges.end()) {
+                    for (const auto& pred : seIt->second) {
+                        auto ndIt = rc.nodeDevice.find(pred);
+                        if (ndIt != rc.nodeDevice.end() && ndIt->second == did) {
+                            addDep(node, seen, pred);
+                        }
+                    }
                 }
             }
         }
