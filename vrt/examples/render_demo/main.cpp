@@ -207,14 +207,12 @@ class DemoCpuKernel : public CpuKernel {
     using Fn = std::function<void(const CpuKernelArgs&)>;
 
     DemoCpuKernel(std::string name, Fn fn, IOTypeMap ioType)
-        : name_(std::move(name)), fn_(std::move(fn)), ioType_(std::move(ioType)) {}
+        : CpuKernel(std::move(name)), fn_(std::move(fn)), ioType_(std::move(ioType)) {}
 
-    const std::string& name() const override { return name_; }
-    const IOTypeMap& ioTypeMap() const override { return ioType_; }
-    void call(const CpuKernelArgs& args) override { fn_(args); }
+    IOTypeMap ioTypeMap() const override { return ioType_; }
+    void run(Args& args) override { fn_(args); }
 
    private:
-    std::string name_;
     Fn          fn_;
     IOTypeMap   ioType_;
 };
