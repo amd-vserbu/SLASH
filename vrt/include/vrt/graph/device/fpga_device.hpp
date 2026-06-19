@@ -190,6 +190,12 @@ class FpgaDevice : public IDevice {
     void                       setWaitTimeout(std::chrono::milliseconds t);
     std::chrono::milliseconds  waitTimeout() const noexcept { return waitTimeout_; }
 
+    /// Stable 1-based numeric id for @p imageId within this device's vbin
+    /// spec, used to populate the RP1 expected-image guard fields on
+    /// KERNEL_DISPATCH / PDI_LOAD. Returns 0 when there is no vbin spec
+    /// (mock/lookup path) or the image is unknown, which disables the guard.
+    std::uint32_t imageNumericId(const std::string& imageId) const;
+
     /**
      * @brief Provide the VRT hardware device used to stage partial PDIs.
      *
