@@ -26,6 +26,7 @@
 #ifndef VRT_GRAPH_CORE_TYPES_HPP
 #define VRT_GRAPH_CORE_TYPES_HPP
 
+#include <cstddef>
 #include <type_traits>
 
 namespace vrt::graph {
@@ -67,6 +68,34 @@ enum class BufferType {
     I8, I16, I32, I64,
     F32, F64,
 };
+
+template<class T>
+constexpr BufferType typeToBufferType() {
+    if constexpr (std::is_same_v<T, uint8_t>)  return BufferType::U8;
+    else if constexpr (std::is_same_v<T, uint16_t>) return BufferType::U16;
+    else if constexpr (std::is_same_v<T, uint32_t>) return BufferType::U32;
+    else if constexpr (std::is_same_v<T, uint64_t>) return BufferType::U64;
+    else if constexpr (std::is_same_v<T, int8_t>)  return BufferType::I8;
+    else if constexpr (std::is_same_v<T, int16_t>) return BufferType::I16;
+    else if constexpr (std::is_same_v<T, int32_t>) return BufferType::I32;
+    else if constexpr (std::is_same_v<T, int64_t>) return BufferType::I64;
+    else if constexpr (std::is_same_v<T, float>)   return BufferType::F32;
+    else if constexpr (std::is_same_v<T, double>)  return BufferType::F64;
+    else static_assert(detail::always_false<T>::value, "Unsupported type for GraphBuffer");
+}
+
+/**
+ * @brief Size in bytes of one element of a BufferType.
+ */
+constexpr std::size_t bufferElementSize(BufferType type) {
+    switch (type) {
+        case BufferType::U8:  case BufferType::I8:  return 1;
+        case BufferType::U16: case BufferType::I16: return 2;
+        case BufferType::U32: case BufferType::I32: case BufferType::F32: return 4;
+        case BufferType::U64: case BufferType::I64: case BufferType::F64: return 8;
+    }
+    return 1;
+}
 
 /**
  * @brief Class of device that a kernel runs on.

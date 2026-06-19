@@ -75,6 +75,47 @@ struct IOTypeMap {
     std::vector<BufferPort>   inputBuffers;   ///< Read-only buffer arguments
     std::vector<BufferPort>   outputBuffers;  ///< Write-only buffer results
     std::vector<RWBufferPort> rwBuffers;      ///< In-place read-write buffers
+
+    // --- Fluent typed builders -------------------------------------------
+    //
+    // Declare a kernel's signature once, types spelled out explicitly:
+    //   IOTypeMap{}.scalarIn<uint64_t>("n").in<int32_t>("in").out<int32_t>("out");
+    // Each returns *this for chaining.
+
+    template <class T>
+    IOTypeMap& scalarIn(std::string name) {
+        inputScalars.push_back({std::move(name), typeToScalarType<T>()});
+        return *this;
+    }
+
+    template <class T>
+    IOTypeMap& scalarOut(std::string name) {
+        outputScalars.push_back({std::move(name), typeToScalarType<T>()});
+        return *this;
+    }
+
+    template <class T>
+    IOTypeMap& in(std::string name) {
+        inputBuffers.push_back({std::move(name), typeToBufferType<T>()});
+        return *this;
+    }
+
+    template <class T>
+    IOTypeMap& out(std::string name) {
+        outputBuffers.push_back({std::move(name), typeToBufferType<T>()});
+        return *this;
+    }
+
+    /**
+     * @brief Declare a single in-place read-write port; the in and out sides
+     *        share the same port name.
+     */
+    template <class T>
+    IOTypeMap& inout(std::string name) {
+        rwBuffers.push_back(RWBufferPort{BufferPort{name, typeToBufferType<T>()},
+                                         BufferPort{name, typeToBufferType<T>()}});
+        return *this;
+    }
 };
 
 }  // namespace vrt::graph

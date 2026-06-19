@@ -27,6 +27,7 @@
 #define VRT_GRAPH_CONTROL_CONDITION_HPP
 
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -259,6 +260,63 @@ class LoopTripCount {
     uint64_t    bits_ = 0;
     uint64_t    scopeId_ = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Fluent condition construction from scalar tokens
+// ---------------------------------------------------------------------------
+//
+// Lets authors write `graph.addConditional({.condition = (parity == 0), ...})`.
+// The named scalar becomes the lhs operand; the literal is coerced to the
+// scalar's element type so Condition::validate()'s exact-type rule is met.
+
+inline ConditionOperand conditionOperandOf(const GraphScalar& scalar) {
+    if (scalar.isConstant()) {
+        return ConditionOperand::constantFromBits(scalar.type(), scalar.constantBits());
+    }
+    return ConditionOperand::scalar(scalar.type(), scalar.varName(), scalar.scopeId());
+}
+
+template <class T>
+ConditionOperand conditionConstantLike(const GraphScalar& scalar, T value) {
+    static_assert(std::is_arithmetic_v<T>,
+                  "condition literal must be an arithmetic type");
+    uint64_t bits = 0;
+    if (isFloatingScalarType(scalar.type())) {
+        if (scalar.type() == ScalarType::F32) {
+            float f = static_cast<float>(value);
+            std::memcpy(&bits, &f, sizeof(f));
+        } else {
+            double d = static_cast<double>(value);
+            std::memcpy(&bits, &d, sizeof(d));
+        }
+    } else {
+        uint64_t u = static_cast<uint64_t>(value);
+        std::memcpy(&bits, &u, sizeof(u));
+    }
+    return ConditionOperand::constantFromBits(scalar.type(), bits);
+}
+
+#define VRT_GRAPH_DEFINE_SCALAR_COMPARE(opSymbol, compareOp)                       \
+    template <class T,                                                            \
+              std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>                 \
+    inline Condition operator opSymbol(const GraphScalar& lhs, T rhs) {           \
+        return Condition::compare(CompareOp::compareOp, conditionOperandOf(lhs),  \
+                                  conditionConstantLike(lhs, rhs));               \
+    }                                                                             \
+    inline Condition operator opSymbol(const GraphScalar& lhs,                    \
+                                       const GraphScalar& rhs) {                  \
+        return Condition::compare(CompareOp::compareOp, conditionOperandOf(lhs),  \
+                                  conditionOperandOf(rhs));                       \
+    }
+
+VRT_GRAPH_DEFINE_SCALAR_COMPARE(==, EQ)
+VRT_GRAPH_DEFINE_SCALAR_COMPARE(!=, NE)
+VRT_GRAPH_DEFINE_SCALAR_COMPARE(<, LT)
+VRT_GRAPH_DEFINE_SCALAR_COMPARE(<=, LE)
+VRT_GRAPH_DEFINE_SCALAR_COMPARE(>, GT)
+VRT_GRAPH_DEFINE_SCALAR_COMPARE(>=, GE)
+
+#undef VRT_GRAPH_DEFINE_SCALAR_COMPARE
 
 }  // namespace vrt::graph
 

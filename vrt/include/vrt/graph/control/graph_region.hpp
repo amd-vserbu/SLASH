@@ -56,12 +56,12 @@ class GraphRegion : public std::enable_shared_from_this<GraphRegion> {
     uint64_t scopeId() const { return scopeId_; }
     uint64_t parentScopeId() const { return parentScopeId_; }
 
-    GraphBuffer inputBuffer(BufferType type, std::string name) {
+    GraphBuffer inputBuffer(BufferType type, std::string name, std::size_t count = 0) {
         if (bufferNames_.count(name)) {
             throw std::invalid_argument("GraphRegion::inputBuffer: name '" + name + "' already used");
         }
         bufferNames_.insert(name);
-        return GraphBuffer::make(type, std::move(name), scopeId_);
+        return GraphBuffer::make(type, std::move(name), scopeId_, count);
     }
 
     GraphScalar scalar(ScalarType type, std::string name) {

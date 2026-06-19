@@ -795,7 +795,7 @@ void CpuDevicePlan::executeKernel(const CompiledKernelNode& node) {
     }
 
     CpuKernelArgs args(std::move(bufViews), std::move(scalars), std::move(writableScalars));
-    it->second->call(args);
+    it->second->run(args);
 }
 
 CpuBufferView CpuDevicePlan::resolveBuffer(const GraphBuffer& buffer) const {

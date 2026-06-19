@@ -74,12 +74,14 @@
 #define VRT_GRAPH_DEVICE_CPU_DEVICE_HPP
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -108,6 +110,35 @@ struct CpuBufferView {
     T* as() const { return static_cast<T*>(data); }
 
     size_t elementCount() const;  // sizeBytes / sizeof(element); defined in .cpp
+};
+
+// ---------------------------------------------------------------------------
+// KernelSpan — minimal typed, bounded view passed to CpuKernel::run()
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Non-owning, typed, bounded view over a kernel buffer argument.
+ *
+ * Provides size() / operator[] / begin() / end() / data() so kernels can write
+ * idiomatic element loops without sizeBytes / sizeof arithmetic. C++17 has no
+ * std::span, so this is the lightweight stand-in.
+ */
+template <typename T>
+class KernelSpan {
+   public:
+    KernelSpan() = default;
+    KernelSpan(T* data, std::size_t count) : data_(data), count_(count) {}
+
+    std::size_t size() const { return count_; }
+    bool empty() const { return count_ == 0; }
+    T* data() const { return data_; }
+    T& operator[](std::size_t i) const { return data_[i]; }
+    T* begin() const { return data_; }
+    T* end() const { return data_ + count_; }
+
+   private:
+    T* data_ = nullptr;
+    std::size_t count_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -158,7 +189,7 @@ class CpuKernelArgs {
     }
 
     /**
-     * @brief Write an output scalar argument by port name.
+     * @brief Write an output scalar argument by port name (raw bits).
      */
     void setScalar(const std::string& portName, uint64_t value) const {
         auto it = writableScalars_.find(portName);
@@ -167,6 +198,46 @@ class CpuKernelArgs {
                 "CpuKernelArgs: unknown writable scalar port '" + portName + "'");
         }
         *it->second = value;
+    }
+
+    // --- Typed accessors (RFC run(Args&) surface) ------------------------
+
+    /** @brief Typed read-only view of an input buffer port. */
+    template <typename T>
+    KernelSpan<const T> in(const std::string& portName) const {
+        const CpuBufferView& v = buffer(portName);
+        return KernelSpan<const T>(static_cast<const T*>(v.data), v.sizeBytes / sizeof(T));
+    }
+
+    /** @brief Typed writable view of an output buffer port. */
+    template <typename T>
+    KernelSpan<T> out(const std::string& portName) const {
+        const CpuBufferView& v = buffer(portName);
+        return KernelSpan<T>(static_cast<T*>(v.data), v.sizeBytes / sizeof(T));
+    }
+
+    /** @brief Typed writable view of an in-place (inout) buffer port. */
+    template <typename T>
+    KernelSpan<T> inout(const std::string& portName) const {
+        const CpuBufferView& v = buffer(portName);
+        return KernelSpan<T>(static_cast<T*>(v.data), v.sizeBytes / sizeof(T));
+    }
+
+    /** @brief Typed value of an input scalar port. */
+    template <typename T>
+    T scalarIn(const std::string& portName) const {
+        uint64_t bits = scalar(portName);
+        T value{};
+        std::memcpy(&value, &bits, sizeof(T));
+        return value;
+    }
+
+    /** @brief Write an output scalar port from a typed value. */
+    template <typename T>
+    void setScalarValue(const std::string& portName, T value) const {
+        uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(T));
+        setScalar(portName, bits);
     }
 
    private:
@@ -181,21 +252,58 @@ class CpuKernelArgs {
 
 class CpuKernel {
    public:
+    /// Argument context handed to run(); typed accessors live on CpuKernelArgs.
+    using Args = CpuKernelArgs;
+
+    explicit CpuKernel(std::string name) : name_(std::move(name)) {}
     virtual ~CpuKernel() = default;
 
     /** @brief Logical kernel name used to match KernelDescriptor::name. */
-    virtual const std::string& name() const = 0;
+    const std::string& name() const { return name_; }
 
-    /** @brief Typed I/O signature for this CPU kernel. */
-    virtual const IOTypeMap& ioTypeMap() const = 0;
+    /** @brief Typed I/O signature for this CPU kernel (declared once). */
+    virtual IOTypeMap ioTypeMap() const = 0;
 
-    /** @brief Execute one graph node invocation. */
-    virtual void call(const CpuKernelArgs& args) = 0;
+    /** @brief Execute one graph node invocation with typed argument access. */
+    virtual void run(Args& args) = 0;
 
-    /** @brief Convenience descriptor for Graph::addNode(). */
+    /** @brief Convenience descriptor for the kernel's typed signature. */
     KernelDescriptor descriptor() const {
-        return KernelDescriptor{name(), DeviceType::CPU, std::nullopt, ioTypeMap()};
+        return KernelDescriptor{name_, DeviceType::CPU, std::nullopt, ioTypeMap()};
     }
+
+   private:
+    std::string name_;
+};
+
+// ---------------------------------------------------------------------------
+// ElementwiseCpuKernel — lambda-backed shorthand for the map-each-element case
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief One-input one-output elementwise CPU kernel built from a lambda.
+ *
+ * Backs Graph::cpu().elementwise<T>(name, fn): declares an `in`/`out` buffer
+ * pair of element type T and applies `fn` to each element.
+ */
+template <typename T>
+class ElementwiseCpuKernel : public CpuKernel {
+   public:
+    ElementwiseCpuKernel(std::string name, std::function<T(T)> fn)
+        : CpuKernel(std::move(name)), fn_(std::move(fn)) {}
+
+    IOTypeMap ioTypeMap() const override {
+        return IOTypeMap{}.template in<T>("in").template out<T>("out");
+    }
+
+    void run(Args& args) override {
+        auto in = args.template in<T>("in");
+        auto out = args.template out<T>("out");
+        for (std::size_t i = 0; i < in.size(); ++i) out[i] = fn_(in[i]);
+    }
+
+   private:
+    std::function<T(T)> fn_;
 };
 
 // ---------------------------------------------------------------------------

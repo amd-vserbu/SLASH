@@ -101,6 +101,58 @@ class IOMap {
     }
 
     /**
+     * @brief Bind an output buffer port to a pre-declared token.
+     *
+     * Unlike bindOutputBuffer(), this does not mint a new token: the caller
+     * supplies the already-declared output token (e.g. from Graph::buffer()).
+     * This is the binding path used by the struct-literal authoring API where
+     * outputs bind to named tokens declared up front.
+     */
+    IOMap& bindExistingOutputBuffer(std::string portName, GraphBuffer out) {
+        if (!out.valid()) {
+            throw std::invalid_argument(
+                "bindExistingOutputBuffer: invalid (default-constructed) GraphBuffer");
+        }
+        if (outputBuffers_.count(portName)) {
+            throw std::invalid_argument(
+                "bindExistingOutputBuffer: port '" + portName + "' already bound");
+        }
+        outputBuffers_.emplace(std::move(portName), std::move(out));
+        return *this;
+    }
+
+    /**
+     * @brief Bind an in-place RW buffer port pair to pre-declared tokens.
+     *
+     * Consumes @p in and produces @p out, both supplied by the caller (no
+     * minting). @p out must match @p in's element type.
+     */
+    IOMap& bindExistingRWBuffer(std::string inPortName, std::string outPortName,
+                                GraphBuffer in, GraphBuffer out) {
+        if (!in.valid() || !out.valid()) {
+            throw std::invalid_argument(
+                "bindExistingRWBuffer: invalid (default-constructed) GraphBuffer");
+        }
+        if (in.type() != out.type()) {
+            throw std::invalid_argument(
+                "bindExistingRWBuffer: in/out element types differ");
+        }
+        for (const auto& existing : rwBuffers_) {
+            if (existing.inPort == inPortName) {
+                throw std::invalid_argument(
+                    "bindExistingRWBuffer: input port '" + inPortName + "' already bound");
+            }
+            if (existing.outPort == outPortName) {
+                throw std::invalid_argument(
+                    "bindExistingRWBuffer: output port '" + outPortName + "' already bound");
+            }
+        }
+        rwBuffers_.emplace_back(RWBinding{std::move(inPortName), std::move(outPortName),
+                                          std::move(in), std::move(out)});
+        return *this;
+    }
+
+    /**
      * @brief Bind an RW buffer port pair: consume @p in, produce a new token into @p out.
      *
      * @p inPortName and @p outPortName must match the in/out sides of the same

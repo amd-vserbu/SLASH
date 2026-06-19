@@ -114,11 +114,16 @@
 #include <variant>
 #include <vector>
 
+#include <vrt/graph/authoring/calls.hpp>
+#include <vrt/graph/authoring/fpga.hpp>
+#include <vrt/graph/authoring/region_builder.hpp>
 #include <vrt/graph/compiler.hpp>
 #include <vrt/graph/control/graph_region.hpp>
 #include <vrt/graph/crossdevice/bridge.hpp>
+#include <vrt/graph/device/cpu_device.hpp>
 #include <vrt/graph/device/device.hpp>
 #include <vrt/graph/device/dgraph.hpp>
+#include <vrt/graph/device/fpga_device.hpp>
 #include <vrt/graph/core/graph_buffer.hpp>
 #include <vrt/graph/node/io_map.hpp>
 #include <vrt/graph/node/kernel_descriptor.hpp>
@@ -126,6 +131,39 @@
 namespace vrt::graph {
 
 class CpuDevice;
+
+/**
+ * @brief Facade returned by Graph::cpu() for declaring CPU kernels.
+ *
+ * `add<K>(args...)` registers a CpuKernel subclass instance and returns a
+ * handle; `elementwise<T>(name, fn)` is the map-each-element shorthand.
+ */
+class CpuKernels {
+   public:
+    explicit CpuKernels(std::shared_ptr<CpuDevice> device) : device_(std::move(device)) {}
+
+    template <class K, class... Args>
+    KernelHandle add(Args&&... args) {
+        auto kernel = std::make_shared<K>(std::forward<Args>(args)...);
+        KernelHandle handle{kernel->name(), DeviceType::CPU, std::nullopt,
+                            kernel->ioTypeMap(), device_->id()};
+        device_->registerKernel(std::move(kernel));
+        return handle;
+    }
+
+    template <class T, class Fn>
+    KernelHandle elementwise(std::string name, Fn fn) {
+        auto kernel = std::make_shared<ElementwiseCpuKernel<T>>(
+            name, std::function<T(T)>(std::move(fn)));
+        KernelHandle handle{name, DeviceType::CPU, std::nullopt, kernel->ioTypeMap(),
+                            device_->id()};
+        device_->registerKernel(std::move(kernel));
+        return handle;
+    }
+
+   private:
+    std::shared_ptr<CpuDevice> device_;
+};
 
 class Graph {
    public:
@@ -490,6 +528,124 @@ class Graph {
         return id;
     }
 
+    // --- Struct-literal authoring API ------------------------------------
+
+    /**
+     * @brief Access the CPU kernel registry facade (declare CPU kernels).
+     */
+    CpuKernels cpu() { return CpuKernels(cpuDevice()); }
+
+    /**
+     * @brief Bring up an FPGA device in one call and register it.
+     *
+     * Folds QDMA PDI staging, vbin/image loading, the vrtd session + BAR
+     * window, the RP1 readiness preflight, and FpgaDevice construction. The
+     * returned handle owns those resources for the graph's lifetime. Defined
+     * in graph.cpp (pulls in vrtd/vrt device plumbing).
+     */
+    FpgaHandle addFpga(const FpgaSpec& spec);
+
+    /**
+     * @brief Declare a graph-level typed input buffer token.
+     */
+    template <class T>
+    GraphBuffer input(std::string name, std::size_t count) {
+        GraphBuffer token = rootRegion_->inputBuffer(typeToBufferType<T>(), std::move(name),
+                                                      count);
+        invalidateCompiledState();
+        return token;
+    }
+
+    /**
+     * @brief Mint a typed, single-assignment buffer token at root scope.
+     */
+    template <class T>
+    GraphBuffer buffer(std::string name, std::size_t count) {
+        return GraphBuffer::make(typeToBufferType<T>(), std::move(name),
+                                 rootRegion_->scopeId(), count);
+    }
+
+    /**
+     * @brief A named constant scalar input (buffer-symmetric constant form).
+     */
+    template <class T>
+    GraphScalar scalarInput(std::string /*name*/, T value) {
+        return GraphScalar::constant<T>(value);
+    }
+
+    /**
+     * @brief Declare a named scalar written once by a kernel (output scalar).
+     */
+    template <class T>
+    GraphScalar scalar(std::string name) {
+        return globalScalar(typeToScalarType<T>(), std::move(name));
+    }
+
+    /** @brief Author a kernel dispatch at root scope. */
+    GraphNode addKernelCall(const KernelCallSpec& spec) {
+        GraphNode node = rootBuilder_.addKernelCall(spec);
+        invalidateCompiledState();
+        return node;
+    }
+
+    /** @brief Author an explicit reprogram (PDI_LOAD) node at root scope. */
+    GraphNode addReprogram(const ReprogramCallSpec& spec) {
+        GraphNode node = rootBuilder_.addReprogram(spec);
+        invalidateCompiledState();
+        return node;
+    }
+
+    /** @brief Author a loop region at root scope. */
+    RegionBuilder addLoop(const LoopBuildSpec& spec) {
+        RegionBuilder loop = rootBuilder_.addLoop(spec);
+        invalidateCompiledState();
+        return loop;
+    }
+
+    /** @brief Author a conditional at root scope; returns [then, else]. */
+    std::pair<RegionBuilder, RegionBuilder> addConditional(const ConditionalBuildSpec& spec) {
+        auto branches = rootBuilder_.addConditional(spec);
+        invalidateCompiledState();
+        return branches;
+    }
+
+    /**
+     * @brief Provide host data for a graph-level input buffer token.
+     */
+    template <class T>
+    void write(const GraphBuffer& token, const std::vector<T>& data) {
+        auto cpu = cpuDevice();
+        if (!cpu) {
+            throw std::runtime_error("Graph::write: no CPU device registered");
+        }
+        cpu->setInputBuffer(scopedBufferKey(token.scopeId(), token.name()),
+                            data.data(), data.size() * sizeof(T));
+    }
+
+    /**
+     * @brief Read back a buffer token after run(), resolving its placement.
+     */
+    template <class T>
+    void read(const GraphBuffer& token, std::vector<T>& out) {
+        const std::string key = scopedBufferKey(token.scopeId(), token.name());
+        const std::size_t bytes = out.size() * sizeof(T);
+        if (auto cpu = cpuDevice(); cpu && cpu->bufferSize(key) > 0) {
+            cpu->getOutputBuffer(key, out.data(), bytes);
+            return;
+        }
+        for (const auto& [id, device] : devices_) {
+            (void)id;
+            if (auto fpga = std::dynamic_pointer_cast<FpgaDevice>(device);
+                fpga && fpga->bufferSize(key) > 0) {
+                fpga->getOutputBuffer(key, out.data(), bytes);
+                return;
+            }
+        }
+        throw std::runtime_error(
+            "Graph::read: token '" + token.name() + "' has no readable storage; "
+            "did the graph run and produce it?");
+    }
+
     // --- Compilation & execution ---
 
     /**
@@ -588,6 +744,7 @@ class Graph {
 
     std::shared_ptr<GraphRegion>                              rootRegion_ =
         GraphRegion::createRoot();
+    RegionBuilder                                             rootBuilder_{rootRegion_};
     std::map<std::string, std::shared_ptr<IDevice>>           devices_;    // device-id → device
     std::map<std::pair<DeviceType, DeviceType>, BridgeFactory> bridgeFactories_;
     std::map<std::pair<std::string, std::string>,

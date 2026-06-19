@@ -65,12 +65,13 @@ class GraphBuffer {
      * @param scopeId  Graph-region namespace that owns this token.
      * @throws std::invalid_argument if @p name is empty.
      */
-    static GraphBuffer make(BufferType type, std::string name, uint64_t scopeId = 0) {
+    static GraphBuffer make(BufferType type, std::string name, uint64_t scopeId = 0,
+                            std::size_t elementCount = 0) {
         if (name.empty()) {
             throw std::invalid_argument(
                 "GraphBuffer::make: name must not be empty");
         }
-        return GraphBuffer(type, std::move(name), scopeId);
+        return GraphBuffer(type, std::move(name), scopeId, elementCount);
     }
 
     /**
@@ -92,17 +93,32 @@ class GraphBuffer {
     BufferType type() const { return type_; }
 
     /**
+     * @brief Number of elements this token was declared with (0 if unspecified).
+     *
+     * Carried for host-side sizing (Graph::write / Graph::read), output
+     * allocation, and in-place length checks. Tokens minted through the
+     * lower-level IOMap binders default to 0 (size inferred at runtime).
+     */
+    std::size_t count() const { return count_; }
+
+    /**
+     * @brief Declared size in bytes (count() * element size), or 0 if unknown.
+     */
+    std::size_t sizeBytes() const { return count_ * bufferElementSize(type_); }
+
+    /**
      * @brief Returns false for default-constructed (unbound) tokens.
      */
     bool valid() const { return !name_.empty(); }
 
    private:
-    GraphBuffer(BufferType type, std::string name, uint64_t scopeId)
-        : type_(type), name_(std::move(name)), scopeId_(scopeId) {}
+    GraphBuffer(BufferType type, std::string name, uint64_t scopeId, std::size_t count)
+        : type_(type), name_(std::move(name)), scopeId_(scopeId), count_(count) {}
 
     BufferType  type_ = BufferType::U8;  // placeholder for default-constructed tokens
     std::string name_;
     uint64_t    scopeId_ = 0;
+    std::size_t count_ = 0;
 };
 
 }  // namespace vrt::graph
