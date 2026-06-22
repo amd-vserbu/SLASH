@@ -56,6 +56,8 @@
 #include <vrt/graph/core/graph_scalar.hpp>
 #include <vrt/graph/core/types.hpp>
 #include <vrt/graph/device/cpu_device.hpp>
+#include <vrt/graph/device/dgraph.hpp>
+#include <vrt/graph/node/compiled_node.hpp>
 #include <vrt/graph/device/fpga/rp1_bar_window.hpp>
 #include <vrt/graph/device/fpga/rp1_submitter.hpp>
 #include <vrt/graph/device/fpga/vbin_spec.hpp>
@@ -187,6 +189,233 @@ class FakeRp1 {
     DdrView           ddr_;
     std::atomic<bool> stop_{false};
     std::thread       thread_;
+};
+
+// A faithful host port of the RP1 firmware flat scanner (rp1_loop.c): honors
+// barrier buckets and executes LOOP / RERUN / COND / WAIT / SIGNAL exactly like
+// the device, so control-flow images can be validated end-to-end on the host
+// (data + iteration counts), not just structurally.  Kernels complete
+// immediately (no inflight delay) and each dispatch is counted by base address.
+// This is the "two-queue simulation harness" the plan calls for; a single
+// instance models one RP1 queue, and instances can share a DDR-backed signal
+// array to rendezvous via SIGNAL/WAIT.
+class FaithfulRp1 {
+   public:
+    // @p sharedSignals, when non-null, is used as the signal array instead of
+    // this queue's own DDR signals, letting multiple concurrent FaithfulRp1
+    // instances rendezvous via SIGNAL/WAIT on the same host-visible slots --
+    // the cross-queue channel the compiler split targets.
+    explicit FaithfulRp1(DdrView ddr, rp1_signal_slot_t* sharedSignals = nullptr)
+        : ddr_(ddr), signals_(sharedSignals ? sharedSignals : ddr.signals()) {
+        thread_ = std::thread([this] { run(); });
+    }
+    ~FaithfulRp1() {
+        stop_.store(true, std::memory_order_relaxed);
+        if (thread_.joinable()) thread_.join();
+    }
+
+    std::uint32_t dispatches(std::uint32_t base) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = dispatchCount_.find(base);
+        return it == dispatchCount_.end() ? 0u : it->second;
+    }
+
+   private:
+    static bool cmp(std::uint32_t sig, std::uint16_t op, std::uint32_t val) {
+        switch (op) {
+            case RP1_COP_EQ:     return sig == val;
+            case RP1_COP_NE:     return sig != val;
+            case RP1_COP_LT:     return sig < val;
+            case RP1_COP_GE:     return sig >= val;
+            case RP1_COP_AND_NZ: return (sig & val) != 0;
+            case RP1_COP_AND_Z:  return (sig & val) == 0;
+        }
+        return false;
+    }
+
+    void run() {
+        while (!stop_.load(std::memory_order_relaxed)) {
+            auto& c = ddr_.ctrl();
+            if (c.graph_seq != c.graph_done_seq) {
+                c.rp1_state = RP1_STATE_RUNNING;
+                processGraph();
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                c.rp1_state      = RP1_STATE_READY;
+                c.graph_done_seq = c.graph_seq;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+            }
+            c.heartbeat = c.heartbeat + 1;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+
+    void processGraph() {
+        auto& c = ddr_.ctrl();
+        const std::uint32_t count = c.node_count;
+        rp1_node_t* nodes = ddr_.nodes();
+        rp1_signal_slot_t* sigs = signals_;
+
+        std::vector<std::uint8_t> status(count, RP1_NODE_PENDING);
+        std::vector<std::uint32_t> barriers(RP1_MAX_BUCKETS, 0);
+        std::vector<std::uint32_t> loopIters(RP1_MAX_LOOPS, 0);
+
+        auto setDone = [&](std::uint32_t i) {
+            status[i] = RP1_NODE_DONE;
+            barriers[nodes[i].barrier_set_bucket] |= nodes[i].barrier_set_mask;
+        };
+
+        for (std::uint64_t guard = 0; guard < 10'000'000ull; ++guard) {
+            bool progress = false;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (status[i] != RP1_NODE_PENDING) continue;
+                rp1_node_t& n = nodes[i];
+                if ((barriers[n.barrier_await_bucket] & n.barrier_await_mask) !=
+                    n.barrier_await_mask) {
+                    continue;
+                }
+                switch (n.opcode) {
+                    case RP1_OP_KERNEL_DISPATCH: {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        dispatchCount_[n.payload.kernel_dispatch.kernel_base_addr]++;
+                        setDone(i);
+                        progress = true;
+                        break;
+                    }
+                    case RP1_OP_SIGNAL: {
+                        const auto& p = n.payload.signal;
+                        switch (p.operation) {
+                            case RP1_SIGOP_SET: sigs[p.target_slot].value = p.value; break;
+                            case RP1_SIGOP_ADD: sigs[p.target_slot].value += p.value; break;
+                            case RP1_SIGOP_OR:  sigs[p.target_slot].value |= p.value; break;
+                            case RP1_SIGOP_AND: sigs[p.target_slot].value &= p.value; break;
+                        }
+                        setDone(i);
+                        progress = true;
+                        break;
+                    }
+                    case RP1_OP_WAIT: {
+                        const auto& w = n.payload.wait;
+                        if (cmp(sigs[w.condition_signal].value, w.condition_op,
+                                w.condition_value)) {
+                            setDone(i);
+                            progress = true;
+                        } else {
+                            status[i] = RP1_NODE_WAITING;
+                        }
+                        break;
+                    }
+                    case RP1_OP_SCALAR_READ: {
+                        // Model a body output scalar that increases by one each
+                        // time it is captured (i.e. a loop variable computing
+                        // i = i + 1), so a data-dependent loop predicate over
+                        // this slot terminates deterministically.
+                        const auto& sr = n.payload.scalar_read;
+                        sigs[sr.target_slot].value = ++scalarReadCount_[sr.target_slot];
+                        setDone(i);
+                        progress = true;
+                        break;
+                    }
+                    case RP1_OP_SCALAR_COPY: {
+                        // Record the slot->register copy so tests can assert the
+                        // carried value was fed into a kernel register (we don't
+                        // model the kernel itself, only the transfer).
+                        const auto& sc = n.payload.scalar_copy;
+                        {
+                            std::lock_guard<std::mutex> lk(mtx_);
+                            scalarCopies_[sc.dest_addr] = sigs[sc.source_slot].value;
+                        }
+                        setDone(i);
+                        progress = true;
+                        break;
+                    }
+                    case RP1_OP_LOOP: {
+                        const auto& lp = n.payload.loop;
+                        loopIters[lp.loop_id]++;
+                        bool exit = false;
+                        if (lp.max_iterations > 0 && loopIters[lp.loop_id] > lp.max_iterations)
+                            exit = true;
+                        if (cmp(sigs[lp.condition_signal].value, lp.condition_op,
+                                lp.condition_value))
+                            exit = true;
+                        if (exit) {
+                            setDone(i);
+                        } else {
+                            for (std::uint8_t b = lp.bucket_clear_start;
+                                 b <= lp.bucket_clear_end; ++b)
+                                barriers[b] = 0;
+                            for (std::uint32_t nn = lp.body_start; nn <= lp.body_end; ++nn)
+                                status[nn] = RP1_NODE_PENDING;
+                            status[i] = RP1_NODE_DONE;  // no barrier on continue
+                        }
+                        progress = true;
+                        break;
+                    }
+                    case RP1_OP_COND: {
+                        const auto& cd = n.payload.cond;
+                        if (cmp(sigs[cd.condition_signal].value, cd.condition_op,
+                                cd.condition_value)) {
+                            barriers[cd.done_bucket] |= cd.done_mask;
+                        } else {
+                            for (std::uint8_t b = cd.bucket_clear_start;
+                                 b <= cd.bucket_clear_end; ++b)
+                                barriers[b] = 0;
+                            for (std::uint32_t nn = cd.body_start; nn <= cd.body_end; ++nn)
+                                status[nn] = RP1_NODE_PENDING;
+                        }
+                        setDone(i);
+                        progress = true;
+                        break;
+                    }
+                    case RP1_OP_RERUN: {
+                        status[n.payload.rerun.target_node] = RP1_NODE_PENDING;
+                        setDone(i);
+                        progress = true;
+                        break;
+                    }
+                    default:  // NOP / PDI_LOAD / SCALAR_* -> immediate
+                        setDone(i);
+                        progress = true;
+                        break;
+                }
+            }
+            // Re-poll parked WAITs (a peer queue / the host may have written).
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if (status[i] != RP1_NODE_WAITING) continue;
+                const auto& w = nodes[i].payload.wait;
+                if (cmp(sigs[w.condition_signal].value, w.condition_op, w.condition_value)) {
+                    setDone(i);
+                    progress = true;
+                }
+            }
+            if (!progress) {
+                bool waiting = false;
+                for (std::uint32_t i = 0; i < count; ++i)
+                    if (status[i] == RP1_NODE_WAITING) waiting = true;
+                if (!waiting) break;  // graph complete
+                // Outstanding WAIT with no local progress: yield so a peer queue
+                // can advance the signal it is gated on.
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+    }
+
+    DdrView                                ddr_;
+    rp1_signal_slot_t*                     signals_;
+    std::atomic<bool>                      stop_{false};
+    std::thread                            thread_;
+    std::mutex                             mtx_;
+    std::map<std::uint32_t, std::uint32_t> dispatchCount_;
+    std::map<std::uint32_t, std::uint32_t> scalarReadCount_;
+
+   public:
+    std::uint32_t scalarCopyTo(std::uint32_t addr) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = scalarCopies_.find(addr);
+        return it == scalarCopies_.end() ? 0xFFFFFFFFu : it->second;
+    }
+
+   private:
+    std::map<std::uint32_t, std::uint32_t> scalarCopies_;  // dest_addr -> last value
 };
 
 void primeAsReady(DdrView ddr) {
@@ -997,4 +1226,1221 @@ TEST_F(FpgaDeviceFixture, CrossBucketFanInInsertsJoinAggregator) {
     ASSERT_NO_THROW(g.run());
     EXPECT_EQ(ddr_.ctrl().graph_seq, 1u);
     EXPECT_EQ(ddr_.signals()[kDefaultSentinelSlot].value, kDefaultSentinelValue);
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous control flow: fixed-count loop lowering
+// ---------------------------------------------------------------------------
+
+// A DGraph carrying a fixed-count CompiledLoopNode with an all-FPGA body must
+// lower to a single RP1 image: LOOP (max_iterations, body range, per-iteration
+// bucket clear) + the flattened body kernel + a RERUN re-arming the LOOP +
+// the trailing sentinel.  This validates the exact node layout the firmware's
+// loop_decrement / loop_fixed_count QEMU tests prove it executes.
+TEST_F(FpgaDeviceFixture, FixedCountLoopLowersToLoopRerunImage) {
+    FpgaDevice dev("fpga:0", window_,
+                   [](const std::string&) { return FpgaKernelLocation{0x88010000u, 0}; });
+
+    CompiledKernelNode bodyK;
+    bodyK.id       = "bk";
+    bodyK.deviceId = "fpga:0";
+    bodyK.kernel   = fpgaKernel("bodyK");  // no declared ports -> zero args
+
+    auto body = std::make_shared<DGraph>();
+    body->deviceId     = "fpga:0";
+    body->nodes.push_back(bodyK);
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph dg;
+    dg.deviceId     = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    CompiledLoopNode loop;
+    loop.id        = "loop0";
+    loop.deviceId  = "fpga:0";
+    loop.loopKind  = CompiledLoopKind::FixedCount;
+    loop.tripCount = LoopTripCount::constant<std::uint32_t>(3);
+    dg.nodes.emplace_back(loop);
+
+    DGraphChild child;
+    child.parentNodeId = "loop0";
+    child.role         = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    const rp1_node_t* n = ddr_.nodes();
+
+    // node 0: LOOP, body range [1,2], 3 iterations, clears the body bucket.
+    EXPECT_EQ(n[0].opcode, RP1_OP_LOOP);
+    EXPECT_EQ(n[0].payload.loop.body_start, 1u);
+    EXPECT_EQ(n[0].payload.loop.body_end, 2u);
+    EXPECT_EQ(n[0].payload.loop.max_iterations, 3u);
+    EXPECT_EQ(n[0].payload.loop.bucket_clear_start, 1u);
+    EXPECT_EQ(n[0].payload.loop.bucket_clear_end, 1u);
+    EXPECT_EQ(n[0].barrier_set_bucket, 0u);          // exit bit lives in bucket 0
+    EXPECT_EQ(n[0].payload.loop.condition_op, RP1_COP_AND_NZ);  // never -> max_iter governs
+    EXPECT_EQ(n[0].payload.loop.condition_value, 0u);
+
+    // node 1: the body kernel, done-bit in the loop's body bucket (1).
+    EXPECT_EQ(n[1].opcode, RP1_OP_KERNEL_DISPATCH);
+    EXPECT_EQ(n[1].barrier_set_bucket, 1u);
+
+    // node 2: RERUN re-arms the LOOP node (index 0), gated on the body bucket.
+    EXPECT_EQ(n[2].opcode, RP1_OP_RERUN);
+    EXPECT_EQ(n[2].payload.rerun.target_node, 0u);
+    EXPECT_EQ(n[2].barrier_await_bucket, 1u);
+
+    // node 3: sentinel SIGNAL gated on the loop's exit bit.
+    EXPECT_EQ(n[3].opcode, RP1_OP_SIGNAL);
+    EXPECT_EQ(n[3].barrier_set_mask, 1u << 31);
+    EXPECT_EQ(n[3].barrier_await_mask, n[0].barrier_set_mask);
+}
+
+// End-to-end execution: a fixed-count loop must dispatch its body kernel
+// exactly N times when run on a faithful host RP1 scanner (LOOP/RERUN +
+// per-iteration body-bucket clear), proving the lowering iterates correctly
+// rather than just emitting a structurally-plausible image.
+TEST(FpgaControlExecution, FixedCountLoopExecutesNIterations) {
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr);
+
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+    FpgaDevice dev("fpga:0", window,
+                   [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
+
+    CompiledKernelNode bodyK;
+    bodyK.id       = "bk";
+    bodyK.deviceId = "fpga:0";
+    bodyK.kernel   = fpgaKernel("bodyK");
+    auto body = std::make_shared<DGraph>();
+    body->deviceId     = "fpga:0";
+    body->nodes.push_back(bodyK);
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph dg;
+    dg.deviceId     = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode loop;
+    loop.id        = "loop0";
+    loop.deviceId  = "fpga:0";
+    loop.loopKind  = CompiledLoopKind::FixedCount;
+    loop.tripCount = LoopTripCount::constant<std::uint32_t>(5);
+    dg.nodes.emplace_back(loop);
+    DGraphChild child;
+    child.parentNodeId = "loop0";
+    child.role         = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    EXPECT_EQ(rp1.dispatches(kBodyBase), 5u);
+}
+
+// Phase F.1: a data-dependent (while) FPGA loop terminates autonomously when a
+// body output scalar's SCALAR_READ slot crosses the predicate threshold.  The
+// body kernel produces a monotonically increasing "i"; the loop continues while
+// i < N, so RP1 must exit (compare GE N) once the slot reaches N -- dispatching
+// the body exactly N times with no host round-trip.
+TEST(FpgaControlExecution, WhileLoopExitsOnBodyScalarPredicate) {
+    constexpr std::uint32_t N = 6u;
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr);
+
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+    FpgaDevice dev("fpga:0", window,
+                   [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
+
+    // Body kernel produces output scalar "i" (the loop variable).
+    IOTypeMap bodyType;
+    bodyType.outputScalars.push_back({"i", ScalarType::U32});
+    CompiledKernelNode bodyK;
+    bodyK.id       = "bk";
+    bodyK.deviceId = "fpga:0";
+    bodyK.kernel   = fpgaKernel("bodyK", bodyType);
+    bodyK.ioMap.bindScalar("i", GraphScalar::globalVar(ScalarType::U32, "i"));
+
+    auto body = std::make_shared<DGraph>();
+    body->deviceId     = "fpga:0";
+    body->nodes.push_back(bodyK);
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph dg;
+    dg.deviceId     = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode loop;
+    loop.id        = "loop0";
+    loop.deviceId  = "fpga:0";
+    loop.loopKind  = CompiledLoopKind::WhileCondition;
+    loop.condition = Condition::compare(CompareOp::LT,
+                                        ConditionOperand::scalar(ScalarType::U32, "i"),
+                                        ConditionOperand::constant<std::uint32_t>(N));
+    dg.nodes.emplace_back(loop);
+    DGraphChild child;
+    child.parentNodeId = "loop0";
+    child.role         = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    EXPECT_EQ(rp1.dispatches(kBodyBase), N)
+        << "while-loop body should dispatch until the predicate slot reaches N";
+}
+
+// Phase F.1b: a data-dependent while-loop whose predicate reads a *parent*
+// scalar produced by the body and exported each iteration (the loop-carried
+// authoring shape).  The body kernel binds a local output scalar; an end
+// boundary exports it to the parent scalar; the LOOP predicate reads the parent.
+// The device lowering must alias the parent scalar to the body output's
+// SCALAR_READ slot so the loop terminates on the freshly-produced value.
+TEST(FpgaControlExecution, WhileLoopExitsOnExportedParentScalarPredicate) {
+    constexpr std::uint32_t N = 4u;
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr);
+
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+    FpgaDevice dev("fpga:0", window,
+                   [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
+
+    // Body kernel produces local scalar "next" (scope 1).
+    IOTypeMap bodyType;
+    bodyType.outputScalars.push_back({"out", ScalarType::U32});
+    CompiledKernelNode bodyK;
+    bodyK.id       = "bk";
+    bodyK.deviceId = "fpga:0";
+    bodyK.kernel   = fpgaKernel("bodyK", bodyType);
+    bodyK.ioMap.bindScalar("out", GraphScalar::globalVar(ScalarType::U32, "next", 1));
+
+    // End boundary exports local "next" (scope 1) to parent "counter" (scope 0).
+    CompiledBoundaryNode exportB;
+    exportB.id       = "export";
+    exportB.deviceId = "fpga:0";
+    exportB.side     = CompiledBoundaryNode::Side::End;
+    exportB.scalarCopies.push_back({/*sourceName=*/"next", /*sourceScopeId=*/1,
+                                    /*targetName=*/"counter", /*targetScopeId=*/0});
+
+    auto body = std::make_shared<DGraph>();
+    body->deviceId     = "fpga:0";
+    body->nodes.push_back(bodyK);
+    body->nodes.push_back(exportB);
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph dg;
+    dg.deviceId     = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode loop;
+    loop.id        = "loop0";
+    loop.deviceId  = "fpga:0";
+    loop.loopKind  = CompiledLoopKind::WhileCondition;
+    loop.condition = Condition::compare(
+        CompareOp::LT, ConditionOperand::scalar(ScalarType::U32, "counter", 0),
+        ConditionOperand::constant<std::uint32_t>(N));
+    dg.nodes.emplace_back(loop);
+    DGraphChild child;
+    child.parentNodeId = "loop0";
+    child.role         = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    EXPECT_EQ(rp1.dispatches(kBodyBase), N)
+        << "while-loop should iterate until the exported parent predicate reaches N";
+}
+
+// Phase F.1b Tier 2: a loop-carried scalar *input*.  The body kernel reads the
+// carried value from an s_axilite register (fed each iteration by SCALAR_COPY
+// from the carried slot) and writes the next value back (captured by SCALAR_READ
+// into the same slot).  The LOOP predicate reads that slot; the carried value
+// flows entirely on-FPGA across iterations via the new RP1_OP_SCALAR_COPY.
+TEST(FpgaControlExecution, WhileLoopCarriesScalarInputViaScalarCopy) {
+    constexpr std::uint32_t N = 4u;
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr);
+
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+    FpgaDevice dev("fpga:0", window,
+                   [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
+
+    // Body kernel: input scalar "in" (carried), output scalar "out" (carried).
+    IOTypeMap bodyType;
+    bodyType.inputScalars.push_back({"in", ScalarType::U32});
+    bodyType.outputScalars.push_back({"out", ScalarType::U32});
+    CompiledKernelNode bodyK;
+    bodyK.id = "bk"; bodyK.deviceId = "fpga:0"; bodyK.kernel = fpgaKernel("bodyK", bodyType);
+    bodyK.ioMap.bindScalar("in",  GraphScalar::globalVar(ScalarType::U32, "lin",  1));
+    bodyK.ioMap.bindScalar("out", GraphScalar::globalVar(ScalarType::U32, "lout", 1));
+
+    // Import counter(0) -> lin(1) (Start); export lout(1) -> counter(0) (End).
+    CompiledBoundaryNode importB;
+    importB.id = "import"; importB.deviceId = "fpga:0";
+    importB.side = CompiledBoundaryNode::Side::Start;
+    importB.scalarCopies.push_back({/*src*/"counter", 0, /*tgt*/"lin", 1});
+    CompiledBoundaryNode exportB;
+    exportB.id = "export"; exportB.deviceId = "fpga:0";
+    exportB.side = CompiledBoundaryNode::Side::End;
+    exportB.scalarCopies.push_back({/*src*/"lout", 1, /*tgt*/"counter", 0});
+
+    auto body = std::make_shared<DGraph>();
+    body->deviceId     = "fpga:0";
+    body->nodes.push_back(importB);
+    body->nodes.push_back(bodyK);
+    body->nodes.push_back(exportB);
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph dg;
+    dg.deviceId     = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode loop;
+    loop.id        = "loop0";
+    loop.deviceId  = "fpga:0";
+    loop.loopKind  = CompiledLoopKind::WhileCondition;
+    loop.condition = Condition::compare(
+        CompareOp::LT, ConditionOperand::scalar(ScalarType::U32, "counter", 0),
+        ConditionOperand::constant<std::uint32_t>(N));
+    dg.nodes.emplace_back(loop);
+    DGraphChild child;
+    child.parentNodeId = "loop0";
+    child.role         = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    EXPECT_EQ(rp1.dispatches(kBodyBase), N)
+        << "carried-scalar while-loop should iterate until the predicate reaches N";
+    // The carried value was fed into the kernel's input register each iteration;
+    // the final SCALAR_COPY carried N-1 (the value the last iteration consumed).
+    EXPECT_EQ(rp1.scalarCopyTo(kBodyBase + 0x10u), N - 1u)
+        << "carried scalar should have been copied into the kernel input register";
+}
+
+// Phase F.2: an autonomous FPGA conditional gates exactly one branch via
+// RP1_OP_COND.  A main-line producer's output scalar (captured to a slot via
+// SCALAR_READ; FaithfulRp1 models it as 1) drives the predicate; the COND-gated
+// then/else lowering must dispatch only the taken branch and OR-join so the
+// graph completes either way.  Predicate "p >= K": K=1 takes then, K=2 takes
+// else (since the modelled p == 1).
+TEST(FpgaControlExecution, ConditionalGatesExactlyOneBranch) {
+    constexpr std::uint32_t kPredBase = 0x88010000u;
+    constexpr std::uint32_t kThenBase = 0x88020000u;
+    constexpr std::uint32_t kElseBase = 0x88030000u;
+
+    auto runWithThreshold = [&](std::uint32_t threshold,
+                                std::uint32_t& thenDisp, std::uint32_t& elseDisp) {
+        std::vector<std::byte> backing(kBarSize, std::byte{0});
+        DdrView ddr{backing.data()};
+        primeAsReady(ddr);
+        auto window =
+            std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+        FaithfulRp1 rp1(ddr);
+
+        FpgaDevice dev("fpga:0", window, [](const std::string& name) -> FpgaKernelLocation {
+            if (name == "pred") return {kPredBase, 0};
+            if (name == "thenK") return {kThenBase, 0};
+            return {kElseBase, 0};
+        });
+
+        // Main-line predicate producer with an output scalar "p".
+        IOTypeMap predType;
+        predType.outputScalars.push_back({"p", ScalarType::U32});
+        CompiledKernelNode pred;
+        pred.id = "pred"; pred.deviceId = "fpga:0"; pred.kernel = fpgaKernel("pred", predType);
+        pred.ioMap.bindScalar("p", GraphScalar::globalVar(ScalarType::U32, "p"));
+
+        auto mk = [](const char* id, const char* name, std::uint32_t /*base*/) {
+            CompiledKernelNode k;
+            k.id = id; k.deviceId = "fpga:0"; k.kernel = fpgaKernel(name);
+            return k;
+        };
+        auto thenBody = std::make_shared<DGraph>();
+        thenBody->deviceId = "fpga:0";
+        thenBody->nodes.push_back(mk("tk", "thenK", kThenBase));
+        thenBody->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+        auto elseBody = std::make_shared<DGraph>();
+        elseBody->deviceId = "fpga:0";
+        elseBody->nodes.push_back(mk("ek", "elseK", kElseBase));
+        elseBody->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+        DGraph dg;
+        dg.deviceId = "fpga:0";
+        dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+        dg.nodes.emplace_back(pred);
+        CompiledConditionalNode cond;
+        cond.id = "cond0"; cond.deviceId = "fpga:0"; cond.dependsOn = {"pred"};
+        cond.condition = Condition::compare(CompareOp::GE,
+                                            ConditionOperand::scalar(ScalarType::U32, "p"),
+                                            ConditionOperand::constant<std::uint32_t>(threshold));
+        dg.nodes.emplace_back(cond);
+        DGraphChild thenChild;
+        thenChild.parentNodeId = "cond0"; thenChild.role = DGraphChildRole::ConditionalThen;
+        thenChild.dgraphs.push_back(thenBody);
+        dg.childDGraphs.push_back(thenChild);
+        DGraphChild elseChild;
+        elseChild.parentNodeId = "cond0"; elseChild.role = DGraphChildRole::ConditionalElse;
+        elseChild.dgraphs.push_back(elseBody);
+        dg.childDGraphs.push_back(elseChild);
+
+        auto plan = dev.compilePlan(dg);
+        ASSERT_NE(plan, nullptr);
+        plan->launch();
+        plan->wait();
+        thenDisp = rp1.dispatches(kThenBase);
+        elseDisp = rp1.dispatches(kElseBase);
+    };
+
+    std::uint32_t thenDisp = 0, elseDisp = 0;
+    runWithThreshold(1u, thenDisp, elseDisp);   // p(=1) >= 1 true -> then
+    EXPECT_EQ(thenDisp, 1u) << "then branch should run when predicate holds";
+    EXPECT_EQ(elseDisp, 0u) << "else branch must be skipped when predicate holds";
+
+    runWithThreshold(2u, thenDisp, elseDisp);   // p(=1) >= 2 false -> else
+    EXPECT_EQ(thenDisp, 0u) << "then branch must be skipped when predicate fails";
+    EXPECT_EQ(elseDisp, 1u) << "else branch should run when predicate fails";
+}
+
+// Phase A: a fixed-count FPGA loop whose inputs/outputs cross to another device
+// runs autonomously (one submission) with the loop's I/O bridged at entry/exit:
+// the input (consumer) bridge stages data before the image, the output
+// (producer) bridge drains it after, and the body iterates N times in between.
+TEST(FpgaControlExecution, LoopWithBoundaryBridgesRunsInputThenImageThenOutput) {
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr);
+
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+    FpgaDevice dev("fpga:0", window,
+                   [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
+
+    std::vector<std::string> order;
+
+    CompiledKernelNode bodyK;
+    bodyK.id       = "bk";
+    bodyK.deviceId = "fpga:0";
+    bodyK.kernel   = fpgaKernel("bodyK");
+    auto body = std::make_shared<DGraph>();
+    body->deviceId     = "fpga:0";
+    body->nodes.push_back(bodyK);
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph dg;
+    dg.deviceId     = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    CompiledBridgeOpNode input;
+    input.id       = "in_bridge";
+    input.deviceId = "fpga:0";
+    input.side     = CompiledBridgeOpNode::Side::Consumer;
+    input.tryReady = [] { return true; };
+    input.action   = [&order] { order.push_back("input"); };
+    dg.nodes.emplace_back(input);
+
+    CompiledLoopNode loop;
+    loop.id        = "loop0";
+    loop.deviceId  = "fpga:0";
+    loop.loopKind  = CompiledLoopKind::FixedCount;
+    loop.tripCount = LoopTripCount::constant<std::uint32_t>(4);
+    loop.dependsOn = {"in_bridge"};
+    dg.nodes.emplace_back(loop);
+
+    CompiledBridgeOpNode output;
+    output.id        = "out_bridge";
+    output.deviceId  = "fpga:0";
+    output.side      = CompiledBridgeOpNode::Side::Producer;
+    output.action    = [&order] { order.push_back("output"); };
+    output.dependsOn = {"loop0"};
+    dg.nodes.emplace_back(output);
+
+    DGraphChild child;
+    child.parentNodeId = "loop0";
+    child.role         = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    ASSERT_EQ(order.size(), 2u);
+    EXPECT_EQ(order[0], "input");   // staged before the loop image
+    EXPECT_EQ(order[1], "output");  // drained after the loop image
+    EXPECT_EQ(rp1.dispatches(kBodyBase), 4u);
+}
+
+// Phase B: a kernel declaring an output scalar must, in a control image, get a
+// trailing RP1_OP_SCALAR_READ that captures the kernel's output register into a
+// signal slot (the value a downstream condition will evaluate).
+TEST(FpgaControlExecution, OutputScalarEmitsScalarReadInControlImage) {
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr);
+
+    constexpr std::uint32_t kProducerBase = 0x88010000u;
+    constexpr std::uint32_t kBodyBase     = 0x88020000u;
+    FpgaDevice dev("fpga:0", window, [](const std::string& name) -> FpgaKernelLocation {
+        if (name == "producer") return {kProducerBase, 0};
+        return {kBodyBase, 0};
+    });
+
+    // Main-line producer kernel with an output scalar.
+    IOTypeMap producerType;
+    producerType.outputScalars.push_back({"parity", ScalarType::U64});
+    CompiledKernelNode producer;
+    producer.id       = "prod";
+    producer.deviceId = "fpga:0";
+    producer.kernel   = fpgaKernel("producer", producerType);
+    producer.ioMap.bindScalar("parity", GraphScalar::globalVar(ScalarType::U64, "parity"));
+
+    CompiledKernelNode bodyK;
+    bodyK.id       = "bk";
+    bodyK.deviceId = "fpga:0";
+    bodyK.kernel   = fpgaKernel("bodyK");
+    auto body = std::make_shared<DGraph>();
+    body->deviceId     = "fpga:0";
+    body->nodes.push_back(bodyK);
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph dg;
+    dg.deviceId     = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    dg.nodes.emplace_back(producer);
+    CompiledLoopNode loop;
+    loop.id        = "loop0";
+    loop.deviceId  = "fpga:0";
+    loop.loopKind  = CompiledLoopKind::FixedCount;
+    loop.tripCount = LoopTripCount::constant<std::uint32_t>(2);
+    loop.dependsOn = {"prod"};
+    dg.nodes.emplace_back(loop);
+    DGraphChild child;
+    child.parentNodeId = "loop0";
+    child.role         = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    const rp1_node_t* n = ddr.nodes();
+    const std::uint32_t count = ddr.ctrl().node_count;
+    bool foundRead = false;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (n[i].opcode == RP1_OP_SCALAR_READ &&
+            n[i].payload.scalar_read.source_addr == kProducerBase + 0x10u) {
+            foundRead = true;
+        }
+    }
+    EXPECT_TRUE(foundRead) << "expected a SCALAR_READ of the producer's output register";
+}
+
+// Cross-queue rendezvous: two concurrently-running RP1 queues sharing a
+// host-visible signal array.  The consumer queue's WAIT must hold its kernel
+// until the producer queue raises the signal -- the SIGNAL/WAIT primitive the
+// compiler cross-queue split will emit at device boundaries.
+TEST(FpgaCrossQueue, SignalWaitRendezvousAcrossConcurrentQueues) {
+    constexpr std::uint32_t kSlot     = 12u;
+    constexpr std::uint32_t kToken    = 0xCAFEu;
+    constexpr std::uint32_t kBaseA    = 0x88010000u;  // producer queue kernel
+    constexpr std::uint32_t kBaseB    = 0x88020000u;  // consumer queue kernel
+
+    std::vector<rp1_signal_slot_t> sharedSignals(RP1_MAX_SIGNALS);
+    std::memset(sharedSignals.data(), 0, sharedSignals.size() * sizeof(rp1_signal_slot_t));
+
+    std::vector<std::byte> backingA(kBarSize, std::byte{0});
+    std::vector<std::byte> backingB(kBarSize, std::byte{0});
+    DdrView ddrA{backingA.data()};
+    DdrView ddrB{backingB.data()};
+    primeAsReady(ddrA);
+    primeAsReady(ddrB);
+
+    auto mkNode = [](std::uint16_t opcode, std::uint8_t awB, std::uint32_t awM,
+                     std::uint8_t stB, std::uint32_t stM) {
+        rp1_node_t n{};
+        n.opcode               = opcode;
+        n.status               = RP1_NODE_PENDING;
+        n.barrier_await_bucket = awB;
+        n.barrier_await_mask   = awM;
+        n.barrier_set_bucket   = stB;
+        n.barrier_set_mask     = stM;
+        return n;
+    };
+    auto submit = [](DdrView ddr, const std::vector<rp1_node_t>& ns) {
+        auto& c = ddr.ctrl();
+        c.cq_size    = 64u;
+        c.node_count = static_cast<std::uint32_t>(ns.size());
+        for (std::size_t i = 0; i < ns.size(); ++i) ddr.nodes()[i] = ns[i];
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        c.graph_seq = 1u;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    };
+    auto waitDone = [](DdrView ddr) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (ddr.ctrl().graph_done_seq == ddr.ctrl().graph_seq) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+
+    // Producer queue A: kernel -> SIGNAL slot = token.
+    std::vector<rp1_node_t> queueA;
+    queueA.push_back(mkNode(RP1_OP_KERNEL_DISPATCH, 0, 0x0, 0, 0x1));
+    queueA.back().payload.kernel_dispatch.kernel_base_addr = kBaseA;
+    queueA.push_back(mkNode(RP1_OP_SIGNAL, 0, 0x1, 0, 0x2));
+    queueA.back().payload.signal.target_slot = kSlot;
+    queueA.back().payload.signal.value       = kToken;
+    queueA.back().payload.signal.operation   = RP1_SIGOP_SET;
+
+    // Consumer queue B: WAIT slot == token -> kernel.
+    std::vector<rp1_node_t> queueB;
+    queueB.push_back(mkNode(RP1_OP_WAIT, 0, 0x0, 0, 0x1));
+    queueB.back().payload.wait.condition_signal = kSlot;
+    queueB.back().payload.wait.condition_op     = RP1_COP_EQ;
+    queueB.back().payload.wait.condition_value  = kToken;
+    queueB.push_back(mkNode(RP1_OP_KERNEL_DISPATCH, 0, 0x1, 0, 0x2));
+    queueB.back().payload.kernel_dispatch.kernel_base_addr = kBaseB;
+
+    FaithfulRp1 rpA(ddrA, sharedSignals.data());
+    FaithfulRp1 rpB(ddrB, sharedSignals.data());
+
+    // Start the consumer first; it must park on WAIT, not run its kernel.
+    submit(ddrB, queueB);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(rpB.dispatches(kBaseB), 0u) << "consumer ran before producer signalled";
+    EXPECT_NE(ddrB.ctrl().graph_done_seq, ddrB.ctrl().graph_seq)
+        << "consumer queue completed while still gated on WAIT";
+
+    // Now run the producer; its SIGNAL releases the consumer's WAIT.
+    submit(ddrA, queueA);
+
+    ASSERT_TRUE(waitDone(ddrA)) << "producer queue did not complete";
+    ASSERT_TRUE(waitDone(ddrB)) << "consumer queue did not complete after rendezvous";
+    EXPECT_EQ(rpA.dispatches(kBaseA), 1u);
+    EXPECT_EQ(rpB.dispatches(kBaseB), 1u);
+    EXPECT_EQ(sharedSignals[kSlot].value, kToken);
+}
+
+// Phase C: a full depth-1 per-iteration handshake between an FPGA LOOP queue
+// and a host CPU queue over shared signal slots.  Each iteration the FPGA body
+// raises READY, the CPU polls it, consumes, clears READY (ack) and raises DONE;
+// the FPGA WAITs DONE, clears it, and proceeds.  Over N iterations the per-side
+// counters must both equal N -- no lost or duplicated iterations.
+TEST(FpgaCrossQueue, PerIterationHandshakeOverNIterations) {
+    constexpr std::uint32_t N        = 5u;
+    constexpr std::uint32_t kReady   = 20u;
+    constexpr std::uint32_t kDone    = 21u;
+    constexpr std::uint32_t kCountF  = 22u;  // FPGA-side iteration counter
+
+    std::vector<rp1_signal_slot_t> sig(RP1_MAX_SIGNALS);
+    std::memset(sig.data(), 0, sig.size() * sizeof(rp1_signal_slot_t));
+
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+
+    auto node = [](std::uint16_t op, std::uint8_t awB, std::uint32_t awM,
+                   std::uint8_t stB, std::uint32_t stM) {
+        rp1_node_t n{};
+        n.opcode = op;
+        n.status = RP1_NODE_PENDING;
+        n.barrier_await_bucket = awB;
+        n.barrier_await_mask = awM;
+        n.barrier_set_bucket = stB;
+        n.barrier_set_mask = stM;
+        return n;
+    };
+
+    // FPGA producer queue: LOOP body=[1..5] (count, raise READY, WAIT DONE,
+    // clear DONE, RERUN), bucket 1 cleared each iteration.
+    std::vector<rp1_node_t> q;
+    {
+        rp1_node_t loop = node(RP1_OP_LOOP, 0, 0x0, 0, 0x2);
+        loop.payload.loop.body_start = 1;
+        loop.payload.loop.body_end = 5;
+        loop.payload.loop.max_iterations = N;
+        loop.payload.loop.condition_op = RP1_COP_AND_NZ;  // never -> max_iter governs
+        loop.payload.loop.condition_value = 0;
+        loop.payload.loop.bucket_clear_start = 1;
+        loop.payload.loop.bucket_clear_end = 1;
+        loop.payload.loop.loop_id = 0;
+        q.push_back(loop);
+
+        rp1_node_t count = node(RP1_OP_SIGNAL, 1, 0x0, 1, 0x1);
+        count.payload.signal.target_slot = kCountF;
+        count.payload.signal.value = 1;
+        count.payload.signal.operation = RP1_SIGOP_ADD;
+        q.push_back(count);
+
+        rp1_node_t ready = node(RP1_OP_SIGNAL, 1, 0x1, 1, 0x2);
+        ready.payload.signal.target_slot = kReady;
+        ready.payload.signal.value = 1;
+        ready.payload.signal.operation = RP1_SIGOP_SET;
+        q.push_back(ready);
+
+        rp1_node_t waitDone = node(RP1_OP_WAIT, 1, 0x2, 1, 0x4);
+        waitDone.payload.wait.condition_signal = kDone;
+        waitDone.payload.wait.condition_op = RP1_COP_AND_NZ;
+        waitDone.payload.wait.condition_value = 1;
+        q.push_back(waitDone);
+
+        rp1_node_t clearDone = node(RP1_OP_SIGNAL, 1, 0x4, 1, 0x8);
+        clearDone.payload.signal.target_slot = kDone;
+        clearDone.payload.signal.value = 0;
+        clearDone.payload.signal.operation = RP1_SIGOP_SET;
+        q.push_back(clearDone);
+
+        rp1_node_t rerun = node(RP1_OP_RERUN, 1, 0x8, 1, 0x10);
+        rerun.payload.rerun.target_node = 0;
+        q.push_back(rerun);
+    }
+
+    auto& c = ddr.ctrl();
+    c.cq_size = 64u;
+    c.node_count = static_cast<std::uint32_t>(q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) ddr.nodes()[i] = q[i];
+
+    FaithfulRp1 rp1(ddr, sig.data());
+
+    // Host CPU queue: rendezvous N times via the shared slots over the "BAR".
+    std::atomic<std::uint32_t> cpuCount{0};
+    std::thread cpu([&] {
+        for (std::uint32_t i = 0; i < N; ++i) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (sig[kReady].value == 0) {
+                if (std::chrono::steady_clock::now() > deadline) return;
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            // consume iteration i
+            cpuCount.fetch_add(1, std::memory_order_relaxed);
+            sig[kReady].value = 0;  // ack/clear
+            sig[kDone].value = 1;   // release the FPGA WAIT
+        }
+    });
+
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    c.graph_seq = 1u;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (c.graph_done_seq != c.graph_seq &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    cpu.join();
+
+    EXPECT_EQ(c.graph_done_seq, c.graph_seq) << "FPGA loop did not complete";
+    EXPECT_EQ(sig[kCountF].value, N) << "FPGA body ran the wrong number of iterations";
+    EXPECT_EQ(cpuCount.load(), N) << "CPU consumed the wrong number of iterations";
+}
+
+// Phase D1: an FPGA loop whose body carries rendezvous CompiledSignalNode /
+// CompiledWaitNode (lowered to RP1_OP_SIGNAL/WAIT in the body bucket) runs the
+// depth-1 handshake with a host CPU peer each iteration.  Validates that the
+// compiler-shaped rendezvous IR lowers and executes over N iterations.
+TEST(FpgaCrossQueue, RendezvousNodesInLoopBodyHandshakeWithCpu) {
+    constexpr std::uint32_t N        = 4u;
+    constexpr std::uint32_t kReady   = 30u;
+    constexpr std::uint32_t kDone    = 31u;
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+
+    std::vector<rp1_signal_slot_t> sig(RP1_MAX_SIGNALS);
+    std::memset(sig.data(), 0, sig.size() * sizeof(rp1_signal_slot_t));
+
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr, sig.data());
+
+    FpgaDevice dev("fpga:0", window,
+                   [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
+
+    // Loop body: bodyK -> SIGNAL ready=1 -> WAIT done!=0 -> SIGNAL done=0 (clear).
+    CompiledKernelNode bodyK;
+    bodyK.id = "bk"; bodyK.deviceId = "fpga:0"; bodyK.kernel = fpgaKernel("bodyK");
+
+    CompiledSignalNode sigReady;
+    sigReady.id = "sig_ready"; sigReady.deviceId = "fpga:0"; sigReady.dependsOn = {"bk"};
+    sigReady.slot = kReady; sigReady.value = 1; sigReady.operation = RP1_SIGOP_SET;
+
+    CompiledWaitNode waitDone;
+    waitDone.id = "wait_done"; waitDone.deviceId = "fpga:0"; waitDone.dependsOn = {"sig_ready"};
+    waitDone.slot = kDone; waitDone.value = 1; waitDone.conditionOp = RP1_COP_AND_NZ;
+
+    CompiledSignalNode sigClear;
+    sigClear.id = "sig_clear"; sigClear.deviceId = "fpga:0"; sigClear.dependsOn = {"wait_done"};
+    sigClear.slot = kDone; sigClear.value = 0; sigClear.operation = RP1_SIGOP_SET;
+
+    auto body = std::make_shared<DGraph>();
+    body->deviceId = "fpga:0";
+    body->nodes.emplace_back(bodyK);
+    body->nodes.emplace_back(sigReady);
+    body->nodes.emplace_back(waitDone);
+    body->nodes.emplace_back(sigClear);
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph dg;
+    dg.deviceId = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode loop;
+    loop.id = "loop0"; loop.deviceId = "fpga:0";
+    loop.loopKind = CompiledLoopKind::FixedCount;
+    loop.tripCount = LoopTripCount::constant<std::uint32_t>(N);
+    dg.nodes.emplace_back(loop);
+    DGraphChild child;
+    child.parentNodeId = "loop0"; child.role = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    // Host CPU peer: each iteration await READY, ack (clear READY), raise DONE.
+    std::atomic<std::uint32_t> cpuCount{0};
+    std::atomic<bool> stop{false};
+    std::thread cpu([&] {
+        for (std::uint32_t i = 0; i < N; ++i) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (sig[kReady].value == 0) {
+                if (stop.load() || std::chrono::steady_clock::now() > deadline) return;
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            cpuCount.fetch_add(1, std::memory_order_relaxed);
+            sig[kReady].value = 0;
+            sig[kDone].value = 1;
+        }
+    });
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+    stop.store(true);
+    cpu.join();
+
+    EXPECT_EQ(rp1.dispatches(kBodyBase), N) << "FPGA loop body ran the wrong count";
+    EXPECT_EQ(cpuCount.load(), N) << "CPU peer rendezvoused the wrong count";
+}
+
+// Phase F.3: an autonomous FPGA while-loop terminates on a predicate *broadcast*
+// by a peer over a shared host-visible signal slot.  The peer (a host thread
+// standing in for the other queue) bumps the broadcast predicate each iteration
+// and only then releases the rendezvous, so the FPGA loop sees a fresh value
+// before its next top-of-loop check.  The loop must run exactly N bodies and
+// exit when the broadcast predicate reaches N -- proving a queue's control flow
+// can be driven by a condition another device computes and broadcasts.
+TEST(FpgaCrossQueue, WhileLoopTerminatesOnBroadcastPredicate) {
+    constexpr std::uint32_t N         = 6u;
+    constexpr std::uint32_t kPred     = 24u;  // broadcast predicate (shared slot)
+    constexpr std::uint32_t kReady    = 25u;
+    constexpr std::uint32_t kDone     = 26u;
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+
+    std::vector<rp1_signal_slot_t> sig(RP1_MAX_SIGNALS);
+    std::memset(sig.data(), 0, sig.size() * sizeof(rp1_signal_slot_t));
+
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    FaithfulRp1 rp1(ddr, sig.data());
+
+    auto node = [](std::uint16_t op, std::uint8_t awB, std::uint32_t awM,
+                   std::uint8_t stB, std::uint32_t stM) {
+        rp1_node_t n{};
+        n.opcode = op;
+        n.status = RP1_NODE_PENDING;
+        n.barrier_await_bucket = awB;
+        n.barrier_await_mask = awM;
+        n.barrier_set_bucket = stB;
+        n.barrier_set_mask = stM;
+        return n;
+    };
+
+    // FPGA while-loop driven by the broadcast predicate kPred (exit when >= N).
+    // body=[1..4]: dispatch, raise READY, WAIT DONE, clear DONE; RERUN at 5.
+    std::vector<rp1_node_t> q;
+    {
+        rp1_node_t loop = node(RP1_OP_LOOP, 0, 0x0, 0, 0x1);
+        loop.payload.loop.body_start = 1;
+        loop.payload.loop.body_end = 5;
+        loop.payload.loop.max_iterations = 100;  // safety cap; predicate governs
+        loop.payload.loop.condition_signal = kPred;
+        loop.payload.loop.condition_op = RP1_COP_GE;
+        loop.payload.loop.condition_value = N;
+        loop.payload.loop.bucket_clear_start = 1;
+        loop.payload.loop.bucket_clear_end = 1;
+        loop.payload.loop.loop_id = 0;
+        q.push_back(loop);
+
+        rp1_node_t body = node(RP1_OP_KERNEL_DISPATCH, 1, 0x0, 1, 0x1);
+        body.payload.kernel_dispatch.kernel_base_addr = kBodyBase;
+        q.push_back(body);
+
+        rp1_node_t ready = node(RP1_OP_SIGNAL, 1, 0x1, 1, 0x2);
+        ready.payload.signal.target_slot = kReady;
+        ready.payload.signal.value = 1;
+        ready.payload.signal.operation = RP1_SIGOP_SET;
+        q.push_back(ready);
+
+        rp1_node_t waitDone = node(RP1_OP_WAIT, 1, 0x2, 1, 0x4);
+        waitDone.payload.wait.condition_signal = kDone;
+        waitDone.payload.wait.condition_op = RP1_COP_AND_NZ;
+        waitDone.payload.wait.condition_value = 1;
+        q.push_back(waitDone);
+
+        rp1_node_t clearDone = node(RP1_OP_SIGNAL, 1, 0x4, 1, 0x8);
+        clearDone.payload.signal.target_slot = kDone;
+        clearDone.payload.signal.value = 0;
+        clearDone.payload.signal.operation = RP1_SIGOP_SET;
+        q.push_back(clearDone);
+
+        rp1_node_t rerun = node(RP1_OP_RERUN, 1, 0x8, 1, 0x10);
+        rerun.payload.rerun.target_node = 0;
+        q.push_back(rerun);
+    }
+
+    auto& c = ddr.ctrl();
+    c.cq_size = 64u;
+    c.node_count = static_cast<std::uint32_t>(q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) ddr.nodes()[i] = q[i];
+
+    // Peer queue (host thread): each iteration await READY, broadcast the next
+    // predicate value into the shared slot, then ack READY and raise DONE.  The
+    // predicate is written *before* DONE, so the FPGA's next loop-top check sees
+    // it (happens-before via the DONE handshake).
+    std::atomic<std::uint32_t> peerTicks{0};
+    std::thread peer([&] {
+        for (std::uint32_t i = 1; i <= N; ++i) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (sig[kReady].value == 0) {
+                if (std::chrono::steady_clock::now() > deadline) return;
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            sig[kPred].value = i;   // broadcast predicate (reaches N on the last tick)
+            peerTicks.fetch_add(1, std::memory_order_relaxed);
+            sig[kReady].value = 0;  // ack
+            sig[kDone].value = 1;   // release the FPGA WAIT (after kPred is set)
+        }
+    });
+
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    c.graph_seq = 1u;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (c.graph_done_seq != c.graph_seq &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    peer.join();
+
+    EXPECT_EQ(c.graph_done_seq, c.graph_seq) << "FPGA while-loop did not terminate";
+    EXPECT_EQ(rp1.dispatches(kBodyBase), N)
+        << "loop body should run exactly N times before the broadcast predicate reaches N";
+    EXPECT_EQ(peerTicks.load(), N) << "peer should have broadcast N predicate updates";
+    EXPECT_EQ(sig[kPred].value, N);
+}
+
+namespace {
+// A no-I/O CPU kernel that counts its invocations — stands in for the CPU
+// body slice's compute in the Phase E rendezvous test.
+class CountKernel : public CpuKernel {
+   public:
+    CountKernel(std::string name, std::atomic<std::uint32_t>& counter)
+        : CpuKernel(std::move(name)), counter_(counter) {}
+    IOTypeMap ioTypeMap() const override { return IOTypeMap{}; }
+    void run(Args&) override { counter_.fetch_add(1, std::memory_order_relaxed); }
+
+   private:
+    std::atomic<std::uint32_t>& counter_;
+};
+}  // namespace
+
+// Phase E: a split cross-device loop runs concurrently as two queues that
+// rendezvous each iteration through host-visible signal slots in the FPGA's BAR
+// window.  Here a *real* CpuDevicePlan executes the CPU consumer half of the
+// handshake (CompiledWaitNode polls a slot, CompiledSignalNode SETs one) inside
+// its fixed-count loop, while a real FpgaDevicePlan submits the FPGA producer
+// half once and RP1 iterates autonomously.  The two share the same slots via
+// the CpuDevice's wired signal accessors (the same wiring Graph::compile sets
+// up), proving the CPU queue executes its slice over the BAR rather than
+// relaunching child plans against a hand-rolled peer.
+TEST(FpgaCrossQueue, CpuDevicePlanRendezvousesWithFpgaLoopOverBar) {
+    constexpr std::uint32_t N         = 5u;
+    constexpr std::uint32_t kReady    = 28u;
+    constexpr std::uint32_t kDone     = 29u;
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    // No sharedSignals: RP1 uses the window's own signal region, the very slots
+    // the CpuDevice reaches through readSignal/writeU32 below.
+    FaithfulRp1 rp1(ddr);
+
+    FpgaDevice dev("fpga:0", window,
+                   [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
+
+    // --- FPGA producer half: body = bodyK -> SIGNAL ready=1 -> WAIT done!=0
+    //     -> SIGNAL done=0 (clear), iterated N times by the LOOP. ---
+    CompiledKernelNode bodyK;
+    bodyK.id = "bk"; bodyK.deviceId = "fpga:0"; bodyK.kernel = fpgaKernel("bodyK");
+    CompiledSignalNode sigReady;
+    sigReady.id = "sig_ready"; sigReady.deviceId = "fpga:0"; sigReady.dependsOn = {"bk"};
+    sigReady.slot = kReady; sigReady.value = 1; sigReady.operation = RP1_SIGOP_SET;
+    CompiledWaitNode waitDone;
+    waitDone.id = "wait_done"; waitDone.deviceId = "fpga:0"; waitDone.dependsOn = {"sig_ready"};
+    waitDone.slot = kDone; waitDone.value = 1; waitDone.conditionOp = RP1_COP_AND_NZ;
+    CompiledSignalNode doneClear;
+    doneClear.id = "done_clear"; doneClear.deviceId = "fpga:0"; doneClear.dependsOn = {"wait_done"};
+    doneClear.slot = kDone; doneClear.value = 0; doneClear.operation = RP1_SIGOP_SET;
+
+    auto fbody = std::make_shared<DGraph>();
+    fbody->deviceId = "fpga:0";
+    fbody->nodes = {bodyK, sigReady, waitDone, doneClear};
+    fbody->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph fdg;
+    fdg.deviceId = "fpga:0";
+    fdg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode floop;
+    floop.id = "floop"; floop.deviceId = "fpga:0";
+    floop.loopKind = CompiledLoopKind::FixedCount;
+    floop.tripCount = LoopTripCount::constant<std::uint32_t>(N);
+    fdg.nodes.emplace_back(floop);
+    DGraphChild fchild;
+    fchild.parentNodeId = "floop"; fchild.role = DGraphChildRole::LoopBody;
+    fchild.dgraphs.push_back(fbody);
+    fdg.childDGraphs.push_back(fchild);
+
+    // --- CPU consumer half: a real CpuDevice wired to the FPGA window's
+    //     signal slots, looping N times: WAIT ready!=0 -> SET ready=0 (clear)
+    //     -> count -> SET done=1 (release the FPGA's WAIT). ---
+    auto cpuDev = std::make_shared<CpuDevice>("cpu");
+    std::atomic<std::uint32_t> cpuCount{0};
+    cpuDev->registerKernel(std::make_shared<CountKernel>("counter", cpuCount));
+    cpuDev->setSignalAccessors(
+        [window](std::uint32_t slot) -> std::uint32_t {
+            rp1_signal_slot_t s{};
+            window->readSignal(slot, s);
+            return s.value;
+        },
+        [window](std::uint32_t slot, std::uint32_t value) {
+            window->writeU32(static_cast<std::uint32_t>(
+                                 RP1_DEFAULT_SIG_ARRAY_OFFSET +
+                                 slot * sizeof(rp1_signal_slot_t) +
+                                 offsetof(rp1_signal_slot_t, value)),
+                             value);
+        });
+
+    CompiledWaitNode waitReady;
+    waitReady.id = "wait_ready"; waitReady.deviceId = "cpu";
+    waitReady.slot = kReady; waitReady.value = 1; waitReady.conditionOp = RP1_COP_AND_NZ;
+    CompiledSignalNode readyClear;
+    readyClear.id = "ready_clear"; readyClear.deviceId = "cpu"; readyClear.dependsOn = {"wait_ready"};
+    readyClear.slot = kReady; readyClear.value = 0; readyClear.operation = RP1_SIGOP_SET;
+    CompiledKernelNode count;
+    count.id = "count"; count.deviceId = "cpu"; count.dependsOn = {"ready_clear"};
+    count.kernel = KernelDescriptor{"counter", DeviceType::CPU, std::nullopt, IOTypeMap{}};
+    CompiledSignalNode doneSet;
+    doneSet.id = "done_set"; doneSet.deviceId = "cpu"; doneSet.dependsOn = {"count"};
+    doneSet.slot = kDone; doneSet.value = 1; doneSet.operation = RP1_SIGOP_SET;
+
+    auto cbody = std::make_shared<DGraph>();
+    cbody->deviceId = "cpu"; cbody->device = cpuDev;
+    cbody->nodes = {waitReady, readyClear, count, doneSet};
+    cbody->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph cdg;
+    cdg.deviceId = "cpu"; cdg.device = cpuDev;
+    cdg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode cloop;
+    cloop.id = "cloop"; cloop.deviceId = "cpu";
+    cloop.loopKind = CompiledLoopKind::FixedCount;
+    cloop.tripCount = LoopTripCount::constant<std::uint32_t>(N);
+    cdg.nodes.emplace_back(cloop);
+    DGraphChild cchild;
+    cchild.parentNodeId = "cloop"; cchild.role = DGraphChildRole::LoopBody;
+    cchild.dgraphs.push_back(cbody);
+    cdg.childDGraphs.push_back(cchild);
+
+    // Launch both queues concurrently; they self-synchronize per iteration.
+    auto fpgaPlan = dev.compilePlan(fdg);
+    auto cpuPlan  = cpuDev->compilePlan(cdg);
+    ASSERT_NE(fpgaPlan, nullptr);
+    ASSERT_NE(cpuPlan, nullptr);
+    fpgaPlan->launch();
+    cpuPlan->launch();
+    cpuPlan->wait();
+    fpgaPlan->wait();
+
+    EXPECT_EQ(rp1.dispatches(kBodyBase), N) << "FPGA loop body ran the wrong count";
+    EXPECT_EQ(cpuCount.load(), N) << "CPU queue rendezvoused the wrong count";
+}
+
+// A loop whose body is not FPGA-resident (cross-device) is the Phase-2
+// cross-queue case; phase-1 lowering rejects it with a clear diagnostic.
+TEST_F(FpgaDeviceFixture, LoopWithoutFpgaBodyThrows) {
+    FpgaDevice dev("fpga:0", window_,
+                   [](const std::string&) { return FpgaKernelLocation{0x88010000u, 0}; });
+
+    DGraph dg;
+    dg.deviceId     = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    CompiledLoopNode loop;
+    loop.id        = "loop0";
+    loop.deviceId  = "fpga:0";
+    loop.loopKind  = CompiledLoopKind::FixedCount;
+    loop.tripCount = LoopTripCount::constant<std::uint32_t>(2);
+    dg.nodes.emplace_back(loop);
+    // No childDGraphs -> no FPGA body.
+
+    EXPECT_THROW(dev.compilePlan(dg), std::logic_error);
+}
+
+// Phase F.3b: a data-dependent cross-device *split* loop runs as two
+// rendezvousing queues -- a CPU Authority that drives the loop and broadcasts
+// its per-iteration continue/stop decision, and an FPGA Follower whose RP1 LOOP
+// reads that broadcast as its exit predicate.  Neither queue is told the count
+// up front; the Follower runs exactly as many bodies as the Authority dictates,
+// the two staying in lockstep via the ready/ack broadcast handshake.
+TEST(FpgaCrossQueue, DataDependentSplitLoopAuthorityDrivesFollower) {
+    constexpr std::uint32_t N         = 5u;
+    constexpr std::uint32_t kDecision = 16u;
+    constexpr std::uint32_t kReady    = 17u;
+    constexpr std::uint32_t kAck      = 18u;
+    constexpr std::uint32_t kBodyBase = 0x88010000u;
+
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr);  // uses the window's own signals (shared with the CPU accessors)
+
+    FpgaDevice dev("fpga:0", window,
+                   [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
+
+    // FPGA Follower: LOOP body = bodyK; lowering injects the broadcast tail
+    // handshake + RERUN and sets the LOOP exit predicate to kDecision.
+    CompiledKernelNode bodyK;
+    bodyK.id = "bk"; bodyK.deviceId = "fpga:0"; bodyK.kernel = fpgaKernel("bodyK");
+    auto fbody = std::make_shared<DGraph>();
+    fbody->deviceId = "fpga:0";
+    fbody->nodes.push_back(bodyK);
+    fbody->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph fdg;
+    fdg.deviceId = "fpga:0";
+    fdg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode floop;
+    floop.id = "floop"; floop.deviceId = "fpga:0";
+    floop.loopKind = CompiledLoopKind::WhileCondition;
+    floop.broadcastRole = SplitBroadcastRole::Follower;
+    floop.conditionBroadcastSlot = kDecision;
+    floop.broadcastReadySlot = kReady;
+    floop.broadcastAckSlot = kAck;
+    fdg.nodes.emplace_back(floop);
+    DGraphChild fchild;
+    fchild.parentNodeId = "floop"; fchild.role = DGraphChildRole::LoopBody;
+    fchild.dgraphs.push_back(fbody);
+    fdg.childDGraphs.push_back(fchild);
+
+    // CPU Authority: drives the loop and broadcasts the decision, wired to the
+    // FPGA window's signal slots.  (Fixed count here for a deterministic check;
+    // a data-dependent Condition takes the same executeLoopAuthority path.)
+    auto cpuDev = std::make_shared<CpuDevice>("cpu");
+    std::atomic<std::uint32_t> cpuCount{0};
+    cpuDev->registerKernel(std::make_shared<CountKernel>("counter", cpuCount));
+    cpuDev->setSignalAccessors(
+        [window](std::uint32_t slot) -> std::uint32_t {
+            rp1_signal_slot_t s{};
+            window->readSignal(slot, s);
+            return s.value;
+        },
+        [window](std::uint32_t slot, std::uint32_t value) {
+            window->writeU32(static_cast<std::uint32_t>(
+                                 RP1_DEFAULT_SIG_ARRAY_OFFSET +
+                                 slot * sizeof(rp1_signal_slot_t) +
+                                 offsetof(rp1_signal_slot_t, value)),
+                             value);
+        });
+
+    CompiledKernelNode count;
+    count.id = "count"; count.deviceId = "cpu";
+    count.kernel = KernelDescriptor{"counter", DeviceType::CPU, std::nullopt, IOTypeMap{}};
+    auto cbody = std::make_shared<DGraph>();
+    cbody->deviceId = "cpu"; cbody->device = cpuDev;
+    cbody->nodes.push_back(count);
+    cbody->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+
+    DGraph cdg;
+    cdg.deviceId = "cpu"; cdg.device = cpuDev;
+    cdg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode cloop;
+    cloop.id = "cloop"; cloop.deviceId = "cpu";
+    cloop.loopKind = CompiledLoopKind::FixedCount;
+    cloop.tripCount = LoopTripCount::constant<std::uint32_t>(N);
+    cloop.broadcastRole = SplitBroadcastRole::Authority;
+    cloop.conditionBroadcastSlot = kDecision;
+    cloop.broadcastReadySlot = kReady;
+    cloop.broadcastAckSlot = kAck;
+    cdg.nodes.emplace_back(cloop);
+    DGraphChild cchild;
+    cchild.parentNodeId = "cloop"; cchild.role = DGraphChildRole::LoopBody;
+    cchild.dgraphs.push_back(cbody);
+    cdg.childDGraphs.push_back(cchild);
+
+    auto fpgaPlan = dev.compilePlan(fdg);
+    auto cpuPlan  = cpuDev->compilePlan(cdg);
+    ASSERT_NE(fpgaPlan, nullptr);
+    ASSERT_NE(cpuPlan, nullptr);
+    fpgaPlan->launch();
+    cpuPlan->launch();
+    cpuPlan->wait();
+    fpgaPlan->wait();
+
+    EXPECT_EQ(rp1.dispatches(kBodyBase), N) << "FPGA follower ran the wrong body count";
+    EXPECT_EQ(cpuCount.load(), N) << "CPU authority ran the wrong body count";
 }

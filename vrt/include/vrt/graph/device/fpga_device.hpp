@@ -234,6 +234,12 @@ class FpgaDevice : public IDevice {
 
     static std::string normalizeBufferKey(const std::string& bufferName);
 
+    /// Make @p targetName resolve to the same device buffer (offset/size/region
+    /// backing) as @p sourceName.  Used to honour loop/conditional carried-buffer
+    /// region boundaries as zero-copy aliases when the body runs autonomously on
+    /// the FPGA queue.  Throws if @p sourceName has not been allocated yet.
+    void aliasBufferKey(const std::string& targetName, const std::string& sourceName);
+
     BufferRecord ensureBuffer(const GraphBuffer& buffer, std::size_t sizeBytes);
     /// Unified allocation core (caller must hold @ref bufferMutex_).  Allocates
     /// in device memory when @ref bufferRegion_ has @p key and a staging device
@@ -252,6 +258,12 @@ class FpgaDevice : public IDevice {
     /// which case the argument packer falls back to a contiguous layout from
     /// `0x10`.
     std::map<std::string, std::uint32_t> kernelArgOffsets(const KernelDescriptor& kernel) const;
+    /// AXI-Lite register byte offset of an output scalar port (the register the
+    /// kernel writes its result to, captured post-run via RP1_OP_SCALAR_READ).
+    /// Resolved from the active/declared image's system_map; falls back to a
+    /// conventional offset on the mock/lookup path (no vbin spec).
+    std::uint32_t outputScalarRegOffset(const KernelDescriptor& kernel,
+                                        const std::string& portName) const;
     /// Map a kernel descriptor's (possibly user-renamed) buffer/scalar port
     /// names to the underlying system_map argument names, by positional
     /// (per-category, declaration-order) correspondence between the

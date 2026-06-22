@@ -70,10 +70,12 @@ extern "C" {
 
 typedef enum {
     RP1_OP_NOP             = 0x0000,
+    RP1_OP_WAIT            = 0x0001,
     RP1_OP_SIGNAL          = 0x0002,
     RP1_OP_KERNEL_DISPATCH = 0x0010,
     RP1_OP_SCALAR_WRITE    = 0x0011,
     RP1_OP_SCALAR_READ     = 0x0012,
+    RP1_OP_SCALAR_COPY     = 0x0013,
     RP1_OP_DMA_COPY        = 0x0020,
     RP1_OP_DMA_FILL        = 0x0021,
     RP1_OP_PDI_LOAD        = 0x0030,
@@ -99,6 +101,7 @@ typedef enum {
     RP1_NODE_PENDING    = 0x0000,
     RP1_NODE_DISPATCHED = 0x0001,
     RP1_NODE_DONE       = 0x0002,
+    RP1_NODE_WAITING    = 0x0003,  /* RP1_OP_WAIT: gated on a signal slot      */
     RP1_NODE_ERROR      = 0x00FF,
 } rp1_node_status_t;
 
@@ -209,6 +212,18 @@ typedef struct {
     uint8_t  _reserved[40];
 } rp1_payload_scalar_read_t;
 
+/* SCALAR_COPY (0x0013) -- copy a signal slot's value into an AXI-Lite register.
+ *
+ * The slot<->register inverse of SCALAR_READ: writes g_signals[source_slot] to
+ * dest_addr.  Used to feed a loop-carried scalar held in a host-visible signal
+ * slot into a body kernel's s_axilite input register each iteration, so the
+ * carried value can flow through a kernel argument rather than a DDR buffer. */
+typedef struct {
+    uint32_t source_slot;    /* Signal array slot index to read     */
+    uint32_t dest_addr;      /* AXI-Lite address to write           */
+    uint8_t  _reserved[40];
+} rp1_payload_scalar_copy_t;
+
 /* SIGNAL (0x0002) */
 typedef struct {
     uint32_t target_slot;    /* Signal array slot index (0-255)     */
@@ -217,6 +232,25 @@ typedef struct {
     uint16_t _reserved0;
     uint8_t  _reserved1[36];
 } rp1_payload_signal_t;
+
+/* WAIT (0x0001) -- block the node until a signal slot satisfies a condition.
+ *
+ * The cross-queue rendezvous primitive: another command queue (a peer device's
+ * RP1 graph, or the host writing over the BAR) raises @c condition_signal via
+ * SIGNAL/SCALAR_READ; this node stays in RP1_NODE_WAITING until
+ * `compare(signal[condition_signal], condition_op, condition_value)` holds,
+ * then completes and raises its barrier_set_mask.  Unlike a barrier (BTCM,
+ * private to one graph execution), the signal array is host-visible DDR, so a
+ * WAIT can gate on producers outside this graph.  While any WAIT is
+ * outstanding the scanner keeps polling (it does not wfi), so host-written
+ * signal updates are observed promptly. */
+typedef struct {
+    uint32_t condition_signal;  /* Signal array slot to poll           */
+    uint32_t condition_value;   /* Comparison value                    */
+    uint16_t condition_op;      /* rp1_condop_t                        */
+    uint16_t _reserved0;
+    uint8_t  _reserved1[36];
+} rp1_payload_wait_t;
 
 /* DMA_COPY (0x0020) */
 typedef struct {
@@ -316,7 +350,9 @@ typedef struct {
         rp1_payload_kernel_dispatch_t kernel_dispatch;
         rp1_payload_scalar_write_t    scalar_write;
         rp1_payload_scalar_read_t     scalar_read;
+        rp1_payload_scalar_copy_t     scalar_copy;
         rp1_payload_signal_t          signal;
+        rp1_payload_wait_t            wait;
         rp1_payload_dma_copy_t        dma_copy;
         rp1_payload_dma_fill_t        dma_fill;
         rp1_payload_pdi_load_t        pdi_load;
@@ -448,8 +484,12 @@ RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_write_t)    == 48,
                   "scalar_write payload must be 48 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_read_t)     == 48,
                   "scalar_read payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_copy_t)     == 48,
+                  "scalar_copy payload must be 48 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_payload_signal_t)          == 48,
                   "signal payload must be 48 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_wait_t)            == 48,
+                  "wait payload must be 48 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_copy_t)        == 48,
                   "dma_copy payload must be 48 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_fill_t)        == 48,

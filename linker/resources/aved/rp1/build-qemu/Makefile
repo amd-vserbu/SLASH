@@ -57,10 +57,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/vserbu/SLASH-fw/linker/resources/aved/rp1
+CMAKE_SOURCE_DIR = /home/vserbu/SLASH/.worktrees/feature/hsa/linker/resources/aved/rp1
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-qemu
+CMAKE_BINARY_DIR = /home/vserbu/SLASH/.worktrees/feature/hsa/linker/resources/aved/rp1/build-qemu
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,9 +87,9 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-qemu/CMakeFiles /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-qemu//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/vserbu/SLASH/.worktrees/feature/hsa/linker/resources/aved/rp1/build-qemu/CMakeFiles /home/vserbu/SLASH/.worktrees/feature/hsa/linker/resources/aved/rp1/build-qemu//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/vserbu/SLASH-fw/linker/resources/aved/rp1/build-qemu/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/vserbu/SLASH/.worktrees/feature/hsa/linker/resources/aved/rp1/build-qemu/CMakeFiles 0
 .PHONY : all
 
 # The main clean target
@@ -247,6 +247,30 @@ src/rp1_memtest_main.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1_memtest.elf.dir/build.make CMakeFiles/rp1_memtest.elf.dir/src/rp1_memtest_main.c.s
 .PHONY : src/rp1_memtest_main.c.s
 
+src/rp1_pdi.obj: src/rp1_pdi.c.obj
+.PHONY : src/rp1_pdi.obj
+
+# target to build an object file
+src/rp1_pdi.c.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_pdi.c.obj
+.PHONY : src/rp1_pdi.c.obj
+
+src/rp1_pdi.i: src/rp1_pdi.c.i
+.PHONY : src/rp1_pdi.i
+
+# target to preprocess a source file
+src/rp1_pdi.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_pdi.c.i
+.PHONY : src/rp1_pdi.c.i
+
+src/rp1_pdi.s: src/rp1_pdi.c.s
+.PHONY : src/rp1_pdi.s
+
+# target to generate assembly for a file
+src/rp1_pdi.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/rp1.elf.dir/build.make CMakeFiles/rp1.elf.dir/src/rp1_pdi.c.s
+.PHONY : src/rp1_pdi.c.s
+
 src/rp1_run.obj: src/rp1_run.c.obj
 .PHONY : src/rp1_run.obj
 
@@ -342,6 +366,9 @@ help:
 	@echo "... src/rp1_memtest_main.obj"
 	@echo "... src/rp1_memtest_main.i"
 	@echo "... src/rp1_memtest_main.s"
+	@echo "... src/rp1_pdi.obj"
+	@echo "... src/rp1_pdi.i"
+	@echo "... src/rp1_pdi.s"
 	@echo "... src/rp1_run.obj"
 	@echo "... src/rp1_run.i"
 	@echo "... src/rp1_run.s"

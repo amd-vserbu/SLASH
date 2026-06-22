@@ -84,6 +84,17 @@ static uint32_t s_seen[TRACE_MAX / 32u];  /* bitmask of nodes already traced */
 static uint32_t s_max_inflight;
 static uint32_t s_node_count;
 static int      s_graph_done_returns;
+static uint32_t s_pass_count;
+
+/* WAIT-arming: after s_wait_after scan passes, write s_wait_value into signal
+ * slot s_wait_slot.  s_wait_seen_slot captures the witness slot's value at the
+ * moment we arm, proving a downstream node gated on the WAIT had not yet run. */
+static int      s_wait_armed;
+static uint32_t s_wait_after;
+static uint32_t s_wait_slot;
+static uint32_t s_wait_value;
+static uint32_t s_wait_witness_slot;
+static uint32_t s_wait_witness_at_fire;
 
 static void hook_reset(uint32_t node_count)
 {
@@ -91,12 +102,29 @@ static void hook_reset(uint32_t node_count)
     s_max_inflight = 0;
     s_node_count = node_count;
     s_graph_done_returns = 1;   /* default: exit rp1_run after one graph */
+    s_pass_count = 0;
+    s_wait_armed = 0;
+    s_wait_after = 0;
+    s_wait_slot = 0;
+    s_wait_value = 0;
+    s_wait_witness_slot = 0;
+    s_wait_witness_at_fire = 0xFFFFFFFFu;
     for (uint32_t i = 0; i < TRACE_MAX / 32u; i++) s_seen[i] = 0;
     for (uint32_t i = 0; i < TRACE_MAX; i++) s_trace[i] = 0;
 }
 
 static void hook_on_scan_pass(void)
 {
+    s_pass_count++;
+
+    /* Cross-queue producer simulation: raise the awaited signal after a few
+     * passes, recording the witness slot first to prove the WAIT held off its
+     * dependents until now. */
+    if (s_wait_armed && s_pass_count == s_wait_after) {
+        s_wait_witness_at_fire = G_SIGS[s_wait_witness_slot].value;
+        G_SIGS[s_wait_slot].value = s_wait_value;
+    }
+
     if (g_inflight_count > s_max_inflight)
         s_max_inflight = g_inflight_count;
 
@@ -204,6 +232,56 @@ static void make_signal(rp1_node_t *n,
     n->payload.signal.target_slot = slot;
     n->payload.signal.value       = value;
     n->payload.signal.operation   = op;
+}
+
+static void make_scalar_write(rp1_node_t *n, uint32_t addr, uint32_t value,
+                              uint8_t aw_b, uint32_t aw_m,
+                              uint8_t st_b, uint32_t st_m)
+{
+    n->opcode               = RP1_OP_SCALAR_WRITE;
+    n->flags                = 0;
+    n->barrier_await_mask   = aw_m;
+    n->barrier_set_mask     = st_m;
+    n->barrier_await_bucket = aw_b;
+    n->barrier_set_bucket   = st_b;
+    n->status               = RP1_NODE_PENDING;
+
+    n->payload.scalar_write.writes[0].addr  = addr;
+    n->payload.scalar_write.writes[0].value = value;
+}
+
+static void make_scalar_read(rp1_node_t *n, uint32_t source_addr, uint32_t target_slot,
+                             uint8_t aw_b, uint32_t aw_m,
+                             uint8_t st_b, uint32_t st_m)
+{
+    n->opcode               = RP1_OP_SCALAR_READ;
+    n->flags                = 0;
+    n->barrier_await_mask   = aw_m;
+    n->barrier_set_mask     = st_m;
+    n->barrier_await_bucket = aw_b;
+    n->barrier_set_bucket   = st_b;
+    n->status               = RP1_NODE_PENDING;
+
+    n->payload.scalar_read.source_addr = source_addr;
+    n->payload.scalar_read.target_slot = target_slot;
+}
+
+static void make_wait(rp1_node_t *n,
+                      uint32_t cond_signal, uint16_t cond_op, uint32_t cond_val,
+                      uint8_t aw_b, uint32_t aw_m,
+                      uint8_t st_b, uint32_t st_m)
+{
+    n->opcode               = RP1_OP_WAIT;
+    n->flags                = 0;
+    n->barrier_await_mask   = aw_m;
+    n->barrier_set_mask     = st_m;
+    n->barrier_await_bucket = aw_b;
+    n->barrier_set_bucket   = st_b;
+    n->status               = RP1_NODE_PENDING;
+
+    n->payload.wait.condition_signal = cond_signal;
+    n->payload.wait.condition_value  = cond_val;
+    n->payload.wait.condition_op     = cond_op;
 }
 
 static void make_loop(rp1_node_t *n,
@@ -584,6 +662,125 @@ static int test_cond_boolean(void)
 }
 
 /* -------------------------------------------------------------------------
+ * test_loop_fixed_count
+ *
+ *  Node 0: LOOP    body=[1,2], cond NEVER (AND_NZ 0), max_iter=3,
+ *                  bucket_clear=[1,1], set-on-exit=0/0x2
+ *  Node 1: KERNEL  (re-dispatched in place each iteration)  set=1/0x1
+ *  Node 2: RERUN   target=0                                 await=1/0x1 set=1/0x2
+ *  Node 3: SIGNAL  slot=10 SET 0xD0NE                       await=0/0x2
+ *
+ * This is the shape the host loop-lowering emits for a fixed-count FPGA loop:
+ * termination governed purely by max_iterations (the data-dependent predicate
+ * is wired to never fire), with a real KERNEL_DISPATCH body that must be
+ * re-dispatched (inflight cleared) on every iteration.  loop_decrement covers
+ * the condition-exit + signal-body path; this covers max_iterations + a kernel.
+ *
+ * Expected: body runs 3 times (loop_iters lands at 4 on exit), finalize fires.
+ * CQ = 3*(kernel + rerun) + loop_exit + finalize = 8.
+ * ---------------------------------------------------------------------- */
+
+static int test_loop_fixed_count(void)
+{
+    setup_graph(/* node_count */ 4, /* fake_kernels */ 1);
+
+    G_ARGS[0] = 0x10u;  /* (reg_offset, value) pair for the body kernel */
+    G_ARGS[1] = 0x55u;
+
+    make_loop(  &G_NODES[0],
+                /* body */ 1, 2,
+                /* cond */ 0, RP1_COP_AND_NZ, 0u,   /* (sig & 0) != 0 -> never */
+                /* clear */ 1, 1,
+                /* loop_id */ 0, /* max_iter */ 3u,
+                /* await */ 0, 0x0, /* set on exit */ 0, 0x2);
+    make_kernel(&G_NODES[1], /* kidx */ 0, 1, 0x0, 1, 0x1, /* args */ 0u, 1);
+    make_rerun( &G_NODES[2], /* target */ 0, 1, 0x1, 1, 0x2);
+    make_signal(&G_NODES[3], 10, 0xD05Eu, RP1_SIGOP_SET, 0, 0x2, 0, 0x4);
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "loop_fixed: rp1_run rc");
+
+    CHECK_EQ32(g_loop_iters[0],        4u,       "loop_fixed: 3 body runs (iters=4)");
+    CHECK_EQ32(G_SIGS[10].value,       0xD05Eu,  "loop_fixed: finalize ran on exit");
+    CHECK_EQ32(G_CTRL->cq_write_idx,   8u,       "loop_fixed: cq entries");
+    CHECK_EQ32(g_node_status[3],       RP1_NODE_DONE, "loop_fixed: finalize DONE");
+    CHECK_EQ32(G_CTRL->graph_done_seq, 1u,       "loop_fixed: graph_done_seq");
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * test_scalar_read
+ *
+ *  Node 0: SCALAR_WRITE  fake_reg = 0x1234ABCD   (stands in for a kernel's
+ *                                                 s_axilite output register)
+ *  Node 1: SCALAR_READ   slot[6] = *fake_reg
+ *
+ * Validates the firmware primitive the host output-scalar lowering relies on:
+ * capturing an AXI-Lite register value into a host-visible signal slot, which
+ * a downstream LOOP/COND can then evaluate (Phase B/F).
+ * ---------------------------------------------------------------------- */
+
+static int test_scalar_read(void)
+{
+    setup_graph(/* node_count */ 2, /* fake_kernels */ 1);
+
+    const uint32_t reg = (uint32_t)FAKE_KERNEL(0) + 0x40u;
+
+    make_scalar_write(&G_NODES[0], reg, 0x1234ABCDu, 0, 0x00, 0, 0x1);
+    make_scalar_read( &G_NODES[1], reg, /* slot */ 6u, 0, 0x1, 0, 0x2);
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "scalar_read: rp1_run rc");
+
+    CHECK_EQ32(G_SIGS[6].value,        0x1234ABCDu, "scalar_read: slot captured reg");
+    CHECK_EQ32(g_node_status[1],       RP1_NODE_DONE, "scalar_read: node DONE");
+    CHECK_EQ32(G_CTRL->graph_done_seq, 1u,          "scalar_read: graph_done_seq");
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * test_wait_blocks
+ *
+ *  Node 0: WAIT    slot[7] EQ 0xABCD     set=0/0x1
+ *  Node 1: SIGNAL  slot[20] SET 0xF00D   await=0/0x1
+ *
+ * The cross-queue rendezvous primitive: node 1 must not run until an external
+ * writer (simulated by the scan-pass hook after 3 passes) raises slot[7].  The
+ * hook records slot[20] at the moment it fires the signal; it must still be 0,
+ * proving the WAIT parked node 0 (RP1_NODE_WAITING) and gated node 1 until the
+ * condition held — not the immediate-NOP behaviour an unknown opcode would get.
+ * ---------------------------------------------------------------------- */
+
+static int test_wait_blocks(void)
+{
+    setup_graph(/* node_count */ 2, /* fake_kernels */ 0);
+
+    make_wait(  &G_NODES[0], /* cond */ 7, RP1_COP_EQ, 0xABCDu,
+                /* await */ 0, 0x00, /* set */ 0, 0x1);
+    make_signal(&G_NODES[1], 20, 0xF00Du, RP1_SIGOP_SET, 0, 0x1, 0, 0x2);
+
+    s_wait_armed        = 1;
+    s_wait_after        = 3u;       /* raise the awaited signal on pass 3 */
+    s_wait_slot         = 7u;
+    s_wait_value        = 0xABCDu;
+    s_wait_witness_slot = 20u;      /* node 1's output slot */
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "wait: rp1_run rc");
+
+    CHECK_EQ32(s_wait_witness_at_fire, 0u,
+               "wait: downstream stayed blocked until the signal arrived");
+    CHECK_EQ32(G_SIGS[20].value,     0xF00Du,        "wait: downstream ran after release");
+    CHECK_EQ32(g_node_status[0],     RP1_NODE_DONE,  "wait: WAIT node DONE");
+    CHECK_EQ32(g_node_status[1],     RP1_NODE_DONE,  "wait: downstream DONE");
+    CHECK_EQ32(g_barriers[0] & 0x3u, 0x3u,           "wait: both barriers raised");
+    CHECK_EQ32(G_CTRL->cq_write_idx, 2u,             "wait: cq entries");
+    CHECK_EQ32(G_CTRL->graph_done_seq, 1u,           "wait: graph_done_seq");
+    CHECK(s_pass_count > s_wait_after, "wait: scanner kept polling while parked");
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * test_pdi_load_basic
  *
  *   Single PDI_LOAD node, override returns success.
@@ -829,7 +1026,10 @@ void rp1_graph_test_run(void)
     run("kernel_unblocks_signal", test_kernel_unblocks_signal);
     run("signal_chain",        test_signal_chain);
     run("loop_decrement",      test_loop_decrement);
+    run("loop_fixed_count",    test_loop_fixed_count);
     run("cond_boolean",        test_cond_boolean);
+    run("scalar_read",         test_scalar_read);
+    run("wait_blocks",         test_wait_blocks);
     run("pdi_load_basic",   test_pdi_load_basic);
     run("pdi_load_timeout", test_pdi_load_timeout);
     run("pdi_load_chained", test_pdi_load_chained);

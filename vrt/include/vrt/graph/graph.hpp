@@ -104,6 +104,7 @@
 #ifndef VRT_GRAPH_GRAPH_HPP
 #define VRT_GRAPH_GRAPH_HPP
 
+#include <cstddef>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -674,6 +675,7 @@ class Graph {
         plans_.clear();
         dgraphs_ = compiler.compile(rootRegion(), devices_, bridgeFactories_,
                                     lookup, scalarValues_);
+        wireRendezvousAccessors();
         plans_.reserve(dgraphs_.size());
         for (const auto& dg : dgraphs_) {
             plans_.push_back(dg.device->compilePlan(dg));
@@ -722,6 +724,47 @@ class Graph {
         plans_.clear();
         dgraphs_.clear();
         compiled_ = false;
+    }
+
+    /**
+     * @brief Give the CPU device read/write access to the FPGA's signal array.
+     *
+     * A split cross-device loop runs its CPU body slice concurrently with the
+     * FPGA queue, rendezvousing per iteration through host-visible signal slots
+     * that live in the FPGA's BAR window. The CPU device polls and SETs those
+     * slots while executing its CompiledWaitNode / CompiledSignalNode halves;
+     * this wires it to the FPGA window so the two queues share the same slots.
+     *
+     * The Phase D compiler restricts a split loop to exactly one FPGA and one
+     * CPU device, so a single accessor pair (to the first FPGA window) suffices.
+     */
+    void wireRendezvousAccessors() {
+        std::shared_ptr<CpuDevice> cpu = cpuDevice();
+        if (!cpu) return;
+        std::shared_ptr<FpgaDevice> fpga;
+        for (const auto& [id, device] : devices_) {
+            (void)id;
+            if (auto f = std::dynamic_pointer_cast<FpgaDevice>(device)) {
+                fpga = f;
+                break;
+            }
+        }
+        if (!fpga) return;
+        std::shared_ptr<fpga::Rp1BarWindow> win = fpga->window();
+        if (!win) return;
+        cpu->setSignalAccessors(
+            [win](std::uint32_t slot) -> std::uint32_t {
+                rp1_signal_slot_t s{};
+                win->readSignal(slot, s);
+                return s.value;
+            },
+            [win](std::uint32_t slot, std::uint32_t value) {
+                win->writeU32(static_cast<std::uint32_t>(
+                                  RP1_DEFAULT_SIG_ARRAY_OFFSET +
+                                  slot * sizeof(rp1_signal_slot_t) +
+                                  offsetof(rp1_signal_slot_t, value)),
+                              value);
+            });
     }
 
     void requireCompiled(const char* method) const {

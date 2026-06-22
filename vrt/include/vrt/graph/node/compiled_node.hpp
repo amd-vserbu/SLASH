@@ -153,6 +153,13 @@ struct CompiledConditionalScalarPublication {
     std::string elseSourceDeviceId;
 };
 
+/// Roles a replicated control node plays in a data-dependent cross-device split.
+enum class SplitBroadcastRole {
+    None,       ///< Not a data-dependent split replica.
+    Authority,  ///< Evaluates the real condition and broadcasts the decision.
+    Follower,   ///< Reads the broadcast decision as its exit predicate.
+};
+
 struct CompiledLoopNode {
     std::string                                 id;
     std::string                                 deviceId;
@@ -160,6 +167,26 @@ struct CompiledLoopNode {
     CompiledLoopKind                            loopKind = CompiledLoopKind::FixedCount;
     std::optional<LoopTripCount>                tripCount;
     std::optional<Condition>                    condition;
+    /// Data-dependent split broadcast wiring.  When @c broadcastRole is not
+    /// @c None, the loop runs as two rendezvousing queues whose continue/stop
+    /// decision is broadcast over host-visible signal slots (do-while shape: the
+    /// body runs, then the Authority decides whether to iterate again):
+    ///
+    ///  - @c conditionBroadcastSlot carries the decision (1 = stop, 0 = continue).
+    ///  - @c broadcastReadySlot is raised by the Authority once the decision is
+    ///    written (Authority -> Follower); the Follower's body tail awaits it
+    ///    before re-arming the LOOP, so the next top-of-loop check sees a fresh
+    ///    decision.
+    ///  - @c broadcastAckSlot is raised by the Follower once it has consumed the
+    ///    decision (Follower -> Authority), so the Authority does not outpace it.
+    ///
+    /// The Authority replica (a CPU queue) evaluates @c condition and drives the
+    /// handshake; the Follower replica (an FPGA queue) reads
+    /// @c conditionBroadcastSlot as its RP1 LOOP exit predicate.
+    SplitBroadcastRole                          broadcastRole = SplitBroadcastRole::None;
+    std::uint32_t                               conditionBroadcastSlot = 0;
+    std::uint32_t                               broadcastReadySlot = 0;
+    std::uint32_t                               broadcastAckSlot = 0;
     std::map<std::string, std::string>          outputBufferPlacements;
     std::map<std::string, std::string>          outputScalarPlacements;
     std::vector<CompiledLoopBufferPublication>  outputBufferPublications;
@@ -177,12 +204,40 @@ struct CompiledConditionalNode {
     std::vector<CompiledConditionalScalarPublication> outputScalarPublications;
 };
 
+/// Cross-queue rendezvous: raise a signal slot for a peer queue.  Lowered to
+/// RP1_OP_SIGNAL on FPGA, or a host BAR write on CPU (Phase E).  @c operation
+/// and @c value carry the raw rp1_sigop_t / 32-bit value (the depth-1 handshake
+/// uses SET 1 to produce and SET 0 to acknowledge/clear).
+struct CompiledSignalNode {
+    std::string              id;
+    std::string              deviceId;
+    std::vector<std::string> dependsOn;
+    std::uint32_t            slot = 0;
+    std::uint32_t            value = 0;
+    std::uint16_t            operation = 0;  // rp1_sigop_t
+};
+
+/// Cross-queue rendezvous: block until a signal slot satisfies a comparison.
+/// Lowered to RP1_OP_WAIT on FPGA, or a host BAR poll on CPU (Phase E).
+/// @c conditionOp carries the raw rp1_condop_t; the depth-1 handshake uses
+/// AND_NZ (slot != 0) to await a peer's produce/ack.
+struct CompiledWaitNode {
+    std::string              id;
+    std::string              deviceId;
+    std::vector<std::string> dependsOn;
+    std::uint32_t            slot = 0;
+    std::uint32_t            value = 0;
+    std::uint16_t            conditionOp = 0;  // rp1_condop_t
+};
+
 using CompiledNode = std::variant<CompiledKernelNode,
                                   CompiledBridgeOpNode,
                                   CompiledReprogramNode,
                                   CompiledBoundaryNode,
                                   CompiledLoopNode,
-                                  CompiledConditionalNode>;
+                                  CompiledConditionalNode,
+                                  CompiledSignalNode,
+                                  CompiledWaitNode>;
 
 inline const std::string& compiledNodeId(const CompiledNode& node) {
     return std::visit([](const auto& concrete) -> const std::string& {

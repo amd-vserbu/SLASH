@@ -25,6 +25,8 @@
 
 #include <vrt/graph/device/cpu_device.hpp>
 
+#include <slash/uapi/rp1_protocol.h>
+
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -137,6 +139,16 @@ class CpuDevicePlan : public IDevicePlan {
                     } else if constexpr (std::is_same_v<T, CompiledReprogramNode>) {
                         throw std::runtime_error(
                             "CpuDevice: reprogram nodes must execute on an FPGA device");
+                    } else if constexpr (std::is_same_v<T, CompiledSignalNode>) {
+                        rt.kind = NodeKind::Signal;
+                        rt.signalSlot = n.slot;
+                        rt.signalValue = n.value;
+                        rt.signalOp = n.operation;
+                    } else if constexpr (std::is_same_v<T, CompiledWaitNode>) {
+                        rt.kind = NodeKind::Wait;
+                        rt.signalSlot = n.slot;
+                        rt.signalValue = n.value;
+                        rt.conditionOp = n.conditionOp;
                     } else {
                         static_assert(sizeof(T) == 0, "Unhandled compiled node type");
                     }
@@ -209,7 +221,8 @@ class CpuDevicePlan : public IDevicePlan {
     }
 
    private:
-    enum class NodeKind { Kernel, ProducerOp, ConsumerOp, Boundary, Loop, Conditional };
+    enum class NodeKind { Kernel, ProducerOp, ConsumerOp, Boundary, Loop, Conditional,
+                          Signal, Wait };
 
     struct NodeRuntime {
         std::string id;
@@ -222,6 +235,10 @@ class CpuDevicePlan : public IDevicePlan {
         CompiledConditionalNode conditional;
         std::function<bool()> tryReady;
         std::function<void()> action;
+        std::uint32_t signalSlot = 0;
+        std::uint32_t signalValue = 0;
+        std::uint16_t signalOp = 0;     // rp1_sigop_t  (Signal nodes)
+        std::uint16_t conditionOp = 0;  // rp1_condop_t (Wait nodes)
     };
 
     void runOnce() {
@@ -235,7 +252,10 @@ class CpuDevicePlan : public IDevicePlan {
         std::vector<size_t> pendingCons;
 
         auto promote = [&](size_t idx) {
-            if (runtime_[idx].kind == NodeKind::ConsumerOp) {
+            // Consumer bridges and cross-queue WAITs block until a runtime
+            // condition holds, so they are polled rather than run immediately.
+            if (runtime_[idx].kind == NodeKind::ConsumerOp ||
+                runtime_[idx].kind == NodeKind::Wait) {
                 pendingCons.push_back(idx);
             } else {
                 readyKP.push_back(idx);
@@ -265,10 +285,23 @@ class CpuDevicePlan : public IDevicePlan {
                 case NodeKind::Conditional:
                     executeConditional(rt.conditional);
                     break;
+                case NodeKind::Signal:
+                    executeSignal(rt);
+                    break;
+                case NodeKind::Wait:
+                    // Readiness was already established by the poller; nothing
+                    // more to do once the awaited slot satisfies the condition.
+                    break;
             }
             for (size_t successor : rt.successors) {
                 if (--unmetCounts[successor] == 0) promote(successor);
             }
+        };
+
+        auto consumerReady = [&](size_t idx) -> bool {
+            NodeRuntime& rt = runtime_[idx];
+            if (rt.kind == NodeKind::Wait) return waitSatisfied(rt);
+            return rt.tryReady && rt.tryReady();
         };
 
         size_t rrCursor = 0;
@@ -286,7 +319,7 @@ class CpuDevicePlan : public IDevicePlan {
             for (size_t step = 0; step < pendingCons.size(); ++step) {
                 if (rrCursor >= pendingCons.size()) rrCursor = 0;
                 size_t idx = pendingCons[rrCursor];
-                if (runtime_[idx].tryReady && runtime_[idx].tryReady()) {
+                if (consumerReady(idx)) {
                     pendingCons.erase(pendingCons.begin() +
                                       static_cast<std::ptrdiff_t>(rrCursor));
                     runIndex(idx);
@@ -570,7 +603,55 @@ class CpuDevicePlan : public IDevicePlan {
         }
     }
 
+    // Data-dependent split Authority: run the body, decide whether to iterate
+    // again (do-while), and broadcast the decision to the Follower (FPGA) queue
+    // over host-visible signal slots, rendezvousing each iteration so neither
+    // queue outpaces the other.  The decision is written *before* broadcastReady
+    // so the Follower's gated top-of-loop check sees a fresh value.
+    void executeLoopAuthority(const CompiledLoopNode& loop) {
+        if (!device_.signalWrite_ || !device_.signalRead_) {
+            throw std::runtime_error(
+                "CpuDevice: split-loop Authority has no signal-array accessor; a peer FPGA "
+                "queue must be registered on the same Graph");
+        }
+        if (!loop.condition && loop.loopKind != CompiledLoopKind::FixedCount) {
+            throw std::runtime_error("CpuDevice: split-loop Authority is missing its condition");
+        }
+        std::optional<uint64_t> fixedCount;
+        if (loop.loopKind == CompiledLoopKind::FixedCount && loop.tripCount) {
+            fixedCount = evaluateTripCount(*loop.tripCount);
+        }
+        bool completedIteration = false;
+        uint64_t iteration = 0;
+        for (;;) {
+            runChildPlans(loop.id, DGraphChildRole::LoopBody);
+            completedIteration = true;
+            ++iteration;
+            // Decide whether to iterate again (do-while shape).
+            bool cont = fixedCount ? (iteration < *fixedCount)
+                                   : evaluateCondition(*loop.condition);
+            device_.signalWrite_(loop.conditionBroadcastSlot, cont ? 0u : 1u);
+            device_.signalWrite_(loop.broadcastReadySlot, 1u);
+            const auto deadline =
+                std::chrono::steady_clock::now() + kBridgeWaitTimeout;
+            while (device_.signalRead_(loop.broadcastAckSlot) == 0u) {
+                if (std::chrono::steady_clock::now() > deadline) {
+                    throw std::runtime_error(
+                        "CpuDevice: split-loop Authority timed out awaiting Follower ack");
+                }
+                std::this_thread::yield();
+            }
+            device_.signalWrite_(loop.broadcastAckSlot, 0u);
+            if (!cont) break;
+        }
+        if (completedIteration) publishLoopOutputs(loop);
+    }
+
     void executeLoop(const CompiledLoopNode& loop) {
+        if (loop.broadcastRole == SplitBroadcastRole::Authority) {
+            executeLoopAuthority(loop);
+            return;
+        }
         bool completedIteration = false;
         if (loop.loopKind == CompiledLoopKind::FixedCount) {
             if (!loop.tripCount) {
@@ -609,6 +690,51 @@ class CpuDevicePlan : public IDevicePlan {
         runChildPlans(cond.id, thenBranch ? DGraphChildRole::ConditionalThen
                                           : DGraphChildRole::ConditionalElse);
         publishConditionalOutputs(cond, thenBranch);
+    }
+
+    // --- Cross-queue rendezvous (Phase E) ---
+    //
+    // A split cross-device loop runs this CPU slice concurrently with its peer
+    // (FPGA) queue. The two queues rendezvous each iteration through signal
+    // slots in the peer's host-visible BAR window; SIGNAL nodes SET/accumulate
+    // a slot, WAIT nodes poll one until a comparison holds. RP1 executes the
+    // mirror-image half autonomously on its side.
+
+    void executeSignal(const NodeRuntime& rt) {
+        if (!device_.signalWrite_ || !device_.signalRead_) {
+            throw std::runtime_error(
+                "CpuDevice: cross-queue SIGNAL has no signal-array accessor; a peer FPGA "
+                "queue must be registered on the same Graph for split control flow");
+        }
+        std::uint32_t next = rt.signalValue;
+        switch (rt.signalOp) {
+            case RP1_SIGOP_SET: next = rt.signalValue; break;
+            case RP1_SIGOP_ADD: next = device_.signalRead_(rt.signalSlot) + rt.signalValue; break;
+            case RP1_SIGOP_OR:  next = device_.signalRead_(rt.signalSlot) | rt.signalValue; break;
+            case RP1_SIGOP_AND: next = device_.signalRead_(rt.signalSlot) & rt.signalValue; break;
+            default:
+                throw std::runtime_error("CpuDevice: unsupported SIGNAL operation");
+        }
+        device_.signalWrite_(rt.signalSlot, next);
+    }
+
+    bool waitSatisfied(const NodeRuntime& rt) const {
+        if (!device_.signalRead_) {
+            throw std::runtime_error(
+                "CpuDevice: cross-queue WAIT has no signal-array accessor; a peer FPGA "
+                "queue must be registered on the same Graph for split control flow");
+        }
+        const std::uint32_t current = device_.signalRead_(rt.signalSlot);
+        switch (rt.conditionOp) {
+            case RP1_COP_EQ:     return current == rt.signalValue;
+            case RP1_COP_NE:     return current != rt.signalValue;
+            case RP1_COP_LT:     return current < rt.signalValue;
+            case RP1_COP_GE:     return current >= rt.signalValue;
+            case RP1_COP_AND_NZ: return (current & rt.signalValue) != 0;
+            case RP1_COP_AND_Z:  return (current & rt.signalValue) == 0;
+            default:
+                throw std::runtime_error("CpuDevice: unsupported WAIT condition operator");
+        }
     }
 
     void executeKernel(const CompiledKernelNode& node);

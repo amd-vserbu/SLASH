@@ -59,6 +59,7 @@ static int test_payload_sizes(void)
     CHECK_EQ32(sizeof(rp1_payload_scalar_write_t),    48, "scalar_write payload");
     CHECK_EQ32(sizeof(rp1_payload_scalar_read_t),     48, "scalar_read payload");
     CHECK_EQ32(sizeof(rp1_payload_signal_t),          48, "signal payload");
+    CHECK_EQ32(sizeof(rp1_payload_wait_t),            48, "wait payload");
     CHECK_EQ32(sizeof(rp1_payload_dma_copy_t),        48, "dma_copy payload");
     CHECK_EQ32(sizeof(rp1_payload_dma_fill_t),        48, "dma_fill payload");
     CHECK_EQ32(sizeof(rp1_payload_pdi_load_t),        48, "pdi_load payload");

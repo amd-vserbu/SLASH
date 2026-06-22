@@ -468,6 +468,402 @@ TEST(RegionCompilerTest, CompilerBuildsLoopControlNodeAndChildDGraph) {
     EXPECT_NE(findCompiledNode(*bodyChild->dgraphs.front(), bodyKernelId), nullptr);
 }
 
+// A constant fixed-count loop whose body is entirely FPGA kernels is placed on
+// the FPGA device (for autonomous RP1 LOOP/RERUN execution), not the CPU.
+TEST(RegionCompilerTest, FixedCountAllFpgaLoopPlacedOnFpgaQueue) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
+    graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
+
+    auto body = graph.rootRegion().createChild();
+    std::string bodyKernelId = body->addKernel(
+        KernelDescriptor{"body", DeviceType::FPGA, std::nullopt, IOTypeMap{}}, IOMap{}, "fpga:0");
+    std::string loopId =
+        graph.addLoop(fixedLoopSpec(LoopTripCount::constant<int32_t>(3), body));
+
+    auto dgraphs = compileForInspection(graph);
+
+    // Loop control node lives on the FPGA queue, not the CPU.
+    const DGraph* fpgaDGraph = findDGraph(dgraphs, "fpga:0");
+    ASSERT_NE(fpgaDGraph, nullptr);
+    const CompiledNode* loopNode = findCompiledNode(*fpgaDGraph, loopId);
+    ASSERT_NE(loopNode, nullptr);
+    EXPECT_TRUE(std::holds_alternative<CompiledLoopNode>(*loopNode));
+
+    const DGraph* cpuDGraph = findDGraph(dgraphs, "cpu");
+    if (cpuDGraph) {
+        EXPECT_EQ(findCompiledNode(*cpuDGraph, loopId), nullptr);
+    }
+
+    const DGraphChild* bodyChild =
+        findChildDGraphs(*fpgaDGraph, loopId, DGraphChildRole::LoopBody);
+    ASSERT_NE(bodyChild, nullptr);
+    ASSERT_FALSE(bodyChild->dgraphs.empty());
+    EXPECT_NE(findCompiledNode(*bodyChild->dgraphs.front(), bodyKernelId), nullptr);
+}
+
+// Phase F.2: an if/else whose predicate is produced by a main-line FPGA kernel
+// and whose branches are all-FPGA runs autonomously on the FPGA queue (RP1
+// COND), not the CPU control path.
+TEST(RegionCompilerTest, FpgaConditionalWithFpgaPredicatePlacedOnFpgaQueue) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
+    graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
+
+    GraphScalar p = graph.globalScalar(ScalarType::U32, "p");
+
+    IOTypeMap predType;
+    predType.outputScalars.push_back({"out", ScalarType::U32});
+    IOMap predIo;
+    predIo.bindScalar("out", p);
+    std::string predId = graph.addNode(
+        KernelDescriptor{"pred", DeviceType::FPGA, std::nullopt, predType}, predIo, "fpga:0");
+
+    auto thenR = graph.rootRegion().createChild();
+    std::string thenKId = thenR->addKernel(
+        KernelDescriptor{"thenK", DeviceType::FPGA, std::nullopt, IOTypeMap{}}, IOMap{}, "fpga:0");
+    auto elseR = graph.rootRegion().createChild();
+    std::string elseKId = elseR->addKernel(
+        KernelDescriptor{"elseK", DeviceType::FPGA, std::nullopt, IOTypeMap{}}, IOMap{}, "fpga:0");
+
+    std::string condId = graph.addConditional(ifElseSpec(
+        Condition::compare(CompareOp::GE, ConditionOperand::scalar(ScalarType::U32, "p"),
+                           ConditionOperand::constant<uint32_t>(1)),
+        thenR, elseR, {predId}));
+
+    auto dgraphs = compileForInspection(graph);
+
+    const DGraph* fpgaDGraph = findDGraph(dgraphs, "fpga:0");
+    ASSERT_NE(fpgaDGraph, nullptr);
+    const CompiledNode* condNode = findCompiledNode(*fpgaDGraph, condId);
+    ASSERT_NE(condNode, nullptr);
+    EXPECT_TRUE(std::holds_alternative<CompiledConditionalNode>(*condNode));
+
+    const DGraph* cpuDGraph = findDGraph(dgraphs, "cpu");
+    if (cpuDGraph) {
+        EXPECT_EQ(findCompiledNode(*cpuDGraph, condId), nullptr);
+    }
+
+    const DGraphChild* thenChild =
+        findChildDGraphs(*fpgaDGraph, condId, DGraphChildRole::ConditionalThen);
+    ASSERT_NE(thenChild, nullptr);
+    ASSERT_FALSE(thenChild->dgraphs.empty());
+    EXPECT_NE(findCompiledNode(*thenChild->dgraphs.front(), thenKId), nullptr);
+
+    const DGraphChild* elseChild =
+        findChildDGraphs(*fpgaDGraph, condId, DGraphChildRole::ConditionalElse);
+    ASSERT_NE(elseChild, nullptr);
+    ASSERT_FALSE(elseChild->dgraphs.empty());
+    EXPECT_NE(findCompiledNode(*elseChild->dgraphs.front(), elseKId), nullptr);
+}
+
+// Phase F.1b: a data-dependent while-loop whose predicate reads a parent scalar
+// that the body produces (FPGA kernel output scalar exported to the parent each
+// iteration) runs autonomously on the FPGA queue.  The device lowering aliases
+// the parent scalar to the body output's SCALAR_READ slot and uses it as the
+// LOOP predicate signal.
+TEST(RegionCompilerTest, WhileLoopWithExportedFpgaPredicatePlacedOnFpgaQueue) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
+    graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
+
+    GraphScalar counter = graph.globalScalar(ScalarType::U32, "counter");
+
+    auto body = graph.rootRegion().createChild();
+    GraphScalar localNext = body->scalar(ScalarType::U32, "next");
+    IOTypeMap bodyType;
+    bodyType.outputScalars.push_back({"out", ScalarType::U32});
+    IOMap bodyIo;
+    bodyIo.bindScalar("out", localNext);
+    std::string bodyKId = body->addKernel(
+        KernelDescriptor{"body", DeviceType::FPGA, std::nullopt, bodyType}, bodyIo, "fpga:0");
+    body->exportToParent({{localNext, counter}}, {bodyKId});
+
+    std::string loopId = graph.addLoop(whileLoopSpec(
+        Condition::compare(CompareOp::LT, ConditionOperand::scalar(ScalarType::U32, "counter"),
+                           ConditionOperand::constant<uint32_t>(4)),
+        body));
+
+    auto dgraphs = compileForInspection(graph);
+
+    const DGraph* fpgaDGraph = findDGraph(dgraphs, "fpga:0");
+    ASSERT_NE(fpgaDGraph, nullptr);
+    const CompiledNode* loopNode = findCompiledNode(*fpgaDGraph, loopId);
+    ASSERT_NE(loopNode, nullptr);
+    ASSERT_TRUE(std::holds_alternative<CompiledLoopNode>(*loopNode));
+    EXPECT_EQ(std::get<CompiledLoopNode>(*loopNode).loopKind,
+              CompiledLoopKind::WhileCondition);
+
+    const DGraph* cpuDGraph = findDGraph(dgraphs, "cpu");
+    if (cpuDGraph) {
+        EXPECT_EQ(findCompiledNode(*cpuDGraph, loopId), nullptr);
+    }
+
+    const DGraphChild* bodyChild =
+        findChildDGraphs(*fpgaDGraph, loopId, DGraphChildRole::LoopBody);
+    ASSERT_NE(bodyChild, nullptr);
+    ASSERT_FALSE(bodyChild->dgraphs.empty());
+    EXPECT_NE(findCompiledNode(*bodyChild->dgraphs.front(), bodyKId), nullptr);
+}
+
+// A fixed-count loop whose body contains a CPU kernel is cross-device and stays
+// on the CPU-owned control path (autonomous placement is all-or-nothing).
+TEST(RegionCompilerTest, FixedCountLoopWithCpuBodyStaysOnCpu) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
+    graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
+
+    auto body = graph.rootRegion().createChild();
+    body->addKernel(cpuKernel("body"), IOMap{}, "cpu");
+    std::string loopId =
+        graph.addLoop(fixedLoopSpec(LoopTripCount::constant<int32_t>(2), body));
+
+    auto dgraphs = compileForInspection(graph);
+    const DGraph* cpuDGraph = findDGraph(dgraphs, "cpu");
+    ASSERT_NE(cpuDGraph, nullptr);
+    EXPECT_NE(findCompiledNode(*cpuDGraph, loopId), nullptr);
+}
+
+// Phase D2: a fixed-count loop whose body spans FPGA + CPU is split into per-
+// queue slices: the control node is replicated onto both devices, and the
+// in-body cross-device bridge becomes SIGNAL/WAIT rendezvous (no plain data
+// bridge left in the FPGA slice).
+TEST(RegionCompilerTest, CrossDeviceLoopSplitsIntoPerQueueRendezvous) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
+    graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
+
+    IOTypeMap outT;
+    outT.outputBuffers.push_back({"out", BufferType::I32});
+    IOTypeMap inOutT;
+    inOutT.inputBuffers.push_back({"in", BufferType::I32});
+    inOutT.outputBuffers.push_back({"out", BufferType::I32});
+
+    auto body = graph.rootRegion().createChild();
+    IOMap fIo;
+    GraphBuffer produced;
+    fIo.bindOutputBuffer("out", BufferType::I32, produced, body->scopeId());
+    const std::string fpgaKId = body->addKernel(
+        KernelDescriptor{"fk", DeviceType::FPGA, std::nullopt, outT}, std::move(fIo), "fpga:0");
+
+    IOMap cIo;
+    GraphBuffer consumed;
+    cIo.bindInputBuffer("in", produced)
+       .bindOutputBuffer("out", BufferType::I32, consumed, body->scopeId());
+    const std::string cpuKId =
+        body->addKernel(cpuKernel("ck", inOutT), std::move(cIo), "cpu", {fpgaKId});
+
+    const std::string loopId =
+        graph.addLoop(fixedLoopSpec(LoopTripCount::constant<int32_t>(3), body));
+
+    InspectionBridge bridge;
+    auto dgraphs = compileForInspection(graph, bridge);
+
+    const DGraph* fpgaDG = findDGraph(dgraphs, "fpga:0");
+    const DGraph* cpuDG  = findDGraph(dgraphs, "cpu");
+    ASSERT_NE(fpgaDG, nullptr);
+    ASSERT_NE(cpuDG, nullptr);
+
+    // Control node replicated onto both queues.
+    const CompiledNode* fpgaLoop = findCompiledNode(*fpgaDG, loopId);
+    const CompiledNode* cpuLoop  = findCompiledNode(*cpuDG, loopId);
+    ASSERT_NE(fpgaLoop, nullptr);
+    ASSERT_NE(cpuLoop, nullptr);
+    EXPECT_TRUE(std::holds_alternative<CompiledLoopNode>(*fpgaLoop));
+    EXPECT_TRUE(std::holds_alternative<CompiledLoopNode>(*cpuLoop));
+
+    // FPGA slice: contains the FPGA kernel + rendezvous, and NO plain data bridge.
+    const DGraphChild* fpgaBody =
+        findChildDGraphs(*fpgaDG, loopId, DGraphChildRole::LoopBody);
+    ASSERT_NE(fpgaBody, nullptr);
+    ASSERT_FALSE(fpgaBody->dgraphs.empty());
+    int fpgaSignals = 0, fpgaWaits = 0, fpgaBridges = 0;
+    bool sawFpgaKernel = false;
+    std::set<std::uint32_t> fpgaSlots;
+    for (const auto& s : fpgaBody->dgraphs) {
+        for (const auto& n : s->nodes) {
+            if (std::holds_alternative<CompiledBridgeOpNode>(n)) ++fpgaBridges;
+            if (const auto* sn = std::get_if<CompiledSignalNode>(&n)) { ++fpgaSignals; fpgaSlots.insert(sn->slot); }
+            if (const auto* wn = std::get_if<CompiledWaitNode>(&n))   { ++fpgaWaits;   fpgaSlots.insert(wn->slot); }
+            if (compiledNodeId(n) == fpgaKId) sawFpgaKernel = true;
+        }
+    }
+    EXPECT_TRUE(sawFpgaKernel);
+    EXPECT_GT(fpgaSignals + fpgaWaits, 0) << "FPGA slice missing rendezvous";
+    EXPECT_EQ(fpgaBridges, 0) << "FPGA slice should have no plain data bridge after conversion";
+
+    // CPU slice: contains the CPU kernel + rendezvous on matching slots.
+    const DGraphChild* cpuBody =
+        findChildDGraphs(*cpuDG, loopId, DGraphChildRole::LoopBody);
+    ASSERT_NE(cpuBody, nullptr);
+    bool sawCpuKernel = false;
+    int cpuRendezvous = 0;
+    std::set<std::uint32_t> cpuSlots;
+    for (const auto& s : cpuBody->dgraphs) {
+        for (const auto& n : s->nodes) {
+            if (const auto* sn = std::get_if<CompiledSignalNode>(&n)) { ++cpuRendezvous; cpuSlots.insert(sn->slot); }
+            if (const auto* wn = std::get_if<CompiledWaitNode>(&n))   { ++cpuRendezvous; cpuSlots.insert(wn->slot); }
+            if (compiledNodeId(n) == cpuKId) sawCpuKernel = true;
+        }
+    }
+    EXPECT_TRUE(sawCpuKernel);
+    EXPECT_GT(cpuRendezvous, 0) << "CPU slice missing rendezvous";
+    // The queues rendezvous on the same slots.
+    std::vector<std::uint32_t> shared;
+    std::set_intersection(fpgaSlots.begin(), fpgaSlots.end(), cpuSlots.begin(), cpuSlots.end(),
+                          std::back_inserter(shared));
+    EXPECT_FALSE(shared.empty()) << "FPGA and CPU rendezvous must share slot(s)";
+}
+
+// Phase F.3b: a *data-dependent* (while) loop whose body spans FPGA + CPU splits
+// into per-queue replicas with broadcast roles: the CPU replica is the Authority
+// (evaluates the host condition and broadcasts its decision) and the FPGA replica
+// is the Follower (reads the broadcast as its exit predicate).  Both replicas
+// share the same broadcast handshake slots.
+TEST(RegionCompilerTest, DataDependentCrossDeviceLoopSplitsWithBroadcastRoles) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
+    graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
+
+    // Main-line CPU producer for the host-evaluated loop predicate scalar.
+    GraphScalar n = graph.globalScalar(ScalarType::U32, "n");
+    IOTypeMap initType;
+    initType.outputScalars.push_back({"out", ScalarType::U32});
+    IOMap initIo;
+    initIo.bindScalar("out", n);
+    std::string initId = graph.addNode(cpuKernel("init", initType), std::move(initIo), "cpu");
+
+    IOTypeMap outT;
+    outT.outputBuffers.push_back({"out", BufferType::I32});
+    IOTypeMap inOutT;
+    inOutT.inputBuffers.push_back({"in", BufferType::I32});
+    inOutT.outputBuffers.push_back({"out", BufferType::I32});
+
+    auto body = graph.rootRegion().createChild();
+    IOMap fIo;
+    GraphBuffer produced;
+    fIo.bindOutputBuffer("out", BufferType::I32, produced, body->scopeId());
+    const std::string fpgaKId = body->addKernel(
+        KernelDescriptor{"fk", DeviceType::FPGA, std::nullopt, outT}, std::move(fIo), "fpga:0");
+    IOMap cIo;
+    GraphBuffer consumed;
+    cIo.bindInputBuffer("in", produced)
+       .bindOutputBuffer("out", BufferType::I32, consumed, body->scopeId());
+    const std::string cpuKId =
+        body->addKernel(cpuKernel("ck", inOutT), std::move(cIo), "cpu", {fpgaKId});
+
+    const std::string loopId = graph.addLoop(whileLoopSpec(
+        Condition::compare(CompareOp::LT, ConditionOperand::scalar(ScalarType::U32, "n"),
+                           ConditionOperand::constant<uint32_t>(4)),
+        body, {initId}));
+
+    InspectionBridge bridge;
+    auto dgraphs = compileForInspection(graph, bridge);
+
+    const DGraph* fpgaDG = findDGraph(dgraphs, "fpga:0");
+    const DGraph* cpuDG  = findDGraph(dgraphs, "cpu");
+    ASSERT_NE(fpgaDG, nullptr);
+    ASSERT_NE(cpuDG, nullptr);
+    const CompiledNode* fpgaLoop = findCompiledNode(*fpgaDG, loopId);
+    const CompiledNode* cpuLoop  = findCompiledNode(*cpuDG, loopId);
+    ASSERT_NE(fpgaLoop, nullptr);
+    ASSERT_NE(cpuLoop, nullptr);
+    ASSERT_TRUE(std::holds_alternative<CompiledLoopNode>(*fpgaLoop));
+    ASSERT_TRUE(std::holds_alternative<CompiledLoopNode>(*cpuLoop));
+    const auto& fl = std::get<CompiledLoopNode>(*fpgaLoop);
+    const auto& cl = std::get<CompiledLoopNode>(*cpuLoop);
+
+    EXPECT_EQ(fl.broadcastRole, SplitBroadcastRole::Follower);
+    EXPECT_EQ(cl.broadcastRole, SplitBroadcastRole::Authority);
+    // Both replicas share the same broadcast handshake slots, all distinct.
+    EXPECT_EQ(fl.conditionBroadcastSlot, cl.conditionBroadcastSlot);
+    EXPECT_EQ(fl.broadcastReadySlot, cl.broadcastReadySlot);
+    EXPECT_EQ(fl.broadcastAckSlot, cl.broadcastAckSlot);
+    EXPECT_NE(fl.conditionBroadcastSlot, fl.broadcastReadySlot);
+    EXPECT_NE(fl.broadcastReadySlot, fl.broadcastAckSlot);
+}
+
+// Phase A: a fixed-count loop with an all-FPGA body that carries a buffer whose
+// initial value is produced on the CPU and whose result is consumed on the CPU.
+// The loop + its import/export boundaries land on the FPGA queue (no in-body
+// bridge), and the loop's I/O is bridged around the control node.
+TEST(RegionCompilerTest, FpgaLoopCarriedBufferWithCpuIoPlacesLoopAndBoundariesOnFpga) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
+    graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
+
+    IOTypeMap kt;
+    kt.inputBuffers.push_back({"in", BufferType::I32});
+    kt.outputBuffers.push_back({"out", BufferType::I32});
+
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw");
+    IOMap initIo;
+    GraphBuffer parentState;
+    initIo.bindInputBuffer("in", raw)
+          .bindOutputBuffer("out", BufferType::I32, parentState);
+    graph.addNode(cpuKernel("init", kt), std::move(initIo), "cpu");
+
+    auto body = graph.rootRegion().createChild();
+    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state");
+    const std::string startId = body->importFromParent(
+        std::vector<BufferBoundaryMapping>{{parentState, localState}});
+    IOMap bodyIo;
+    GraphBuffer localNext;
+    bodyIo.bindInputBuffer("in", localState)
+          .bindOutputBuffer("out", BufferType::I32, localNext, body->scopeId());
+    const std::string bodyId = body->addKernel(
+        KernelDescriptor{"advance", DeviceType::FPGA, std::nullopt, kt},
+        std::move(bodyIo), "fpga:0", {startId});
+    body->exportToParent(std::vector<BufferBoundaryMapping>{{localNext, parentState}},
+                         {bodyId});
+    const std::string loopId =
+        graph.addLoop(fixedLoopSpec(LoopTripCount::constant<int32_t>(3), body));
+
+    IOMap consumeIo;
+    GraphBuffer finalOut;
+    consumeIo.bindInputBuffer("in", parentState)
+             .bindOutputBuffer("out", BufferType::I32, finalOut);
+    graph.addNode(cpuKernel("consume", kt), std::move(consumeIo), "cpu");
+
+    InspectionBridge bridge;
+    auto dgraphs = compileForInspection(graph, bridge);
+
+    const DGraph* fpgaDGraph = findDGraph(dgraphs, "fpga:0");
+    ASSERT_NE(fpgaDGraph, nullptr);
+
+    // The loop control node is on the FPGA queue.
+    const CompiledNode* loopNode = findCompiledNode(*fpgaDGraph, loopId);
+    ASSERT_NE(loopNode, nullptr);
+    EXPECT_TRUE(std::holds_alternative<CompiledLoopNode>(*loopNode));
+
+    // The body lives entirely on the FPGA queue with no in-body bridge (the
+    // carried-buffer boundaries are FPGA-resident aliases).
+    const DGraphChild* bodyChild =
+        findChildDGraphs(*fpgaDGraph, loopId, DGraphChildRole::LoopBody);
+    ASSERT_NE(bodyChild, nullptr);
+    bool bodyBridge = false;
+    bool sawStartBoundary = false;
+    for (const auto& d : bodyChild->dgraphs) {
+        if (!d) continue;
+        for (const auto& n : d->nodes) {
+            if (std::holds_alternative<CompiledBridgeOpNode>(n)) bodyBridge = true;
+            if (compiledNodeId(n) == startId) {
+                sawStartBoundary = true;
+                EXPECT_EQ(compiledNodeDeviceId(n), "fpga:0");
+            }
+        }
+    }
+    EXPECT_FALSE(bodyBridge) << "an in-body cross-device bridge disqualifies autonomy";
+    EXPECT_TRUE(sawStartBoundary);
+
+    // The loop's CPU-side I/O is bridged around the control node, on the FPGA queue.
+    int fpgaBridges = 0;
+    for (const auto& n : fpgaDGraph->nodes) {
+        if (std::holds_alternative<CompiledBridgeOpNode>(n)) ++fpgaBridges;
+    }
+    EXPECT_GT(fpgaBridges, 0) << "expected entry/exit bridges around the FPGA loop";
+}
+
 TEST(RegionCompilerTest, CompilerBuildsNestedCrossDeviceBridgesInLoopBody) {
     Graph graph;
     graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));

@@ -349,6 +349,28 @@ class CpuDevice : public IDevice {
      */
     size_t bufferSize(const std::string& bufferName) const;
 
+    // --- Cross-queue rendezvous signal access (Phase E) ---
+
+    /// Reads the 32-bit value of a host-visible signal slot.
+    using SignalReadFn = std::function<std::uint32_t(std::uint32_t /*slot*/)>;
+    /// Writes the 32-bit value of a host-visible signal slot.
+    using SignalWriteFn = std::function<void(std::uint32_t /*slot*/, std::uint32_t /*value*/)>;
+
+    /**
+     * @brief Wire this CPU device to a peer queue's host-visible signal array.
+     *
+     * A split cross-device loop runs its CPU body slice concurrently with the
+     * peer (FPGA) queue, rendezvousing per iteration through signal slots that
+     * live in the peer's BAR-visible DDR window. The Graph supplies these
+     * accessors before launch so the CPU's CompiledSignalNode / CompiledWaitNode
+     * execution can SET and poll those slots over the BAR. Without them, a CPU
+     * slice that contains rendezvous nodes throws at launch.
+     */
+    void setSignalAccessors(SignalReadFn reader, SignalWriteFn writer) {
+        signalRead_  = std::move(reader);
+        signalWrite_ = std::move(writer);
+    }
+
     // --- IDevice ---
 
     DeviceType  type() const override { return DeviceType::CPU; }
@@ -362,6 +384,8 @@ class CpuDevice : public IDevice {
     std::string                                  id_;
     std::map<std::string, std::shared_ptr<CpuKernel>> kernels_;
     std::map<std::string, std::vector<uint8_t>>  buffers_;
+    SignalReadFn                                 signalRead_;
+    SignalWriteFn                                signalWrite_;
 };
 
 }  // namespace vrt::graph

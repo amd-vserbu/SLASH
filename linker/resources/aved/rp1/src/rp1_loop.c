@@ -163,6 +163,13 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
         break;
     }
 
+    case RP1_OP_SCALAR_COPY: {
+        const rp1_payload_scalar_copy_t *p = &node->payload.scalar_copy;
+        axi_write32(p->dest_addr, g_signals[p->source_slot].value);
+        dsb();
+        break;
+    }
+
     case RP1_OP_DMA_COPY: {
         const rp1_payload_dma_copy_t *p = &node->payload.dma_copy;
         /* Phase 1: DDR-DDR software memcpy (32-bit addresses only). */
@@ -244,6 +251,37 @@ static int check_inflight(void)
             } else {
                 i++;
             }
+        }
+    }
+
+    return made_progress;
+}
+
+/* -------------------------------------------------------------------------
+ * WAIT polling
+ *
+ * Re-evaluates every node parked in RP1_NODE_WAITING against its signal slot.
+ * A WAIT becomes DONE (raising its barrier) as soon as the condition holds,
+ * which may happen because a peer queue or the host wrote the slot between
+ * scan passes.  Mirrors check_inflight(): returns 1 if any wait resolved.
+ * ---------------------------------------------------------------------- */
+
+static int check_waits(uint32_t node_count)
+{
+    int made_progress = 0;
+
+    for (uint32_t i = 0; i < node_count; i++) {
+        if (g_node_status[i] != RP1_NODE_WAITING)
+            continue;
+
+        const rp1_node_t *node = &g_nodes[i];
+        const rp1_payload_wait_t *w = &node->payload.wait;
+        if (compare(g_signals[w->condition_signal].value,
+                    w->condition_op, w->condition_value)) {
+            g_node_status[i] = RP1_NODE_DONE;
+            g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+            write_cq_entry(node->flags, i, RP1_CQ_OK, 0);
+            made_progress = 1;
         }
     }
 
@@ -406,6 +444,21 @@ static int activate_nodes(uint32_t node_count)
             break;
         }
 
+        case RP1_OP_WAIT: {
+            const rp1_payload_wait_t *w = &node->payload.wait;
+            if (compare(g_signals[w->condition_signal].value,
+                        w->condition_op, w->condition_value)) {
+                g_node_status[i] = RP1_NODE_DONE;
+                g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+                write_cq_entry(node->flags, i, RP1_CQ_OK, 0);
+                made_progress = 1;
+            } else {
+                /* Park the node; check_waits() re-polls the slot each pass. */
+                g_node_status[i] = RP1_NODE_WAITING;
+            }
+            break;
+        }
+
         case RP1_OP_HALT:
             g_node_status[i] = RP1_NODE_DONE;
             write_cq_entry(node->flags, i, RP1_CQ_OK, 0);
@@ -445,25 +498,32 @@ int rp1_loop(void)
         if (inflight_progress < 0)
             return inflight_progress;
 
+        int wait_progress = check_waits(node_count);
+
 #ifdef QEMU_SEMIHOSTING
         if (hooks && hooks->on_scan_pass)
             hooks->on_scan_pass();
 #endif
 
-        if (!activated && !inflight_progress) {
-            /* No scan progress — check for dispatched kernels. */
+        if (!activated && !inflight_progress && !wait_progress) {
+            /* No scan progress — keep looping while kernels are in flight or a
+             * WAIT is still gated on a signal a peer/host may yet raise. */
             uint32_t has_dispatched = 0;
+            uint32_t has_waiting = 0;
             for (uint32_t i = 0; i < node_count; i++) {
-                if (g_node_status[i] == RP1_NODE_DISPATCHED) {
-                    has_dispatched = 1;
-                    break;
-                }
+                uint8_t st = g_node_status[i];
+                if (st == RP1_NODE_DISPATCHED) has_dispatched = 1;
+                else if (st == RP1_NODE_WAITING) has_waiting = 1;
             }
-            if (!has_dispatched)
+            if (!has_dispatched && !has_waiting)
                 return 0; /* graph complete */
 
 #if !defined(QEMU_SEMIHOSTING) && !defined(RP1_POLLING_BRINGUP)
-            wfi();
+            /* A pending WAIT must busy-poll: host signal writes over the BAR do
+             * not raise an R5 event, so wfi() could oversleep.  Only idle the
+             * core when the sole outstanding work is in-flight kernels. */
+            if (!has_waiting)
+                wfi();
 #endif
         }
 

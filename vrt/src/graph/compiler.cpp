@@ -22,12 +22,15 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <queue>
 #include <set>
 #include <type_traits>
 #include <utility>
+
+#include <vrt/graph/device/fpga/control_lowering.hpp>
 
 namespace vrt::graph {
 
@@ -2269,7 +2272,9 @@ class RegionCompiler {
     RegionCompiler(const std::map<std::string, std::shared_ptr<IDevice>>& devices,
                    const GraphCompiler::BridgeFor& bridgeFor,
                    std::shared_ptr<std::map<std::string, uint64_t>> scalarValues)
-        : devices_(devices), bridgeFor_(bridgeFor), scalarValues_(std::move(scalarValues)) {}
+        : devices_(devices), bridgeFor_(bridgeFor), scalarValues_(std::move(scalarValues)) {
+        rendezvousSlots_.reserve(RP1_MAX_SIGNALS - 1u);  // FPGA sentinel slot
+    }
 
     std::vector<DGraph> compileRegion(const GraphRegion& region) {
         RegionCompilation rc;
@@ -2289,6 +2294,7 @@ class RegionCompiler {
         insertCrossDeviceBridges(rc);
         insertAfterOpsBarriers(rc);
         populateDependsOn(rc);
+        splitCrossQueueLoops(rc);
         return assembleDGraphs(rc);
     }
 
@@ -2322,6 +2328,15 @@ class RegionCompiler {
         std::map<std::string, DeviceInsertions>               insertions;
         std::map<std::pair<std::string, std::string>, std::string> remoteConsumerBridgeIds;
         uint32_t bridgeCounter = 0;
+        // Cross-queue-split loops: control op id -> sorted participating device
+        // ids.  The control node is replicated onto each; its body's in-body
+        // bridges are converted to per-iteration SIGNAL/WAIT rendezvous.
+        std::map<std::string, std::vector<std::string>> splitLoopDevices;
+        // Data-dependent split loops: control op id -> broadcast slots
+        // {decision, ready, ack}.  The CPU replica is the Authority (evaluates
+        // the condition and broadcasts it); the FPGA replica is the Follower.
+        struct SplitBroadcast { std::uint32_t decision, ready, ack; };
+        std::map<std::string, SplitBroadcast> splitLoopBroadcast;
     };
 
     // ---- Phases ---------------------------------------------------------
@@ -2367,16 +2382,32 @@ class RegionCompiler {
             const auto* kernel = std::get_if<KernelOp>(&op);
             if (!kernel) continue;
             if (kernel->kernel.type != DeviceType::CPU) {
-                for (const auto& [portName, scalar] : kernel->ioMap.scalars()) {
-                    (void)portName;
-                    if (!scalar.isConstant()) {
-                        throw std::runtime_error(
-                            "GraphCompiler: global scalar bindings are currently supported only on CPU kernels");
+                auto isOutputPort = [&](const std::string& port) {
+                    for (const auto& sp : kernel->kernel.ioType.outputScalars) {
+                        if (sp.name == port) return true;
                     }
-                }
-                if (!kernel->kernel.ioType.outputScalars.empty()) {
+                    return false;
+                };
+                // FPGA kernels may bind *output* scalars: the FpgaDevice captures
+                // them post-run via RP1_OP_SCALAR_READ into a signal slot (the
+                // value a downstream LOOP/COND predicate evaluates).  Non-constant
+                // *input* scalars on a non-CPU kernel are not yet supported (they
+                // would need a host/slot value written into the kernel register).
+                for (const auto& [portName, scalar] : kernel->ioMap.scalars()) {
+                    if (scalar.isConstant()) continue;
+                    if (kernel->kernel.type == DeviceType::FPGA && isOutputPort(portName)) {
+                        continue;
+                    }
                     throw std::runtime_error(
-                        "GraphCompiler: output scalar ports are currently supported only on CPU kernels");
+                        "GraphCompiler: non-constant scalar bindings are currently supported "
+                        "only on CPU kernels (FPGA kernels may bind output scalars, captured "
+                        "via SCALAR_READ)");
+                }
+                if (kernel->kernel.type != DeviceType::FPGA &&
+                    !kernel->kernel.ioType.outputScalars.empty()) {
+                    throw std::runtime_error(
+                        "GraphCompiler: output scalar ports are currently supported only on "
+                        "CPU and FPGA kernels");
                 }
             }
         }
@@ -2463,6 +2494,404 @@ class RegionCompiler {
         }
     }
 
+    /// Decide whether a single loop can run autonomously on one FPGA queue
+    /// (RP1 LOOP/RERUN), returning that FPGA device id, or nullopt to keep it
+    /// CPU-owned.  Eligible when: it is a constant fixed-count loop, and its
+    /// body is entirely FPGA kernels/reprograms on one FPGA device (carried-
+    /// buffer boundaries are fine; carried scalars, bridges, and nested control
+    /// are not).  The loop's own inputs/outputs may cross to another device --
+    /// those become bridges around the control node (Phase A boundary case),
+    /// which the FpgaDevice control path stages before / drains after the image.
+    std::optional<std::string> fpgaAutonomousLoopDevice(const RegionCompilation& rc,
+                                                        const LoopOp& loop) const {
+        // A data-dependent while-loop is eligible when its predicate is
+        // RP1-evaluable (one integer scalar vs constant) and that scalar is
+        // produced inside the body as an FPGA kernel output scalar, which the
+        // device lowering captures via SCALAR_READ each iteration.
+        std::optional<std::string> predKey;
+        if (loop.kind == LoopKind::FixedCount) {
+            if (!loop.tripCount || loop.tripCount->kind() != LoopTripCount::Kind::Constant) {
+                return std::nullopt;
+            }
+        } else if (loop.kind == LoopKind::WhileCondition) {
+            if (!loop.condition || !fpga::isRp1EvaluableCondition(*loop.condition)) {
+                return std::nullopt;
+            }
+            const fpga::Rp1Compare c = fpga::mapRp1Condition(*loop.condition);
+            predKey = scopedScalarKey(c.scalarScopeId, c.scalarName);
+        } else {
+            return std::nullopt;
+        }
+        auto cit = rc.childrenByControlId.find(loop.id);
+        if (cit == rc.childrenByControlId.end()) return std::nullopt;
+
+        std::optional<std::string> dev;
+        bool any = false;
+        std::set<std::string> producedScalars;            // body kernel output scalars
+        std::vector<std::pair<std::string, std::string>>  // export source -> target
+            scalarExports;
+        auto note = [&](const std::string& d) -> bool {
+            auto it = devices_.find(d);
+            if (it == devices_.end() || it->second->type() != DeviceType::FPGA) return false;
+            if (!dev) dev = d;
+            return *dev == d;
+        };
+
+        for (const DGraphChild& child : cit->second) {
+            if (child.role != DGraphChildRole::LoopBody) continue;
+            for (const auto& body : child.dgraphs) {
+                if (!body) continue;
+                for (const CompiledNode& n : body->nodes) {
+                    if (const auto* bk = std::get_if<CompiledKernelNode>(&n)) {
+                        if (bk->kernel.type != DeviceType::FPGA) return std::nullopt;
+                        if (!note(bk->deviceId)) return std::nullopt;
+                        any = true;
+                        for (const ScalarPort& sp : bk->kernel.ioType.outputScalars) {
+                            auto sb = bk->ioMap.scalars().find(sp.name);
+                            if (sb != bk->ioMap.scalars().end()) {
+                                producedScalars.insert(scopedScalarKey(
+                                    sb->second.scopeId(), sb->second.varName()));
+                            }
+                        }
+                    } else if (const auto* br = std::get_if<CompiledReprogramNode>(&n)) {
+                        if (!note(br->deviceId)) return std::nullopt;
+                        any = true;
+                    } else if (const auto* bb = std::get_if<CompiledBoundaryNode>(&n)) {
+                        // Carried-scalar boundaries are autonomous: an End export
+                        // aliases a body-produced scalar to the parent (predicate
+                        // source); a Start import feeds the carried slot into a
+                        // kernel register via SCALAR_COPY each iteration.
+                        for (const auto& sc : bb->scalarCopies) {
+                            if (bb->side == CompiledBoundaryNode::Side::End) {
+                                scalarExports.emplace_back(
+                                    scopedScalarKey(sc.sourceScopeId, sc.sourceName),
+                                    scopedScalarKey(sc.targetScopeId, sc.targetName));
+                            }
+                        }
+                    } else {
+                        // bridge op or nested control -> not autonomous.
+                        return std::nullopt;
+                    }
+                }
+            }
+        }
+
+        if (!any || !dev) return std::nullopt;
+        if (predKey) {
+            // The predicate is body-produced directly, or via an export whose
+            // source a body kernel produced.
+            bool predProduced = producedScalars.count(*predKey) > 0;
+            for (const auto& [src, tgt] : scalarExports) {
+                if (tgt == *predKey && producedScalars.count(src)) predProduced = true;
+            }
+            if (!predProduced) return std::nullopt;
+        }
+        return dev;
+    }
+
+    /// Decide whether a conditional can run autonomously on one FPGA queue
+    /// (RP1 COND), returning that FPGA device id, or nullopt to keep it
+    /// CPU-owned.  Eligible when: the predicate is RP1-evaluable and produced by
+    /// an FPGA kernel on the same device (so its SCALAR_READ slot is visible on
+    /// that queue -- cross-device predicate broadcast is a later phase); and
+    /// both branches are entirely FPGA kernels/reprograms on that one device
+    /// (data-carrying branch boundaries and nested control are not autonomous).
+    std::optional<std::string> fpgaAutonomousConditionalDevice(const RegionCompilation& rc,
+                                                               const ConditionalOp& cond) const {
+        if (!fpga::isRp1EvaluableCondition(cond.condition)) return std::nullopt;
+        const fpga::Rp1Compare c = fpga::mapRp1Condition(cond.condition);
+        const std::string predKey = scopedScalarKey(c.scalarScopeId, c.scalarName);
+
+        auto cit = rc.childrenByControlId.find(cond.id);
+        if (cit == rc.childrenByControlId.end()) return std::nullopt;
+
+        std::optional<std::string> dev;
+        bool any = false;
+        auto note = [&](const std::string& d) -> bool {
+            auto it = devices_.find(d);
+            if (it == devices_.end() || it->second->type() != DeviceType::FPGA) return false;
+            if (!dev) dev = d;
+            return *dev == d;
+        };
+
+        for (const DGraphChild& child : cit->second) {
+            if (child.role != DGraphChildRole::ConditionalThen &&
+                child.role != DGraphChildRole::ConditionalElse) {
+                continue;
+            }
+            for (const auto& body : child.dgraphs) {
+                if (!body) continue;
+                for (const CompiledNode& n : body->nodes) {
+                    if (const auto* bk = std::get_if<CompiledKernelNode>(&n)) {
+                        if (bk->kernel.type != DeviceType::FPGA) return std::nullopt;
+                        if (!note(bk->deviceId)) return std::nullopt;
+                        any = true;
+                    } else if (const auto* br = std::get_if<CompiledReprogramNode>(&n)) {
+                        if (!note(br->deviceId)) return std::nullopt;
+                        any = true;
+                    } else if (const auto* bb = std::get_if<CompiledBoundaryNode>(&n)) {
+                        if (!bb->scalarCopies.empty() || !bb->bufferCopies.empty()) {
+                            return std::nullopt;
+                        }
+                    } else {
+                        return std::nullopt;
+                    }
+                }
+            }
+        }
+        if (!any || !dev) return std::nullopt;
+
+        // The predicate must be produced by an FPGA kernel on the same queue so
+        // its SCALAR_READ slot is available when the COND evaluates.
+        bool predProduced = false;
+        for (const auto& [opId, opPtr] : rc.opById) {
+            (void)opId;
+            const auto* k = std::get_if<KernelOp>(opPtr);
+            if (!k || !opPtr) continue;
+            if (resolveKernelDevice(*k, devices_) != *dev) continue;
+            for (const ScalarPort& sp : k->kernel.ioType.outputScalars) {
+                auto sb = k->ioMap.scalars().find(sp.name);
+                if (sb != k->ioMap.scalars().end() &&
+                    scopedScalarKey(sb->second.scopeId(), sb->second.varName()) == predKey) {
+                    predProduced = true;
+                }
+            }
+        }
+        if (!predProduced) return std::nullopt;
+        return dev;
+    }
+
+    /// Decide whether a cross-device loop should be split into per-queue slices
+    /// (one replicated control node per participating device, rendezvous-
+    /// synchronised).  Returns the sorted participating device ids, or nullopt.
+    /// Eligible when: constant fixed-count; body spans >=2 devices that are all
+    /// FPGA or CPU (runnable as a queue slice); body has no nested control or
+    /// pre-existing rendezvous.  (Single-FPGA bodies take fpgaAutonomousLoopDevice
+    /// instead; everything else stays CPU-owned.)
+    std::optional<std::vector<std::string>> splitLoopParticipants(
+        const RegionCompilation& rc, const LoopOp& loop) const {
+        // Fixed-count splits replicate a known count onto each queue.  A
+        // data-dependent (while) split instead designates the CPU participant as
+        // the Authority that broadcasts its continue/stop decision to the FPGA
+        // Follower each iteration (see splitLoopBroadcast wiring), so a while
+        // loop is eligible too -- the CPU evaluates the (host) condition.
+        if (loop.kind == LoopKind::FixedCount) {
+            if (!loop.tripCount || loop.tripCount->kind() != LoopTripCount::Kind::Constant) {
+                return std::nullopt;
+            }
+        } else if (loop.kind == LoopKind::WhileCondition) {
+            if (!loop.condition) return std::nullopt;
+        } else {
+            return std::nullopt;
+        }
+        auto cit = rc.childrenByControlId.find(loop.id);
+        if (cit == rc.childrenByControlId.end()) return std::nullopt;
+
+        std::set<std::string> devs;
+        for (const DGraphChild& child : cit->second) {
+            if (child.role != DGraphChildRole::LoopBody) continue;
+            for (const auto& slice : child.dgraphs) {
+                if (!slice || slice->nodes.empty()) continue;
+                devs.insert(slice->deviceId);
+                for (const CompiledNode& n : slice->nodes) {
+                    if (std::holds_alternative<CompiledLoopNode>(n) ||
+                        std::holds_alternative<CompiledConditionalNode>(n) ||
+                        std::holds_alternative<CompiledSignalNode>(n) ||
+                        std::holds_alternative<CompiledWaitNode>(n)) {
+                        return std::nullopt;  // nested control / pre-existing rendezvous
+                    }
+                }
+            }
+        }
+        if (devs.size() < 2) return std::nullopt;  // not cross-device
+
+        // Every cross-device edge must have a CPU endpoint so the per-iteration
+        // data move is a host BAR copy on the CPU side.  Conservatively require
+        // exactly one CPU + one FPGA (guarantees all edges are FPGA<->CPU).
+        // Multi-FPGA bodies with FPGA<->FPGA DMA edges are a future extension.
+        int cpus = 0, fpgas = 0;
+        for (const std::string& d : devs) {
+            auto it = devices_.find(d);
+            if (it == devices_.end()) return std::nullopt;
+            switch (it->second->type()) {
+                case DeviceType::CPU:  ++cpus;  break;
+                case DeviceType::FPGA: ++fpgas; break;
+                default: return std::nullopt;
+            }
+        }
+        if (cpus != 1 || fpgas != 1) return std::nullopt;
+        return std::vector<std::string>(devs.begin(), devs.end());
+    }
+
+    /// Primary device for a split loop (carries the parent-facing output
+    /// publications): prefer an FPGA participant, else the first.
+    std::string splitPrimaryDevice(const std::vector<std::string>& devs) const {
+        for (const std::string& d : devs) {
+            auto it = devices_.find(d);
+            if (it != devices_.end() && it->second->type() == DeviceType::FPGA) return d;
+        }
+        return devs.front();
+    }
+
+    bool isCpuDevice(const std::string& d) const {
+        auto it = devices_.find(d);
+        return it != devices_.end() && it->second->type() == DeviceType::CPU;
+    }
+
+    /// Convert the in-body cross-device bridges of a split loop's body slices
+    /// into per-iteration SIGNAL/WAIT rendezvous (the depth-1 handshake: the
+    /// producer raises READY then waits DONE+clears; the consumer waits READY+
+    /// clears, moves the data over the BAR on its CPU side, then raises DONE).
+    /// Ordering within each slice is by dependsOn, so nodes are appended.
+    void convertBridgesToRendezvous(RegionCompilation& rc, DGraphChild& child) {
+        // Match producer/consumer bridge halves by their shared IBridgeOp.
+        struct Half { DGraph* slice; const CompiledBridgeOpNode* node; };
+        std::map<const void*, std::vector<Half>> byOp;
+        for (auto& slice : child.dgraphs) {
+            if (!slice) continue;
+            for (const CompiledNode& n : slice->nodes) {
+                if (const auto* b = std::get_if<CompiledBridgeOpNode>(&n)) {
+                    if (b->op) byOp[b->op.get()].push_back({slice.get(), b});
+                }
+            }
+        }
+
+        std::map<DGraph*, std::set<std::string>> removeIds;
+        std::map<DGraph*, std::vector<CompiledNode>> appendNodes;
+        std::map<std::string, std::string> depRewrite;  // bridge half id -> data-ready node id
+
+        for (auto& [op, hs] : byOp) {
+            (void)op;
+            if (hs.size() != 2) continue;
+            const CompiledBridgeOpNode* prod =
+                hs[0].node->side == CompiledBridgeOpNode::Side::Producer ? hs[0].node : hs[1].node;
+            const CompiledBridgeOpNode* cons =
+                hs[0].node->side == CompiledBridgeOpNode::Side::Producer ? hs[1].node : hs[0].node;
+            DGraph* prodSlice = hs[0].node == prod ? hs[0].slice : hs[1].slice;
+            DGraph* consSlice = hs[0].node == cons ? hs[0].slice : hs[1].slice;
+            if (prod->side != CompiledBridgeOpNode::Side::Producer ||
+                cons->side != CompiledBridgeOpNode::Side::Consumer) {
+                continue;
+            }
+
+            const std::uint32_t ready = rendezvousSlots_.alloc();
+            const std::uint32_t done  = rendezvousSlots_.alloc();
+            const std::string tag = "_rdv_" + std::to_string(ready) + "_";
+
+            removeIds[prodSlice].insert(prod->id);
+            removeIds[consSlice].insert(cons->id);
+
+            // Combined BAR data move, run on whichever slice is the CPU.
+            auto pAction = prod->action;
+            auto cAction = cons->action;
+            std::function<void()> move = [pAction, cAction]() {
+                if (pAction) pAction();
+                if (cAction) cAction();
+            };
+
+            // Producer slice: raise READY (after producing), then gate the next
+            // iteration's produce on DONE and clear it.
+            CompiledSignalNode sigReady;
+            sigReady.id = tag + "ready_set"; sigReady.deviceId = prodSlice->deviceId;
+            sigReady.dependsOn = prod->dependsOn;  // includes the producing kernel
+            sigReady.slot = ready; sigReady.value = 1; sigReady.operation = RP1_SIGOP_SET;
+
+            CompiledWaitNode waitDone;
+            waitDone.id = tag + "done_wait"; waitDone.deviceId = prodSlice->deviceId;
+            waitDone.dependsOn = {sigReady.id};
+            waitDone.slot = done; waitDone.value = 1; waitDone.conditionOp = RP1_COP_AND_NZ;
+
+            CompiledSignalNode doneClear;
+            doneClear.id = tag + "done_clear"; doneClear.deviceId = prodSlice->deviceId;
+            doneClear.dependsOn = {waitDone.id};
+            doneClear.slot = done; doneClear.value = 0; doneClear.operation = RP1_SIGOP_SET;
+
+            // Consumer slice: await READY, clear it, then (consume), raise DONE.
+            CompiledWaitNode waitReady;
+            waitReady.id = tag + "ready_wait"; waitReady.deviceId = consSlice->deviceId;
+            waitReady.slot = ready; waitReady.value = 1; waitReady.conditionOp = RP1_COP_AND_NZ;
+
+            CompiledSignalNode readyClear;
+            readyClear.id = tag + "ready_clear"; readyClear.deviceId = consSlice->deviceId;
+            readyClear.dependsOn = {waitReady.id};
+            readyClear.slot = ready; readyClear.value = 0; readyClear.operation = RP1_SIGOP_SET;
+
+            // The CPU side performs the BAR copy.  Placed on the producer slice
+            // (push) when CPU produces, else on the consumer slice (pull).
+            std::string dataReadyId;  // node after which the consumer's data is valid
+            const bool cpuProduces = isCpuDevice(prodSlice->deviceId);
+            if (cpuProduces) {
+                CompiledBridgeOpNode xfer;
+                xfer.id = tag + "xfer"; xfer.deviceId = prodSlice->deviceId; xfer.op = prod->op;
+                xfer.action = move; xfer.side = CompiledBridgeOpNode::Side::Consumer;
+                xfer.dependsOn = prod->dependsOn;        // after the producing kernel
+                sigReady.dependsOn = {xfer.id};          // raise READY once data is staged to FPGA
+                appendNodes[prodSlice].emplace_back(std::move(xfer));
+                dataReadyId = waitReady.id;              // FPGA consumer: data already in its buffer
+            } else {
+                CompiledBridgeOpNode xfer;
+                xfer.id = tag + "xfer"; xfer.deviceId = consSlice->deviceId; xfer.op = prod->op;
+                xfer.action = move; xfer.side = CompiledBridgeOpNode::Side::Consumer;
+                xfer.dependsOn = {readyClear.id};        // pull from FPGA after READY
+                appendNodes[consSlice].emplace_back(std::move(xfer));
+                dataReadyId = tag + "xfer";
+            }
+
+            CompiledSignalNode doneSet;
+            doneSet.id = tag + "done_set"; doneSet.deviceId = consSlice->deviceId;
+            doneSet.dependsOn = {cons->pairedKernelId.empty() ? dataReadyId : cons->pairedKernelId};
+            doneSet.slot = done; doneSet.value = 1; doneSet.operation = RP1_SIGOP_SET;
+
+            appendNodes[prodSlice].emplace_back(std::move(sigReady));
+            appendNodes[prodSlice].emplace_back(std::move(waitDone));
+            appendNodes[prodSlice].emplace_back(std::move(doneClear));
+            appendNodes[consSlice].emplace_back(std::move(waitReady));
+            appendNodes[consSlice].emplace_back(std::move(readyClear));
+            appendNodes[consSlice].emplace_back(std::move(doneSet));
+
+            // The consumer kernel consumed the bridge's output; it now depends
+            // on the staged data instead of the removed consumer bridge.
+            depRewrite[cons->id] = dataReadyId;
+            depRewrite[prod->id] = tag + "ready_set";
+        }
+
+        // Apply removals, dependsOn rewrites, and appends to each slice.
+        for (auto& slice : child.dgraphs) {
+            if (!slice) continue;
+            auto rmIt = removeIds.find(slice.get());
+            std::vector<CompiledNode> kept;
+            kept.reserve(slice->nodes.size());
+            for (CompiledNode& n : slice->nodes) {
+                if (rmIt != removeIds.end() && rmIt->second.count(compiledNodeId(n))) continue;
+                auto& deps = mutableCompiledNodeDependsOn(n);
+                for (std::string& d : deps) {
+                    auto rw = depRewrite.find(d);
+                    if (rw != depRewrite.end()) d = rw->second;
+                }
+                kept.push_back(std::move(n));
+            }
+            auto apIt = appendNodes.find(slice.get());
+            if (apIt != appendNodes.end()) {
+                for (CompiledNode& n : apIt->second) kept.push_back(std::move(n));
+            }
+            slice->nodes = std::move(kept);
+        }
+    }
+
+    /// Lower every cross-queue-split loop's body bridges into rendezvous.
+    void splitCrossQueueLoops(RegionCompilation& rc) {
+        for (auto& [loopId, devs] : rc.splitLoopDevices) {
+            (void)devs;
+            auto it = rc.childrenByControlId.find(loopId);
+            if (it == rc.childrenByControlId.end()) continue;
+            for (DGraphChild& child : it->second) {
+                if (child.role == DGraphChildRole::LoopBody) {
+                    convertBridgesToRendezvous(rc, child);
+                }
+            }
+        }
+    }
+
     /// Topologically sort the region's ops and pin each one to a device
     /// (kernels via deviceHint, control / boundary ops to the singleton CPU).
     void assignDevices(RegionCompilation& rc) const {
@@ -2475,27 +2904,90 @@ class RegionCompiler {
         const auto adj = buildRegionAdjacency(rc.ops, bufferProducers, scalarProducers);
         rc.sortedIds = topoSortRegion(rc.ops, adj);
 
+        // A region whose every kernel/reprogram targets one FPGA device is an
+        // all-FPGA control body; its import/export boundaries then live on that
+        // FPGA queue too (zero-copy carried-buffer aliases handled by the
+        // FpgaDevice lowering) so no in-body cross-device bridge is synthesised
+        // between a CPU-pinned boundary and an FPGA kernel.  Mixed/CPU regions
+        // keep boundaries on the CPU as before.
+        std::optional<std::string> bodyFpgaDevice;
+        {
+            bool mixed = false;
+            for (const RegionOp* opPtr : rc.ops) {
+                std::string d;
+                if (const auto* k = std::get_if<KernelOp>(opPtr)) {
+                    if (k->kernel.type != DeviceType::FPGA) { mixed = true; break; }
+                    d = resolveKernelDevice(*k, devices_);
+                } else if (const auto* r = std::get_if<ReprogramOp>(opPtr)) {
+                    d = resolveReprogramDevice(*r, devices_);
+                } else {
+                    continue;
+                }
+                auto it = devices_.find(d);
+                if (it == devices_.end() || it->second->type() != DeviceType::FPGA) {
+                    mixed = true;
+                    break;
+                }
+                if (!bodyFpgaDevice) bodyFpgaDevice = d;
+                else if (*bodyFpgaDevice != d) { mixed = true; break; }
+            }
+            if (mixed) bodyFpgaDevice.reset();
+        }
+
         for (const auto& id : rc.sortedIds) {
             const RegionOp& op = *rc.opById.at(id);
             if (const auto* kernel = std::get_if<KernelOp>(&op)) {
                 rc.nodeDevice[id] = resolveKernelDevice(*kernel, devices_);
             } else if (const auto* reprogram = std::get_if<ReprogramOp>(&op)) {
                 rc.nodeDevice[id] = resolveReprogramDevice(*reprogram, devices_);
-            } else if (std::holds_alternative<LoopOp>(op) ||
-                       std::holds_alternative<ConditionalOp>(op)) {
-                if (!rc.cpuDevice) {
+            } else if (const auto* loop = std::get_if<LoopOp>(&op)) {
+                // A fixed-count loop with an all-FPGA body runs autonomously on
+                // the FPGA queue (RP1 LOOP/RERUN).  A cross-device body is split
+                // into per-queue slices (replicated control node + SIGNAL/WAIT
+                // rendezvous).  Otherwise it stays CPU-owned.
+                if (const auto fpga = fpgaAutonomousLoopDevice(rc, *loop)) {
+                    rc.nodeDevice[id] = *fpga;
+                } else if (auto parts = splitLoopParticipants(rc, *loop)) {
+                    rc.splitLoopDevices[id] = *parts;
+                    rc.nodeDevice[id] = splitPrimaryDevice(*parts);
+                    if (loop->kind == LoopKind::WhileCondition) {
+                        // Data-dependent split: reserve the broadcast handshake
+                        // slots shared by the Authority (CPU) and Follower (FPGA).
+                        rc.splitLoopBroadcast[id] = {rendezvousSlots_.alloc(),
+                                                     rendezvousSlots_.alloc(),
+                                                     rendezvousSlots_.alloc()};
+                    }
+                } else if (rc.cpuDevice) {
+                    rc.nodeDevice[id] = rc.cpuDevice->id();
+                } else {
                     throw std::runtime_error(
                         "GraphCompiler: control op '" + id +
                         "' requires a CPU device for execution but none is registered");
                 }
-                rc.nodeDevice[id] = rc.cpuDevice->id();
+            } else if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
+                // An all-FPGA if/else with an FPGA-produced predicate runs
+                // autonomously on the FPGA queue (RP1 COND); otherwise CPU-owned.
+                if (const auto fpga = fpgaAutonomousConditionalDevice(rc, *cond)) {
+                    rc.nodeDevice[id] = *fpga;
+                } else if (rc.cpuDevice) {
+                    rc.nodeDevice[id] = rc.cpuDevice->id();
+                } else {
+                    throw std::runtime_error(
+                        "GraphCompiler: control op '" + id +
+                        "' requires a CPU device for execution but none is registered");
+                }
             } else {
-                if (!rc.cpuDevice) {
+                // Region boundary (import/export).  Lives on the all-FPGA body's
+                // queue when there is one (carried-buffer alias), else the CPU.
+                if (bodyFpgaDevice) {
+                    rc.nodeDevice[id] = *bodyFpgaDevice;
+                } else if (rc.cpuDevice) {
+                    rc.nodeDevice[id] = rc.cpuDevice->id();
+                } else {
                     throw std::runtime_error(
                         "GraphCompiler: boundary op '" + id +
                         "' requires a CPU device but none is registered");
                 }
-                rc.nodeDevice[id] = rc.cpuDevice->id();
             }
         }
     }
@@ -2518,9 +3010,36 @@ class RegionCompiler {
                        condIt != rc.conditionalOutputPlacements.end()) {
                 condPlacement = &condIt->second;
             }
-            rc.nodesByDevice[rc.nodeDevice.at(id)].push_back(
-                makeCompiledRegionNode(op, rc.nodeDevice.at(id),
-                                       loopPlacement, condPlacement));
+            const std::string& primary = rc.nodeDevice.at(id);
+            auto splitIt = rc.splitLoopDevices.find(id);
+            if (splitIt != rc.splitLoopDevices.end()) {
+                // Replicate the control node onto every participating queue.
+                // The primary device carries the parent-facing output
+                // publications; the replicas are pure LOOP-body drivers.
+                auto bcastIt = rc.splitLoopBroadcast.find(id);
+                for (const std::string& dev : splitIt->second) {
+                    const bool isPrimary = (dev == primary);
+                    CompiledNode node = makeCompiledRegionNode(
+                        op, dev, isPrimary ? loopPlacement : nullptr,
+                        isPrimary ? condPlacement : nullptr);
+                    // Data-dependent split: wire the broadcast roles/slots.  The
+                    // CPU replica is the Authority; the FPGA replica the Follower.
+                    if (bcastIt != rc.splitLoopBroadcast.end()) {
+                        if (auto* loopN = std::get_if<CompiledLoopNode>(&node)) {
+                            loopN->conditionBroadcastSlot = bcastIt->second.decision;
+                            loopN->broadcastReadySlot     = bcastIt->second.ready;
+                            loopN->broadcastAckSlot       = bcastIt->second.ack;
+                            loopN->broadcastRole = isCpuDevice(dev)
+                                ? SplitBroadcastRole::Authority
+                                : SplitBroadcastRole::Follower;
+                        }
+                    }
+                    rc.nodesByDevice[dev].push_back(std::move(node));
+                }
+            } else {
+                rc.nodesByDevice[primary].push_back(
+                    makeCompiledRegionNode(op, primary, loopPlacement, condPlacement));
+            }
         }
     }
 
@@ -2539,7 +3058,51 @@ class RegionCompiler {
             for (const auto& rw : ioMap.rwBuffers()) {
                 routeBufferTransferIfNeeded(rc, op, consumerDevId, rw.in);
             }
+            // A loop placed on a non-CPU (FPGA) queue consumes its carried/
+            // initial inputs through the body's import boundaries rather than
+            // its own IOMap, so enumerate those consumed buffers and bridge any
+            // whose producer lives on another device (the Phase-A entry bridge).
+            if (std::holds_alternative<LoopOp>(op) && consumerDevId != cpuDeviceId(rc)) {
+                for (const ConsumedBufferRef& ref : consumedBufferRefs(op)) {
+                    if (const GraphBuffer* gb = producedBufferObject(rc, id, ref.key)) {
+                        routeBufferTransferIfNeeded(rc, op, consumerDevId, *gb);
+                    }
+                }
+            }
         }
+    }
+
+    std::string cpuDeviceId(const RegionCompilation& rc) const {
+        return rc.cpuDevice ? rc.cpuDevice->id() : std::string{};
+    }
+
+    /// Find the GraphBuffer object a producer op emits under @p key (scanning
+    /// its output and RW-output bindings), so a control-node consumed buffer --
+    /// which carries only a key, not a typed token -- can be routed for
+    /// cross-device transfer.  Returns nullptr if not found.
+    const GraphBuffer* producedBufferObject(const RegionCompilation& rc,
+                                            const std::string& consumerId,
+                                            const std::string& key) const {
+        std::string producerId;
+        auto carriedIt = rc.loopCarriedInitialBufferProducers.find({consumerId, key});
+        if (carriedIt != rc.loopCarriedInitialBufferProducers.end()) {
+            producerId = carriedIt->second;
+        } else if (auto pit = rc.bufferProducerMap.find(key);
+                   pit != rc.bufferProducerMap.end()) {
+            producerId = pit->second;
+        }
+        if (producerId.empty()) return nullptr;
+        auto opIt = rc.opById.find(producerId);
+        if (opIt == rc.opById.end()) return nullptr;
+        const IOMap& io = regionOpIoMap(*opIt->second);
+        for (const auto& [port, gb] : io.outputBuffers()) {
+            (void)port;
+            if (scopedBufferKey(gb.scopeId(), gb.name()) == key) return &gb;
+        }
+        for (const IOMap::RWBinding& rw : io.rwBuffers()) {
+            if (scopedBufferKey(rw.out.scopeId(), rw.out.name()) == key) return &rw.out;
+        }
+        return nullptr;
     }
 
     /// For every cross-device afterOps edge, materialise a barrier-only
@@ -2583,7 +3146,17 @@ class RegionCompiler {
                 for (const auto& ref : consumedBufferRefs(source)) {
                     pushBufferDependency(rc, did, node, seen, ref);
                 }
+                // A data-dependent split Follower receives its loop predicate
+                // through the Authority's broadcast, not a direct scalar read, so
+                // it must not take a (cross-device) dependency on the condition's
+                // producer.  The Authority replica keeps the scalar dependency.
+                bool followerSkipsScalarDeps = false;
+                if (const auto* ln = std::get_if<CompiledLoopNode>(&node)) {
+                    followerSkipsScalarDeps =
+                        ln->broadcastRole == SplitBroadcastRole::Follower;
+                }
                 for (const auto& scalarKey : consumedScalarKeys(source)) {
+                    if (followerSkipsScalarDeps) continue;
                     std::string producerNodeId;
                     auto carriedIt = rc.loopCarriedInitialScalarProducers.find(
                         {compiledNodeId(node), scalarKey});
@@ -2660,10 +3233,25 @@ class RegionCompiler {
             for (const auto& op : ins.trailing) dg.nodes.emplace_back(op);
 
             for (const CompiledNode& node : dg.nodes) {
-                auto childIt = rc.childrenByControlId.find(compiledNodeId(node));
+                const std::string& nodeId = compiledNodeId(node);
+                auto childIt = rc.childrenByControlId.find(nodeId);
                 if (childIt == rc.childrenByControlId.end()) continue;
-                dg.childDGraphs.insert(dg.childDGraphs.end(),
-                                       childIt->second.begin(), childIt->second.end());
+                const bool split = rc.splitLoopDevices.count(nodeId) != 0;
+                for (const DGraphChild& child : childIt->second) {
+                    if (!split) {
+                        dg.childDGraphs.push_back(child);
+                        continue;
+                    }
+                    // Split loop: this device's replica owns only its own body
+                    // slice (the slice whose DGraph targets this device).
+                    DGraphChild local;
+                    local.parentNodeId = child.parentNodeId;
+                    local.role = child.role;
+                    for (const auto& slice : child.dgraphs) {
+                        if (slice && slice->deviceId == did) local.dgraphs.push_back(slice);
+                    }
+                    if (!local.dgraphs.empty()) dg.childDGraphs.push_back(std::move(local));
+                }
             }
 
             result.push_back(std::move(dg));
@@ -2889,6 +3477,9 @@ class RegionCompiler {
     const std::map<std::string, std::shared_ptr<IDevice>>& devices_;
     const GraphCompiler::BridgeFor&                        bridgeFor_;
     std::shared_ptr<std::map<std::string, uint64_t>>       scalarValues_;
+    // Graph-global rendezvous signal-slot allocator (shared across all queues
+    // and nested regions of one compile); the FPGA sentinel slot is reserved.
+    mutable fpga::SignalSlotAllocator                      rendezvousSlots_;
 };
 
 }  // namespace
