@@ -580,9 +580,9 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     KernelDescriptor cpu{"copy", DeviceType::CPU, std::nullopt, cpuIo};
 
     IOMap cpuProduceIo;
-    GraphBuffer toFpga;
+    GraphBuffer toFpga = g.buffer<std::int32_t>("toFpga", 4);
     cpuProduceIo.bindInputBuffer("in", raw)
-                .bindOutputBuffer("out", BufferType::I32, toFpga);
+                .bindExistingOutputBuffer("out", toFpga);
     const std::string cpuProducer = g.addNode(cpu, std::move(cpuProduceIo), "cpu");
 
     IOTypeMap fpgaIo;
@@ -591,17 +591,17 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     fpgaIo.outputBuffers.push_back({"out", BufferType::I32});
 
     IOMap fpgaCopyIo;
-    GraphBuffer fromFpga;
+    GraphBuffer fromFpga = g.buffer<std::int32_t>("fromFpga", 4);
     constexpr std::uint32_t kBytes = 4u * sizeof(std::int32_t);
     fpgaCopyIo.bindScalar("bytes", GraphScalar::constant<std::uint32_t>(kBytes))
               .bindInputBuffer("in", toFpga)
-              .bindOutputBuffer("out", BufferType::I32, fromFpga);
+              .bindExistingOutputBuffer("out", fromFpga);
     g.addNode(fpgaKernel("kA", fpgaIo), std::move(fpgaCopyIo), "fpga:0", {cpuProducer});
 
     IOMap cpuConsumeIo;
-    GraphBuffer finalOut;
+    GraphBuffer finalOut = g.buffer<std::int32_t>("finalOut", 4);
     cpuConsumeIo.bindInputBuffer("in", fromFpga)
-                .bindOutputBuffer("out", BufferType::I32, finalOut);
+                .bindExistingOutputBuffer("out", finalOut);
     g.addNode(cpu, std::move(cpuConsumeIo), "cpu");
 
     const std::vector<std::int32_t> input = {10, 20, 30, 40};
@@ -1112,31 +1112,31 @@ TEST_F(FpgaDeviceFixture, UnboundInputScalarIsRejected) {
     EXPECT_THROW(g.compile(), std::runtime_error);
 }
 
-TEST_F(FpgaDeviceFixture, OutputScalarPortsAreRejectedInPhase1) {
-    // The compiler rejects output scalar ports on non-CPU kernels at the
-    // front end with "output scalar ports are currently supported only
-    // on CPU kernels".  FpgaDevice's own rejection in compilePlan
-    // provides defense in depth for direct DGraph construction; we
-    // verify both layers complain here.
+TEST_F(FpgaDeviceFixture, OutputScalarPortsEmitScalarRead) {
+    // FPGA output scalar ports are captured by a trailing SCALAR_READ so RP1
+    // can feed the value into signal-slot based predicates.
     IOTypeMap iot;
     iot.outputScalars.push_back({"result", ScalarType::U32});
 
     auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
-    Graph g = Graph::withDefaults();
-    g.registerDevice(dev);
-    g.addNode(fpgaKernel("kA", iot), IOMap{}, "fpga:0");
 
-    EXPECT_THROW(g.compile(), std::runtime_error);
-
-    // Verify the deeper-layer rejection too.
     DGraph dg;
     dg.deviceId = "fpga:0";
+    dg.device = dev;
     CompiledKernelNode k;
     k.id        = "kA";
     k.deviceId  = "fpga:0";
     k.kernel    = fpgaKernel("kA", iot);
     dg.nodes.push_back(k);
-    EXPECT_THROW(dev->compilePlan(dg), std::logic_error);
+
+    auto plan = dev->compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    ASSERT_NO_THROW(plan->launch());
+    ASSERT_NO_THROW(plan->wait());
+
+    EXPECT_EQ(ddr_.nodes()[0].opcode, RP1_OP_KERNEL_DISPATCH);
+    EXPECT_EQ(ddr_.nodes()[1].opcode, RP1_OP_SCALAR_READ);
+    EXPECT_EQ(ddr_.nodes()[1].payload.scalar_read.source_addr, kKernelA_R5 + 0x10u);
 }
 
 TEST_F(FpgaDeviceFixture, SentinelSlotAndValueAreCustomisable) {
@@ -1633,23 +1633,20 @@ TEST(FpgaControlExecution, ConditionalGatesExactlyOneBranch) {
     EXPECT_EQ(elseDisp, 1u) << "else branch should run when predicate fails";
 }
 
-// Phase A: a fixed-count FPGA loop whose inputs/outputs cross to another device
-// runs autonomously (one submission) with the loop's I/O bridged at entry/exit:
-// the input (consumer) bridge stages data before the image, the output
-// (producer) bridge drains it after, and the body iterates N times in between.
-TEST(FpgaControlExecution, LoopWithBoundaryBridgesRunsInputThenImageThenOutput) {
+// The one-path FPGA executor accepts only RP1-executable nodes. Host bridge
+// closures must be moved to the CPU DGraph by the compiler and represented on
+// the FPGA side as SIGNAL/WAIT rendezvous nodes; a hand-built FPGA DGraph that
+// still contains CompiledBridgeOpNode is invalid.
+TEST(FpgaControlExecution, FpgaDGraphRejectsHostBridgeNodes) {
     std::vector<std::byte> backing(kBarSize, std::byte{0});
     DdrView ddr{backing.data()};
     primeAsReady(ddr);
     auto window =
         std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
-    FaithfulRp1 rp1(ddr);
 
     constexpr std::uint32_t kBodyBase = 0x88010000u;
     FpgaDevice dev("fpga:0", window,
                    [](const std::string&) { return FpgaKernelLocation{kBodyBase, 0}; });
-
-    std::vector<std::string> order;
 
     CompiledKernelNode bodyK;
     bodyK.id       = "bk";
@@ -1669,7 +1666,6 @@ TEST(FpgaControlExecution, LoopWithBoundaryBridgesRunsInputThenImageThenOutput) 
     input.deviceId = "fpga:0";
     input.side     = CompiledBridgeOpNode::Side::Consumer;
     input.tryReady = [] { return true; };
-    input.action   = [&order] { order.push_back("input"); };
     dg.nodes.emplace_back(input);
 
     CompiledLoopNode loop;
@@ -1680,29 +1676,13 @@ TEST(FpgaControlExecution, LoopWithBoundaryBridgesRunsInputThenImageThenOutput) 
     loop.dependsOn = {"in_bridge"};
     dg.nodes.emplace_back(loop);
 
-    CompiledBridgeOpNode output;
-    output.id        = "out_bridge";
-    output.deviceId  = "fpga:0";
-    output.side      = CompiledBridgeOpNode::Side::Producer;
-    output.action    = [&order] { order.push_back("output"); };
-    output.dependsOn = {"loop0"};
-    dg.nodes.emplace_back(output);
-
     DGraphChild child;
     child.parentNodeId = "loop0";
     child.role         = DGraphChildRole::LoopBody;
     child.dgraphs.push_back(body);
     dg.childDGraphs.push_back(child);
 
-    auto plan = dev.compilePlan(dg);
-    ASSERT_NE(plan, nullptr);
-    plan->launch();
-    plan->wait();
-
-    ASSERT_EQ(order.size(), 2u);
-    EXPECT_EQ(order[0], "input");   // staged before the loop image
-    EXPECT_EQ(order[1], "output");  // drained after the loop image
-    EXPECT_EQ(rp1.dispatches(kBodyBase), 4u);
+    EXPECT_THROW(dev.compilePlan(dg), std::logic_error);
 }
 
 // Phase B: a kernel declaring an output scalar must, in a control image, get a

@@ -715,6 +715,74 @@ TEST(RegionCompilerTest, CrossDeviceLoopSplitsIntoPerQueueRendezvous) {
     EXPECT_FALSE(shared.empty()) << "FPGA and CPU rendezvous must share slot(s)";
 }
 
+// Top-level CPU<->FPGA transfers are host actions, so the compiler must keep
+// the transfer closure on the CPU DGraph and leave only RP1-executable
+// SIGNAL/WAIT rendezvous nodes on the FPGA DGraph.
+TEST(RegionCompilerTest, TopLevelCpuFpgaBridgeMovesHostActionToCpuDGraph) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
+    graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
+
+    IOTypeMap cpuOutT;
+    cpuOutT.outputBuffers.push_back({"out", BufferType::I32});
+    IOTypeMap fpgaInT;
+    fpgaInT.inputBuffers.push_back({"in", BufferType::I32});
+
+    IOMap cIo;
+    GraphBuffer produced;
+    cIo.bindOutputBuffer("out", BufferType::I32, produced);
+    const std::string cpuProducer =
+        graph.addNode(cpuKernel("produce", cpuOutT), std::move(cIo), "cpu");
+
+    IOMap fIo;
+    fIo.bindInputBuffer("in", produced);
+    const std::string fpgaConsumer = graph.addNode(
+        KernelDescriptor{"consume", DeviceType::FPGA, std::nullopt, fpgaInT},
+        std::move(fIo), "fpga:0");
+
+    InspectionBridge bridge;
+    auto dgraphs = compileForInspection(graph, bridge);
+    const DGraph* cpuDG = findDGraph(dgraphs, "cpu");
+    const DGraph* fpgaDG = findDGraph(dgraphs, "fpga:0");
+    ASSERT_NE(cpuDG, nullptr);
+    ASSERT_NE(fpgaDG, nullptr);
+
+    int cpuBridges = 0, cpuSignals = 0;
+    std::set<std::uint32_t> cpuSlots;
+    for (const CompiledNode& n : cpuDG->nodes) {
+        if (std::holds_alternative<CompiledBridgeOpNode>(n)) ++cpuBridges;
+        if (const auto* s = std::get_if<CompiledSignalNode>(&n)) {
+            ++cpuSignals;
+            cpuSlots.insert(s->slot);
+        }
+    }
+
+    int fpgaBridges = 0, fpgaWaits = 0;
+    std::set<std::uint32_t> fpgaSlots;
+    const CompiledNode* fpgaNode = findCompiledNode(*fpgaDG, fpgaConsumer);
+    ASSERT_NE(fpgaNode, nullptr);
+    EXPECT_TRUE(std::holds_alternative<CompiledKernelNode>(*fpgaNode));
+    for (const CompiledNode& n : fpgaDG->nodes) {
+        if (std::holds_alternative<CompiledBridgeOpNode>(n)) ++fpgaBridges;
+        if (const auto* w = std::get_if<CompiledWaitNode>(&n)) {
+            ++fpgaWaits;
+            fpgaSlots.insert(w->slot);
+            EXPECT_TRUE(dependsOn(*fpgaNode, w->id))
+                << "FPGA consumer should wait for the CPU-owned transfer";
+        }
+    }
+
+    EXPECT_EQ(cpuBridges, 1);
+    EXPECT_EQ(cpuSignals, 1);
+    EXPECT_EQ(fpgaBridges, 0);
+    EXPECT_EQ(fpgaWaits, 1);
+
+    std::vector<std::uint32_t> shared;
+    std::set_intersection(cpuSlots.begin(), cpuSlots.end(), fpgaSlots.begin(), fpgaSlots.end(),
+                          std::back_inserter(shared));
+    EXPECT_FALSE(shared.empty()) << "CPU signal and FPGA wait must share a rendezvous slot";
+}
+
 // Phase F.3b: a *data-dependent* (while) loop whose body spans FPGA + CPU splits
 // into per-queue replicas with broadcast roles: the CPU replica is the Authority
 // (evaluates the host condition and broadcasts its decision) and the FPGA replica
@@ -856,12 +924,17 @@ TEST(RegionCompilerTest, FpgaLoopCarriedBufferWithCpuIoPlacesLoopAndBoundariesOn
     EXPECT_FALSE(bodyBridge) << "an in-body cross-device bridge disqualifies autonomy";
     EXPECT_TRUE(sawStartBoundary);
 
-    // The loop's CPU-side I/O is bridged around the control node, on the FPGA queue.
+    // The loop's CPU-side I/O is ordered around the control node by FPGA
+    // rendezvous nodes; the host bridge actions themselves live on the CPU DGraph.
     int fpgaBridges = 0;
+    int fpgaRendezvous = 0;
     for (const auto& n : fpgaDGraph->nodes) {
         if (std::holds_alternative<CompiledBridgeOpNode>(n)) ++fpgaBridges;
+        if (std::holds_alternative<CompiledSignalNode>(n) ||
+            std::holds_alternative<CompiledWaitNode>(n)) ++fpgaRendezvous;
     }
-    EXPECT_GT(fpgaBridges, 0) << "expected entry/exit bridges around the FPGA loop";
+    EXPECT_EQ(fpgaBridges, 0) << "FPGA DGraph must not own host bridge actions";
+    EXPECT_GT(fpgaRendezvous, 0) << "expected entry/exit rendezvous around the FPGA loop";
 }
 
 TEST(RegionCompilerTest, CompilerBuildsNestedCrossDeviceBridgesInLoopBody) {
