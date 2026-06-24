@@ -182,14 +182,21 @@ def generate_base_pdi_with_aved(config: CommandConfiguration) -> Path:
         with resources.path("slashkit.resources.aved", file_name) as in_path:
             _copy_checked(in_path, target_dir / file_name)
 
-    # Copy RP1 firmware sources into the AVED build tree.  The firmware ships as
-    # bundled package data (slashkit/resources/aved/rp1), so locate it through
-    # importlib.resources like the other AVED resources above rather than a
+    # Copy RP1 firmware sources into the AVED build tree.  The firmware lives in
+    # the repo's linker/resources/aved/rp1 (a sibling of the slashkit package),
+    # not as bundled package data; the static-shell build runs from the source
+    # tree, so locate it relative to the slashkit package root rather than a
     # (non-existent) config attribute.
-    rp1_src_dir = Path(str(resources.files("slashkit.resources.aved").joinpath("rp1")))
+    _pkg_root = Path(__file__).resolve()
+    while _pkg_root.name != "slashkit" and _pkg_root != _pkg_root.parent:
+        _pkg_root = _pkg_root.parent
+    rp1_src_dir = _pkg_root.parent / "resources" / "aved" / "rp1"
     rp1_dest_dir = aved_dir / "fw" / "RP1"
     if rp1_src_dir.is_dir():
         shutil.copytree(rp1_src_dir, rp1_dest_dir, dirs_exist_ok=True)
+    else:
+        logger.warning("RP1 firmware source dir not found at %s; "
+                       "shell will use the prebuilt RP1 image", rp1_src_dir)
 
     logger.info("Running AVED build script in %s", aved_hw_dir)
     subprocess.run(
