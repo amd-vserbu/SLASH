@@ -59,8 +59,15 @@
  * CPU device.
  *
  * The compiler relies on this invariant to:
- *   - host every control-flow op (loop / conditional) on the CPU, since the
- *     CPU device is the only backend that owns control-flow execution today;
+ *   - own control-flow execution as the *fallback*: a loop / conditional runs
+ *     on the CPU only when it is not eligible for autonomous FPGA execution or
+ *     a cross-device split. An all-FPGA loop (fixed-count or data-dependent
+ *     while) or conditional is lowered to run autonomously on the FPGA queue
+ *     (RP1 LOOP/RERUN/COND), and a control op whose body spans FPGA + CPU is
+ *     split into per-queue replicas that rendezvous over signal slots (an FPGA
+ *     Follower driven by a CPU Authority). See assignDevices /
+ *     fpgaAutonomousLoopDevice / fpgaAutonomousConditionalDevice /
+ *     splitLoopParticipants in the compiler;
  *   - route cross-device transfers through a CPU bounce buffer when no
  *     direct `(srcType, dstType)` bridge factory is registered.
  *
