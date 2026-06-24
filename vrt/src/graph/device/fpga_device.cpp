@@ -256,6 +256,13 @@ struct DeferredScalar {
     std::string  diagnostic;         // "<kernelId>.<portName>"
 };
 
+/// Bookkeeping for a PDI_LOAD node whose PDI bytes are staged at launch time.
+struct DeferredPdi {
+    std::size_t  nodeIndex = 0;
+    std::string  imageId;
+    std::string  pdiPath;
+};
+
 const char* deviceTypeName(DeviceType t) {
     switch (t) {
         case DeviceType::CPU:      return "CPU";
@@ -301,34 +308,7 @@ class FpgaDevicePlan : public IDevicePlan {
           sentinelSlot_(sentinelSlot),
           sentinelValue_(sentinelValue),
           timeout_(timeout) {
-        if (dgraphHasControl(dg)) {
-            // Autonomous control flow: lower the loop/conditional into a single
-            // RP1 image (LOOP/COND/RERUN + flattened body).  Cross-device loop
-            // I/O shows up as parent-level bridge ops around the control node;
-            // capture them so launch() feeds inputs before the image and drains
-            // outputs after (the body itself runs end-to-end on RP1).
-            controlMode_ = true;
-            captureControlBridges(dg);
-            image_ = buildControlImage(dg);
-        } else {
-            buildRuntime(dg);
-        }
-    }
-
-    // Collect the cross-device bridge ops that bracket a control image: input
-    // (consumer) bridges stage loop inputs into FPGA memory before submission;
-    // output (producer) bridges read loop results back afterwards.
-    void captureControlBridges(const DGraph& dg) {
-        for (const CompiledNode& node : dg.nodes) {
-            const auto* b = std::get_if<CompiledBridgeOpNode>(&node);
-            if (!b) continue;
-            ControlBridge cb{b->tryReady, b->action};
-            if (b->side == CompiledBridgeOpNode::Side::Consumer) {
-                controlConsumers_.push_back(std::move(cb));
-            } else {
-                controlProducers_.push_back(std::move(cb));
-            }
-        }
+        image_ = dgraphHasControl(dg) ? buildControlImage(dg) : buildMainlineImage(dg);
     }
 
     static bool dgraphHasControl(const DGraph& dg) {
@@ -351,15 +331,11 @@ class FpgaDevicePlan : public IDevicePlan {
         worker_ = std::thread([this] {
             try {
                 lastCq_.clear();
-                if (controlMode_) {
-                    runControl();
-                } else if (runtime_.empty()) {
-                    resolveDeferredScalars();
-                    submitter_->submitAndWait(image_, timeout_);
-                    lastCq_ = submitter_->drainCq();
-                } else {
-                    runScheduled();
-                }
+                resolveDeferredScalars();
+                stageDeferredPdis();
+                submitter_->submitAndWait(image_, timeout_);
+                lastCq_ = submitter_->drainCq();
+                applyImageSideEffects();
             } catch (...) {
                 workerEx_ = std::current_exception();
             }
@@ -375,143 +351,16 @@ class FpgaDevicePlan : public IDevicePlan {
         }
     }
 
-    // Control-flow execution: stage loop inputs (consumer bridges) before the
-    // single autonomous LOOP/COND image, then drain loop outputs (producer
-    // bridges) after it completes.  The loop body itself runs end-to-end on RP1.
-    void runControl() {
-        resolveDeferredScalars();
-        for (ControlBridge& c : controlConsumers_) {
-            const auto deadline = std::chrono::steady_clock::now() + kBridgeWaitTimeout;
-            while (c.tryReady && !c.tryReady()) {
-                if (std::chrono::steady_clock::now() > deadline) {
-                    throw std::runtime_error(
-                        "FpgaDevice: control-flow input bridge timed out waiting for upstream data");
-                }
-                std::this_thread::yield();
-            }
-            if (c.action) c.action();
-        }
-        submitter_->submitAndWait(image_, timeout_);
-        lastCq_ = submitter_->drainCq();
-        for (ControlBridge& p : controlProducers_) {
-            if (p.action) p.action();
-        }
-    }
-
     const std::vector<rp1_cq_entry_t>& lastCq() const noexcept { return lastCq_; }
     std::uint32_t sentinelSlot()  const noexcept { return sentinelSlot_; }
     std::uint32_t sentinelValue() const noexcept { return sentinelValue_; }
     const fpga::Rp1GraphImage& image() const noexcept { return image_; }
 
    private:
-    enum class NodeKind { Kernel, Reprogram, ProducerOp, ConsumerOp };
-
-    struct KernelRuntime {
-        CompiledKernelNode node;
-    };
-
-    struct ReprogramRuntime {
-        CompiledReprogramNode node;
-    };
-
-    struct NodeRuntime {
-        std::string id;
-        NodeKind kind = NodeKind::Kernel;
-        std::size_t initialUnmet = 0;
-        std::vector<std::size_t> successors;
-        KernelRuntime kernel;
-        ReprogramRuntime reprogram;
-        std::function<bool()> tryReady;
-        std::function<void()> action;
-    };
-
-    void buildRuntime(const DGraph& dg) {
-        runtime_.reserve(dg.nodes.size());
-        idToIdx_.reserve(dg.nodes.size());
-
-        for (const CompiledNode& node : dg.nodes) {
-            NodeRuntime rt;
-            std::visit(
-                [&](const auto& concrete) {
-                    using T = std::decay_t<decltype(concrete)>;
-                    rt.id = concrete.id;
-                    if constexpr (std::is_same_v<T, CompiledKernelNode>) {
-                        if (concrete.kernel.type != DeviceType::FPGA) {
-                            throw std::logic_error(
-                                std::string("FpgaDevice: kernel '") +
-                                concrete.kernel.name +
-                                "' has DeviceType::" + deviceTypeName(concrete.kernel.type) +
-                                "; expected FPGA");
-                        }
-                        rt.kind = NodeKind::Kernel;
-                        rt.kernel = KernelRuntime{concrete};
-                    } else if constexpr (std::is_same_v<T, CompiledBridgeOpNode>) {
-                        rt.kind = (concrete.side == CompiledBridgeOpNode::Side::Producer)
-                                      ? NodeKind::ProducerOp
-                                      : NodeKind::ConsumerOp;
-                        rt.tryReady = concrete.tryReady;
-                        rt.action = concrete.action;
-                    } else if constexpr (std::is_same_v<T, CompiledReprogramNode>) {
-                        rt.kind = NodeKind::Reprogram;
-                        rt.reprogram = ReprogramRuntime{concrete};
-                    } else if constexpr (std::is_same_v<T, CompiledBoundaryNode>) {
-                        throw std::logic_error(
-                            std::string("FpgaDevice: graph-region boundaries are not yet "
-                                        "supported, got '") + concrete.id + "'");
-                    } else if constexpr (std::is_same_v<T, CompiledLoopNode>) {
-                        throw std::logic_error(
-                            std::string("FpgaDevice: LOOP nodes are not yet supported, got '") +
-                            concrete.id + "' (will lower to RP1_OP_LOOP in a future phase)");
-                    } else if constexpr (std::is_same_v<T, CompiledConditionalNode>) {
-                        throw std::logic_error(
-                            std::string("FpgaDevice: COND nodes are not yet supported, got '") +
-                            concrete.id + "' (will lower to RP1_OP_COND in a future phase)");
-                    } else if constexpr (std::is_same_v<T, CompiledSignalNode> ||
-                                         std::is_same_v<T, CompiledWaitNode>) {
-                        throw std::logic_error(
-                            std::string("FpgaDevice: rendezvous SIGNAL/WAIT nodes are only "
-                                        "valid inside a control-flow image, got '") +
-                            concrete.id + "'");
-                    } else {
-                        static_assert(sizeof(T) == 0, "Unhandled CompiledNode variant");
-                    }
-                },
-                node);
-            idToIdx_[rt.id] = runtime_.size();
-            runtime_.push_back(std::move(rt));
-        }
-
-        for (std::size_t i = 0; i < dg.nodes.size(); ++i) {
-            for (const std::string& depId : compiledNodeDependsOn(dg.nodes[i])) {
-                auto it = idToIdx_.find(depId);
-                if (it == idToIdx_.end()) continue;
-                runtime_[it->second].successors.push_back(i);
-                ++runtime_[i].initialUnmet;
-            }
-        }
-        validateImageOrdering();
-    }
-
-    void validateImageOrdering() const {
-        std::string active = device_->activeImageId();
-        for (const NodeRuntime& rt : runtime_) {
-            if (rt.kind == NodeKind::Reprogram) {
-                active = rt.reprogram.node.imageId;
-                continue;
-            }
-            if (rt.kind != NodeKind::Kernel || !rt.kernel.node.kernel.image) continue;
-            if (active.empty()) {
-                throw std::runtime_error(
-                    "FpgaDevice: kernel '" + rt.kernel.node.kernel.name +
-                    "' requires image '" + *rt.kernel.node.kernel.image +
-                    "' but the device has no active image; add a reprogram node first");
-            }
-            if (*rt.kernel.node.kernel.image != active) {
-                throw std::runtime_error(
-                    "FpgaDevice: kernel '" + rt.kernel.node.kernel.name +
-                    "' requires image '" + *rt.kernel.node.kernel.image +
-                    "' but active image is '" + active + "'");
-            }
+    void applyImageSideEffects() {
+        if (!device_) return;
+        for (const DeferredPdi& pdi : deferredPdis_) {
+            device_->setActiveImage(pdi.imageId);
         }
     }
 
@@ -543,6 +392,29 @@ class FpgaDevicePlan : public IDevicePlan {
         }
     }
 
+    void stageDeferredPdis() {
+        if (deferredPdis_.empty()) return;
+        std::map<std::string, std::uint64_t> stagedByPath;
+        for (const DeferredPdi& d : deferredPdis_) {
+            const std::string key = d.imageId + "\n" + d.pdiPath;
+            auto it = stagedByPath.find(key);
+            if (it == stagedByPath.end()) {
+                CompiledReprogramNode node;
+                node.imageId = d.imageId;
+                node.pdiPath = d.pdiPath;
+                it = stagedByPath.emplace(key, stagePdi(node)).first;
+            }
+            if (d.nodeIndex >= image_.nodes.size() ||
+                image_.nodes[d.nodeIndex].opcode != RP1_OP_PDI_LOAD) {
+                throw std::logic_error(
+                    "FpgaDevicePlan: deferred PDI fixup points at a non-PDI_LOAD node");
+            }
+            auto& payload = image_.nodes[d.nodeIndex].payload.pdi_load;
+            payload.pdi_addr_lo = static_cast<std::uint32_t>(it->second & 0xFFFFFFFFull);
+            payload.pdi_addr_hi = static_cast<std::uint32_t>((it->second >> 32) & 0xFFFFFFFFull);
+        }
+    }
+
     std::uint64_t scalarBits(const GraphScalar& gs, const std::string& diagnostic) const {
         if (gs.isConstant()) return gs.constantBits();
         if (!scalarValues_) {
@@ -564,7 +436,8 @@ class FpgaDevicePlan : public IDevicePlan {
     }
 
     std::size_t currentBufferSize(const GraphBuffer& buffer) const {
-        return device_->bufferSize(scopedBufferKey(buffer.scopeId(), buffer.name()));
+        const std::size_t live = device_->bufferSize(scopedBufferKey(buffer.scopeId(), buffer.name()));
+        return live != 0 ? live : buffer.sizeBytes();
     }
 
     std::size_t defaultOutputSize(const CompiledKernelNode& node) const {
@@ -623,12 +496,24 @@ class FpgaDevicePlan : public IDevicePlan {
             }
             const std::uint32_t width = scalarWidthInWords(port.type);
             std::uint32_t words[2] = {0u, 0u};
-            writeScalarToArgWords(port.type,
-                                  scalarBits(it->second, node.id + "." + port.name),
-                                  words);
+            if (it->second.isConstant()) {
+                writeScalarToArgWords(port.type,
+                                      scalarBits(it->second, node.id + "." + port.name),
+                                      words);
+            }
             const std::uint32_t base = layout.take(port.name, width);
-            appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, width,
-                                  node.kernel.name, port.name);
+            const std::uint32_t firstValueWord =
+                appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, width,
+                                      node.kernel.name, port.name);
+            if (!it->second.isConstant()) {
+                deferred_.push_back(DeferredScalar{
+                    scopedScalarKey(it->second.scopeId(), it->second.varName()),
+                    it->second.varName(),
+                    it->second.scopeId() == 0,
+                    port.type,
+                    firstValueWord,
+                    node.id + "." + port.name});
+            }
             arg_count += width;
         }
 
@@ -721,199 +606,6 @@ class FpgaDevicePlan : public IDevicePlan {
         return device_->stagePdiFile(node.pdiPath);
     }
 
-    const std::vector<std::string>& segNodeDeps(std::size_t rtIdx) const {
-        const NodeRuntime& rt = runtime_[rtIdx];
-        return (rt.kind == NodeKind::Reprogram) ? rt.reprogram.node.dependsOn
-                                                : rt.kernel.node.dependsOn;
-    }
-
-    // Build one RP1 graph image for a contiguous FPGA segment (kernels +
-    // reprograms, in topological order) plus a trailing sentinel SIGNAL.
-    // Intra-segment dependsOn edges become in-image barriers (bucket 0, one
-    // bit per node); deps outside the segment are already satisfied by a prior
-    // segment or a host bridge, so they carry no barrier. PDI_LOAD and
-    // KERNEL_DISPATCH nodes coexist, so a single submission can reconfigure and
-    // then dispatch — the reprogram-drain ordering becomes an in-image barrier.
-    fpga::Rp1GraphImage buildSegmentImage(const std::vector<std::size_t>& seg) {
-        const std::size_t N = seg.size();
-
-        // Node done-bits occupy bits 0..30 of buckets [0, nodeBuckets); bit 31
-        // of bucket 0 is the sentinel. For N <= 31 this is a single bucket and
-        // no aggregation is needed (bit-identical to the simple case).
-        const std::size_t nodeBuckets =
-            (N + (kKernelBitsPerBucket - 1)) / kKernelBitsPerBucket;
-        if (nodeBuckets >= RP1_MAX_BUCKETS) {
-            throw std::logic_error(
-                "FpgaDevice: FPGA segment has " + std::to_string(N) + " nodes, needing " +
-                std::to_string(nodeBuckets) +
-                " barrier buckets and leaving no room for join/sentinel buckets");
-        }
-
-        auto nodeBucketOf = [](std::size_t p) -> std::uint8_t {
-            return static_cast<std::uint8_t>(p / kKernelBitsPerBucket);
-        };
-        auto nodeBitOf = [](std::size_t p) -> std::uint32_t {
-            return 1u << (p % kKernelBitsPerBucket);
-        };
-
-        std::unordered_map<std::size_t, std::size_t> posOf;
-        for (std::size_t p = 0; p < N; ++p) posOf[seg[p]] = p;
-
-        std::vector<bool> isLeaf(N, true);
-        for (std::size_t p = 0; p < N; ++p) {
-            for (const std::string& depId : segNodeDeps(seg[p])) {
-                auto it = idToIdx_.find(depId);
-                if (it == idToIdx_.end()) continue;
-                auto pit = posOf.find(it->second);
-                if (pit != posOf.end()) isLeaf[pit->second] = false;
-            }
-        }
-
-        fpga::Rp1GraphImage image;
-        std::vector<rp1_node_t> aggregators;
-
-        // A node can only await ONE bucket, so when a node's predecessor
-        // done-bits span multiple buckets we funnel each predecessor bucket
-        // through a NOP aggregator into one shared join bucket. Join bits live
-        // in buckets above the node-done buckets.
-        std::uint8_t  joinBucket = static_cast<std::uint8_t>(nodeBuckets);
-        std::uint32_t joinBit    = 0;
-        auto resolveAwait =
-            [&](const std::map<std::uint8_t, std::uint32_t>& groups)
-            -> std::pair<std::uint8_t, std::uint32_t> {
-            if (groups.empty()) return {std::uint8_t{0}, 0u};
-            if (groups.size() == 1) return {groups.begin()->first, groups.begin()->second};
-
-            const std::uint32_t m = static_cast<std::uint32_t>(groups.size());
-            if (joinBit + m > kKernelBitsPerBucket) { ++joinBucket; joinBit = 0; }
-            if (joinBucket >= RP1_MAX_BUCKETS) {
-                throw std::logic_error(
-                    "FpgaDevice: ran out of barrier buckets for cross-bucket join "
-                    "aggregation in an FPGA segment");
-            }
-            const std::uint8_t  cb   = joinBucket;
-            const std::uint32_t base = joinBit;
-            joinBit += m;
-
-            std::uint32_t consumerMask = 0;
-            std::uint32_t j = 0;
-            for (const auto& [bucket, mask] : groups) {
-                rp1_node_t agg{};
-                agg.opcode               = RP1_OP_NOP;
-                agg.flags                = RP1_FLAG_SILENT;
-                agg.status               = RP1_NODE_PENDING;
-                agg.barrier_await_bucket = bucket;
-                agg.barrier_await_mask   = mask;
-                agg.barrier_set_bucket   = cb;
-                agg.barrier_set_mask     = (1u << (base + j));
-                consumerMask |= (1u << (base + j));
-                ++j;
-                aggregators.push_back(agg);
-            }
-            return {cb, consumerMask};
-        };
-
-        for (std::size_t p = 0; p < N; ++p) {
-            const NodeRuntime& rt = runtime_[seg[p]];
-
-            std::map<std::uint8_t, std::uint32_t> predGroups;
-            for (const std::string& depId : segNodeDeps(seg[p])) {
-                auto it = idToIdx_.find(depId);
-                if (it == idToIdx_.end()) continue;
-                auto pit = posOf.find(it->second);
-                if (pit == posOf.end()) continue;
-                predGroups[nodeBucketOf(pit->second)] |= nodeBitOf(pit->second);
-            }
-            const auto [awaitBucket, awaitMask] = resolveAwait(predGroups);
-
-            rp1_node_t pkt{};
-            pkt.status               = RP1_NODE_PENDING;
-            pkt.barrier_await_bucket = awaitBucket;
-            pkt.barrier_await_mask   = awaitMask;
-            pkt.barrier_set_bucket   = nodeBucketOf(p);
-            pkt.barrier_set_mask     = nodeBitOf(p);
-
-            if (rt.kind == NodeKind::Kernel) {
-                const CompiledKernelNode& k = rt.kernel.node;
-                const FpgaKernelLocation loc = device_->resolveKernelLocation(k.kernel);
-                const std::uint32_t argOffset =
-                    static_cast<std::uint32_t>(image.arg_buf.size()) * sizeof(std::uint32_t);
-                const std::uint32_t argCount = packKernelArgs(image, k);
-
-                pkt.opcode = RP1_OP_KERNEL_DISPATCH;
-                auto& kd = pkt.payload.kernel_dispatch;
-                kd.kernel_base_addr  = loc.r5_base_addr;
-                kd.arg_buffer_offset = argOffset;
-                kd.arg_count         = static_cast<std::uint16_t>(argCount);
-                kd.ctrl_flags        = 0;
-                kd.timeout_cycles    = loc.timeout_cycles;
-                kd.expected_image_id =
-                    k.kernel.image ? device_->imageNumericId(*k.kernel.image) : 0u;
-                dumpKernelArgs(k.kernel.name, kd, image.arg_buf);
-            } else {  // Reprogram
-                const CompiledReprogramNode& r = rt.reprogram.node;
-                const std::uint64_t pdiAddr = stagePdi(r);
-                pkt.opcode = RP1_OP_PDI_LOAD;
-                pkt.flags  = RP1_FLAG_HALT_ON_ERROR;
-                auto& pl = pkt.payload.pdi_load;
-                pl.pdi_addr_lo    = static_cast<std::uint32_t>(pdiAddr & 0xFFFFFFFFull);
-                pl.pdi_addr_hi    = static_cast<std::uint32_t>((pdiAddr >> 32) & 0xFFFFFFFFull);
-                pl.timeout_cycles = r.timeoutCycles;
-                pl.image_id       = device_->imageNumericId(r.imageId);
-            }
-
-            image.nodes.push_back(pkt);
-        }
-
-        // Sentinel awaits every leaf node (aggregated if leaves span buckets).
-        std::map<std::uint8_t, std::uint32_t> leafGroups;
-        for (std::size_t p = 0; p < N; ++p) {
-            if (isLeaf[p]) leafGroups[nodeBucketOf(p)] |= nodeBitOf(p);
-        }
-        const auto [sentBucket, sentMask] = resolveAwait(leafGroups);
-
-        // Aggregators (their bits set work-node done-bits) go after the work
-        // nodes; the trailing sentinel is last. Array order is irrelevant to
-        // the firmware scanner (barriers gate execution), but this keeps it tidy.
-        for (const rp1_node_t& agg : aggregators) image.nodes.push_back(agg);
-
-        rp1_node_t sentinel{};
-        sentinel.opcode = RP1_OP_SIGNAL;
-        sentinel.status = RP1_NODE_PENDING;
-        sentinel.barrier_await_bucket = sentBucket;
-        sentinel.barrier_await_mask   = sentMask;
-        sentinel.barrier_set_bucket   = kSentinelBucket;
-        sentinel.barrier_set_mask     = kSentinelBit;
-        sentinel.payload.signal.target_slot = sentinelSlot_;
-        sentinel.payload.signal.value       = sentinelValue_;
-        sentinel.payload.signal.operation   = RP1_SIGOP_SET;
-        image.nodes.push_back(sentinel);
-        image.clear_signal_slots.push_back(sentinelSlot_);
-
-        if (image.nodes.size() > RP1_MAX_NODES) {
-            throw std::logic_error(
-                "FpgaDevice: FPGA segment image has " +
-                std::to_string(image.nodes.size()) + " nodes, exceeds RP1_MAX_NODES");
-        }
-        return image;
-    }
-
-    // Build, submit, and drain one FPGA segment, then advance the host's
-    // active-image bookkeeping past any reprograms the segment contained.
-    void submitSegment(const std::vector<std::size_t>& seg) {
-        if (seg.empty()) return;
-        fpga::Rp1GraphImage image = buildSegmentImage(seg);
-        submitter_->submitAndWait(image, timeout_);
-        auto cq = submitter_->drainCq();
-        lastCq_.insert(lastCq_.end(), cq.begin(), cq.end());
-        for (std::size_t idx : seg) {
-            const NodeRuntime& rt = runtime_[idx];
-            if (rt.kind == NodeKind::Reprogram) {
-                device_->setActiveImage(rt.reprogram.node.imageId);
-            }
-        }
-    }
-
     // Gather every node a control body owns across all its per-device child
     // DGraphs (the FPGA kernels/reprograms plus the boundary nodes the compiler
     // emits on the CPU DGraph for carried-buffer import/export), ordered so the
@@ -973,7 +665,6 @@ class FpgaDevicePlan : public IDevicePlan {
     std::size_t emitReprogramPacket(fpga::Rp1GraphImage& image, const CompiledReprogramNode& r,
                                     std::uint8_t awBucket, std::uint32_t awMask,
                                     std::uint8_t setBucket, std::uint32_t setMask) {
-        const std::uint64_t pdiAddr = stagePdi(r);
         rp1_node_t pkt{};
         pkt.status               = RP1_NODE_PENDING;
         pkt.opcode               = RP1_OP_PDI_LOAD;
@@ -983,12 +674,193 @@ class FpgaDevicePlan : public IDevicePlan {
         pkt.barrier_set_bucket   = setBucket;
         pkt.barrier_set_mask     = setMask;
         auto& pl = pkt.payload.pdi_load;
-        pl.pdi_addr_lo    = static_cast<std::uint32_t>(pdiAddr & 0xFFFFFFFFull);
-        pl.pdi_addr_hi    = static_cast<std::uint32_t>((pdiAddr >> 32) & 0xFFFFFFFFull);
+        pl.pdi_addr_lo    = 0;
+        pl.pdi_addr_hi    = 0;
         pl.timeout_cycles = r.timeoutCycles;
         pl.image_id       = device_->imageNumericId(r.imageId);
         image.nodes.push_back(pkt);
-        return image.nodes.size() - 1;
+        const std::size_t idx = image.nodes.size() - 1;
+        deferredPdis_.push_back(DeferredPdi{idx, r.imageId, r.pdiPath});
+        return idx;
+    }
+
+    fpga::Rp1GraphImage buildMainlineImage(const DGraph& dg) {
+        if (dg.nodes.empty()) throw std::logic_error("FpgaDevice: empty FPGA DGraph");
+
+        const std::size_t N = dg.nodes.size();
+        fpga::SignalSlotAllocator slotAlloc;
+        slotAlloc.reserve(sentinelSlot_);
+        std::size_t totalWork = N;
+        std::vector<bool> hasOutputScalarReads(N, false);
+        for (std::size_t p = 0; p < N; ++p) {
+            if (const auto* k = std::get_if<CompiledKernelNode>(&dg.nodes[p])) {
+                totalWork += k->kernel.ioType.outputScalars.size();
+                hasOutputScalarReads[p] = !k->kernel.ioType.outputScalars.empty();
+            }
+        }
+        const std::size_t nodeBuckets =
+            (totalWork + (kKernelBitsPerBucket - 1)) / kKernelBitsPerBucket;
+        if (nodeBuckets >= RP1_MAX_BUCKETS) {
+            throw std::logic_error(
+                "FpgaDevice: FPGA image has " + std::to_string(N) + " main-line nodes");
+        }
+
+        auto nodeBucketOf = [](std::size_t p) -> std::uint8_t {
+            return static_cast<std::uint8_t>(p / kKernelBitsPerBucket);
+        };
+        auto nodeBitOf = [](std::size_t p) -> std::uint32_t {
+            return 1u << (p % kKernelBitsPerBucket);
+        };
+
+        std::unordered_map<std::string, std::size_t> posOf;
+        for (std::size_t p = 0; p < N; ++p) posOf[compiledNodeId(dg.nodes[p])] = p;
+        std::size_t nextExtraPos = N;
+
+        std::vector<bool> isLeaf(N, true);
+        std::map<std::uint8_t, std::uint32_t> extraLeafGroups;
+        for (std::size_t p = 0; p < N; ++p) {
+            for (const std::string& depId : compiledNodeDependsOn(dg.nodes[p])) {
+                auto it = posOf.find(depId);
+                if (it != posOf.end()) isLeaf[it->second] = false;
+            }
+        }
+
+        fpga::Rp1GraphImage image;
+        std::vector<rp1_node_t> aggregators;
+        std::uint8_t  joinBucket = static_cast<std::uint8_t>(nodeBuckets);
+        std::uint32_t joinBit = 0;
+        auto resolveAwait =
+            [&](const std::map<std::uint8_t, std::uint32_t>& groups)
+            -> std::pair<std::uint8_t, std::uint32_t> {
+            if (groups.empty()) return {std::uint8_t{0}, 0u};
+            if (groups.size() == 1) return {groups.begin()->first, groups.begin()->second};
+
+            const std::uint32_t m = static_cast<std::uint32_t>(groups.size());
+            if (joinBit + m > kKernelBitsPerBucket) { ++joinBucket; joinBit = 0; }
+            if (joinBucket >= RP1_MAX_BUCKETS) {
+                throw std::logic_error(
+                    "FpgaDevice: ran out of barrier buckets for main-line join aggregation");
+            }
+
+            const std::uint8_t cb = joinBucket;
+            const std::uint32_t base = joinBit;
+            joinBit += m;
+            std::uint32_t mask = 0;
+            std::uint32_t j = 0;
+            for (const auto& [bucket, bits] : groups) {
+                rp1_node_t agg{};
+                agg.opcode = RP1_OP_NOP;
+                agg.flags = RP1_FLAG_SILENT;
+                agg.status = RP1_NODE_PENDING;
+                agg.barrier_await_bucket = bucket;
+                agg.barrier_await_mask = bits;
+                agg.barrier_set_bucket = cb;
+                agg.barrier_set_mask = 1u << (base + j);
+                mask |= 1u << (base + j);
+                aggregators.push_back(agg);
+                ++j;
+            }
+            return {cb, mask};
+        };
+
+        for (std::size_t p = 0; p < N; ++p) {
+            const CompiledNode& n = dg.nodes[p];
+            std::map<std::uint8_t, std::uint32_t> predGroups;
+            for (const std::string& depId : compiledNodeDependsOn(n)) {
+                auto it = posOf.find(depId);
+                if (it != posOf.end()) predGroups[nodeBucketOf(it->second)] |= nodeBitOf(it->second);
+            }
+            const auto [awBucket, awMask] = resolveAwait(predGroups);
+            const std::uint8_t setBucket = nodeBucketOf(p);
+            const std::uint32_t setMask = nodeBitOf(p);
+
+            if (const auto* k = std::get_if<CompiledKernelNode>(&n)) {
+                emitKernelPacket(image, *k, awBucket, awMask, setBucket, setMask);
+                std::uint8_t lastBucket = setBucket;
+                std::uint32_t lastMask = setMask;
+                for (const ScalarPort& sp : k->kernel.ioType.outputScalars) {
+                    const std::size_t rpos = nextExtraPos++;
+                    const std::uint8_t rbucket = nodeBucketOf(rpos);
+                    const std::uint32_t rmask = nodeBitOf(rpos);
+                    const std::uint32_t slot = slotAlloc.alloc();
+                    const FpgaKernelLocation loc = device_->resolveKernelLocation(k->kernel);
+                    const std::uint32_t off = device_->outputScalarRegOffset(k->kernel, sp.name);
+                    rp1_node_t sr{};
+                    sr.opcode = RP1_OP_SCALAR_READ;
+                    sr.status = RP1_NODE_PENDING;
+                    sr.barrier_await_bucket = lastBucket;
+                    sr.barrier_await_mask = lastMask;
+                    sr.barrier_set_bucket = rbucket;
+                    sr.barrier_set_mask = rmask;
+                    sr.payload.scalar_read.source_addr = loc.r5_base_addr + off;
+                    sr.payload.scalar_read.target_slot = slot;
+                    image.nodes.push_back(sr);
+                    auto bindIt = k->ioMap.scalars().find(sp.name);
+                    if (bindIt != k->ioMap.scalars().end()) {
+                        const GraphScalar& gs = bindIt->second;
+                        scalarSlots_[scopedScalarKey(gs.scopeId(), gs.varName())] = slot;
+                    }
+                    extraLeafGroups[rbucket] |= rmask;
+                    lastBucket = rbucket;
+                    lastMask = rmask;
+                }
+            } else if (const auto* r = std::get_if<CompiledReprogramNode>(&n)) {
+                emitReprogramPacket(image, *r, awBucket, awMask, setBucket, setMask);
+            } else if (const auto* sg = std::get_if<CompiledSignalNode>(&n)) {
+                rp1_node_t pkt{};
+                pkt.opcode = RP1_OP_SIGNAL;
+                pkt.status = RP1_NODE_PENDING;
+                pkt.barrier_await_bucket = awBucket;
+                pkt.barrier_await_mask = awMask;
+                pkt.barrier_set_bucket = setBucket;
+                pkt.barrier_set_mask = setMask;
+                pkt.payload.signal.target_slot = sg->slot;
+                pkt.payload.signal.value = sg->value;
+                pkt.payload.signal.operation = sg->operation;
+                image.nodes.push_back(pkt);
+            } else if (const auto* wt = std::get_if<CompiledWaitNode>(&n)) {
+                rp1_node_t pkt{};
+                pkt.opcode = RP1_OP_WAIT;
+                pkt.status = RP1_NODE_PENDING;
+                pkt.barrier_await_bucket = awBucket;
+                pkt.barrier_await_mask = awMask;
+                pkt.barrier_set_bucket = setBucket;
+                pkt.barrier_set_mask = setMask;
+                pkt.payload.wait.condition_signal = wt->slot;
+                pkt.payload.wait.condition_value = wt->value;
+                pkt.payload.wait.condition_op = wt->conditionOp;
+                image.nodes.push_back(pkt);
+            } else {
+                throw std::logic_error(
+                    "FpgaDevice: non-RP1 node '" + compiledNodeId(n) +
+                    "' reached main-line FPGA image lowering");
+            }
+        }
+
+        std::map<std::uint8_t, std::uint32_t> leafGroups = extraLeafGroups;
+        for (std::size_t p = 0; p < N; ++p) {
+            if (isLeaf[p] && !hasOutputScalarReads[p]) leafGroups[nodeBucketOf(p)] |= nodeBitOf(p);
+        }
+        const auto [sentBucket, sentMask] = resolveAwait(leafGroups);
+        for (const rp1_node_t& agg : aggregators) image.nodes.push_back(agg);
+
+        rp1_node_t sentinel{};
+        sentinel.opcode = RP1_OP_SIGNAL;
+        sentinel.status = RP1_NODE_PENDING;
+        sentinel.barrier_await_bucket = sentBucket;
+        sentinel.barrier_await_mask = sentMask;
+        sentinel.barrier_set_bucket = kSentinelBucket;
+        sentinel.barrier_set_mask = kSentinelBit;
+        sentinel.payload.signal.target_slot = sentinelSlot_;
+        sentinel.payload.signal.value = sentinelValue_;
+        sentinel.payload.signal.operation = RP1_SIGOP_SET;
+        image.nodes.push_back(sentinel);
+        image.clear_signal_slots.push_back(sentinelSlot_);
+
+        if (image.nodes.size() > RP1_MAX_NODES) {
+            throw std::logic_error("FpgaDevice: main-line image exceeds RP1_MAX_NODES");
+        }
+        return image;
     }
 
     // Lower a control-flow DGraph (loops/conditionals whose body lives entirely
@@ -1079,12 +951,42 @@ class FpgaDevicePlan : public IDevicePlan {
                 lowerLoop(image, dg, *loop, loopIds, slotAlloc, mainBit, consumedMain,
                           awaitMaskFor, allocMainBit, nextBodyBkt);
             } else if (std::holds_alternative<CompiledBridgeOpNode>(node)) {
-                // Cross-device loop I/O: staged/drained by the host around the
-                // image (captureControlBridges / runControl), not an RP1 node.
-                continue;
+                throw std::logic_error(
+                    "FpgaDevice: host bridge node '" + compiledNodeId(node) +
+                    "' reached the FPGA DGraph; bridge actions must be owned by the CPU DGraph");
             } else if (const auto* cnd = std::get_if<CompiledConditionalNode>(&node)) {
                 lowerConditional(image, dg, *cnd, slotAlloc, mainBit, consumedMain,
                                  awaitMaskFor, allocMainBit, nextBodyBkt);
+            } else if (const auto* sg = std::get_if<CompiledSignalNode>(&node)) {
+                const std::uint32_t aw  = awaitMaskFor(sg->dependsOn);
+                const std::uint32_t bit = allocMainBit();
+                rp1_node_t pkt{};
+                pkt.opcode               = RP1_OP_SIGNAL;
+                pkt.status               = RP1_NODE_PENDING;
+                pkt.barrier_await_bucket = 0;
+                pkt.barrier_await_mask   = aw;
+                pkt.barrier_set_bucket   = 0;
+                pkt.barrier_set_mask     = bit;
+                pkt.payload.signal.target_slot = sg->slot;
+                pkt.payload.signal.value       = sg->value;
+                pkt.payload.signal.operation   = sg->operation;
+                image.nodes.push_back(pkt);
+                mainBit[sg->id] = bit;
+            } else if (const auto* wt = std::get_if<CompiledWaitNode>(&node)) {
+                const std::uint32_t aw  = awaitMaskFor(wt->dependsOn);
+                const std::uint32_t bit = allocMainBit();
+                rp1_node_t pkt{};
+                pkt.opcode               = RP1_OP_WAIT;
+                pkt.status               = RP1_NODE_PENDING;
+                pkt.barrier_await_bucket = 0;
+                pkt.barrier_await_mask   = aw;
+                pkt.barrier_set_bucket   = 0;
+                pkt.barrier_set_mask     = bit;
+                pkt.payload.wait.condition_signal = wt->slot;
+                pkt.payload.wait.condition_value  = wt->value;
+                pkt.payload.wait.condition_op     = wt->conditionOp;
+                image.nodes.push_back(pkt);
+                mainBit[wt->id] = bit;
             } else if (std::holds_alternative<CompiledBoundaryNode>(node)) {
                 throw std::logic_error(
                     "FpgaDevice: top-level region boundary in a control DGraph is "
@@ -1695,121 +1597,11 @@ class FpgaDevicePlan : public IDevicePlan {
         mainBit[cond.id] = condDone;
     }
 
-    // Segment scheduler: accumulate contiguous FPGA work (kernels + reprograms)
-    // into one RP1 submission, cutting only at host cross-device bridges.
-    //
-    // A work node is "scheduled" (its successors released) the instant it joins
-    // the pending segment, because its in-image barrier orders it; a bridge op
-    // is scheduled when its host action runs. Input bridges (consumers) write
-    // FPGA buffers and run before the segment that uses them; output bridges
-    // (producers) read FPGA buffers, so the segment is flushed before they run.
-    void runScheduled() {
-        std::vector<std::size_t> unmet;
-        unmet.reserve(runtime_.size());
-        for (const auto& rt : runtime_) unmet.push_back(rt.initialUnmet);
-
-        std::deque<std::size_t>  readyWork;
-        std::vector<std::size_t> readyProducers;
-        std::vector<std::size_t> pendingConsumers;
-        std::vector<std::size_t> segment;
-
-        auto enqueue = [&](std::size_t idx) {
-            switch (runtime_[idx].kind) {
-                case NodeKind::Kernel:
-                case NodeKind::Reprogram:  readyWork.push_back(idx);       break;
-                case NodeKind::ProducerOp: readyProducers.push_back(idx);  break;
-                case NodeKind::ConsumerOp: pendingConsumers.push_back(idx); break;
-            }
-        };
-        auto schedule = [&](std::size_t idx) {
-            for (std::size_t succ : runtime_[idx].successors) {
-                if (--unmet[succ] == 0) enqueue(succ);
-            }
-        };
-
-        for (std::size_t i = 0; i < runtime_.size(); ++i) {
-            if (unmet[i] == 0) enqueue(i);
-        }
-
-        std::size_t rrCursor = 0;
-        auto idleSince = std::chrono::steady_clock::now();
-        for (;;) {
-            // 1. Absorb all ready work into the current segment.
-            if (!readyWork.empty()) {
-                while (!readyWork.empty()) {
-                    const std::size_t idx = readyWork.front();
-                    readyWork.pop_front();
-                    segment.push_back(idx);
-                    schedule(idx);
-                }
-                idleSince = std::chrono::steady_clock::now();
-                continue;
-            }
-
-            // 2. Run a ready host input bridge (consumer); it gates future work
-            //    and never depends on the unsubmitted segment.
-            bool fired = false;
-            for (std::size_t step = 0; step < pendingConsumers.size(); ++step) {
-                if (rrCursor >= pendingConsumers.size()) rrCursor = 0;
-                const std::size_t idx = pendingConsumers[rrCursor];
-                NodeRuntime& rt = runtime_[idx];
-                if (!rt.tryReady || rt.tryReady()) {
-                    pendingConsumers.erase(pendingConsumers.begin() +
-                                           static_cast<std::ptrdiff_t>(rrCursor));
-                    if (rt.action) rt.action();
-                    schedule(idx);
-                    fired = true;
-                    idleSince = std::chrono::steady_clock::now();
-                    break;
-                }
-                ++rrCursor;
-            }
-            if (fired) continue;
-
-            // 3. Output bridges need the segment's results: flush, then run them.
-            if (!readyProducers.empty()) {
-                submitSegment(segment);
-                segment.clear();
-                for (std::size_t idx : readyProducers) {
-                    NodeRuntime& rt = runtime_[idx];
-                    if (rt.action) rt.action();
-                    schedule(idx);
-                }
-                readyProducers.clear();
-                idleSince = std::chrono::steady_clock::now();
-                continue;
-            }
-
-            // 4. No work, no bridge progress: flush a terminal segment. Flushing
-            //    (rather than waiting) is required to break cross-device cycles
-            //    where a pending consumer transitively needs this segment's output.
-            if (!segment.empty()) {
-                submitSegment(segment);
-                segment.clear();
-                idleSince = std::chrono::steady_clock::now();
-                continue;
-            }
-
-            // 5. Nothing left to run -> done. Otherwise we are blocked waiting
-            //    on a cross-device consumer that is not ready yet.
-            if (pendingConsumers.empty()) break;
-            if (std::chrono::steady_clock::now() - idleSince > kBridgeWaitTimeout) {
-                std::string pending;
-                for (std::size_t idx : pendingConsumers) {
-                    if (!pending.empty()) pending += ", ";
-                    pending += runtime_[idx].id;
-                }
-                throw std::runtime_error(
-                    "FpgaDevice: timed out waiting for bridge consumer(s): " + pending);
-            }
-            std::this_thread::yield();
-        }
-    }
-
     FpgaDevice*                                                device_ = nullptr;
     std::shared_ptr<fpga::Rp1Submitter>                       submitter_;
     fpga::Rp1GraphImage                                        image_;
     std::vector<DeferredScalar>                                deferred_;
+    std::vector<DeferredPdi>                                   deferredPdis_;
     std::shared_ptr<std::map<std::string, std::uint64_t>>      scalarValues_;
     std::uint32_t                                              sentinelSlot_;
     std::uint32_t                                              sentinelValue_;
@@ -1817,18 +1609,6 @@ class FpgaDevicePlan : public IDevicePlan {
     std::thread                                                worker_;
     std::exception_ptr                                         workerEx_;
     std::vector<rp1_cq_entry_t>                                lastCq_;
-    std::vector<NodeRuntime>                                   runtime_;
-    std::unordered_map<std::string, std::size_t>                idToIdx_;
-
-    // Control-flow (loop/conditional) execution state.
-    bool controlMode_ = false;
-    struct ControlBridge {
-        std::function<bool()> tryReady;
-        std::function<void()> action;
-    };
-    std::vector<ControlBridge> controlConsumers_;  // stage loop inputs (pre-image)
-    std::vector<ControlBridge> controlProducers_;  // drain loop outputs (post-image)
-
     // Output scalars captured into RP1 signal slots by SCALAR_READ during
     // control-image lowering, keyed by the bound scalar's scoped name so a
     // downstream condition (Phase F) can locate the slot to evaluate.
@@ -2403,6 +2183,7 @@ std::unique_ptr<IDevicePlan> FpgaDevice::compilePlan(const DGraph& dg) {
     bool hasBridgeOps = false;
     bool hasReprogramOps = false;
     bool hasControlOps = false;
+    bool hasRendezvousOps = false;
 
     for (const CompiledNode& node : dg.nodes) {
         std::visit(
@@ -2431,9 +2212,7 @@ std::unique_ptr<IDevicePlan> FpgaDevice::compilePlan(const DGraph& dg) {
                     hasControlOps = true;
                 } else if constexpr (std::is_same_v<T, CompiledSignalNode> ||
                                      std::is_same_v<T, CompiledWaitNode>) {
-                    throw std::logic_error(
-                        std::string("FpgaDevice: rendezvous SIGNAL/WAIT nodes are only valid "
-                                    "inside a control-flow image, got '") + concrete.id + "'");
+                    hasRendezvousOps = true;
                 } else {
                     static_assert(sizeof(T) == 0, "Unhandled CompiledNode variant");
                 }
@@ -2441,271 +2220,16 @@ std::unique_ptr<IDevicePlan> FpgaDevice::compilePlan(const DGraph& dg) {
             node);
     }
 
-    // Autonomous control flow: a DGraph carrying loop/conditional nodes is
-    // lowered to a single RP1 image (LOOP/COND/RERUN + flattened body) by the
-    // FpgaDevicePlan(DGraph) constructor and submitted in one shot.
-    if (hasControlOps) {
-        return std::make_unique<FpgaDevicePlan>(*this,
-                                                dg,
-                                                dg.scalarValues,
-                                                sentinelSlot_,
-                                                sentinelValue_,
-                                                waitTimeout_);
+    if (dg.nodes.empty()) {
+        throw std::logic_error("FpgaDevice: DGraph has no nodes to compile");
     }
-
-    // Reprogram / bridge graphs, and any kernels-only graph too large for a
-    // single barrier bucket, go through the segment scheduler, which fuses
-    // contiguous FPGA work into whole-DGraph submissions and allocates barrier
-    // bits across multiple buckets (with NOP join aggregators).
-    if (hasBridgeOps || hasReprogramOps || kernels.size() > kKernelBitsPerBucket) {
-        return std::make_unique<FpgaDevicePlan>(*this,
-                                                dg,
-                                                dg.scalarValues,
-                                                sentinelSlot_,
-                                                sentinelValue_,
-                                                waitTimeout_);
-    }
-
-    if (kernels.empty()) {
-        throw std::logic_error("FpgaDevice: DGraph has no kernels to compile");
-    }
-
-    // -------------------------------------------------------------------
-    // Pass 2: allocate barrier bits and compute lookup tables.
-    // -------------------------------------------------------------------
-    std::unordered_map<std::string, std::size_t> idToIdx;
-    idToIdx.reserve(kernels.size());
-    for (std::size_t i = 0; i < kernels.size(); ++i) {
-        idToIdx[kernels[i]->id] = i;
-    }
-
-    std::vector<std::uint32_t> bitMask(kernels.size());
-    for (std::size_t i = 0; i < kernels.size(); ++i) {
-        bitMask[i] = 1u << i;  // bits 0..kKernelBitsPerBucket-1 in bucket 0
-    }
-
-    // Identify "leaf" kernels (nothing within this DGraph depends on them).
-    std::vector<bool> isLeaf(kernels.size(), true);
-    for (std::size_t i = 0; i < kernels.size(); ++i) {
-        for (const std::string& depId : kernels[i]->dependsOn) {
-            auto it = idToIdx.find(depId);
-            if (it != idToIdx.end()) {
-                isLeaf[it->second] = false;
-            }
-            // Cross-DGraph deps are silently ignored in phase 1 (no bridges).
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Pass 3: build the RP1 node array + arg buffer + deferred-scalar list.
-    // -------------------------------------------------------------------
-    fpga::Rp1GraphImage         image;
-    std::vector<DeferredScalar>  deferred;
-
-    image.nodes.reserve(kernels.size() + 1);
-    image.arg_buf.reserve(/*words*/ 0);
-
-    std::uint32_t cursor_words = 0;
-    std::uint32_t leafMask     = 0;
-
-    for (std::size_t i = 0; i < kernels.size(); ++i) {
-        const CompiledKernelNode& k = *kernels[i];
-
-        const FpgaKernelLocation loc = resolveKernelLocation(k.kernel);
-
-        // ---- Pack scalar args in IOTypeMap::inputScalars order. ----
-        // Protocol v2: the arg buffer is an array of (reg_offset, value)
-        // pairs; arg_count counts pairs.  Register offsets come from the
-        // system_map (or a contiguous 0x10 fallback on the mock path).
-        const std::uint32_t this_arg_offset = cursor_words;
-        std::uint32_t this_arg_count = 0;
-        ArgLayout layout(kernelArgOffsets(k.kernel), k.kernel.name);
-
-        const auto& boundScalars = k.ioMap.scalars();
-        for (const ScalarPort& port : k.kernel.ioType.inputScalars) {
-            auto bit = boundScalars.find(port.name);
-            if (bit == boundScalars.end()) {
-                throw std::runtime_error(
-                    "FpgaDevice: kernel '" + k.kernel.name +
-                    "' input scalar port '" + port.name + "' has no IOMap binding");
-            }
-            const GraphScalar& gs    = bit->second;
-            const std::uint32_t width = scalarWidthInWords(port.type);
-            const std::uint32_t base  = layout.take(port.name, width);
-
-            std::uint32_t words[2] = {0u, 0u};
-            if (gs.isConstant()) {
-                writeScalarToArgWords(port.type, gs.constantBits(), words);
-            }
-            const std::uint32_t firstValueWord = appendArgWordsAsPairs(
-                image.arg_buf, cursor_words, base, words, width,
-                k.kernel.name, port.name);
-
-            if (!gs.isConstant()) {
-                DeferredScalar d;
-                d.scopedKey       = scopedScalarKey(gs.scopeId(), gs.varName());
-                d.fallbackKey     = gs.varName();
-                d.hasFallback     = (gs.scopeId() == 0);
-                d.type            = port.type;
-                d.arg_word_offset = firstValueWord;
-                d.diagnostic      = k.id + "." + port.name;
-                deferred.push_back(std::move(d));
-            }
-            this_arg_count += width;
-        }
-
-        if (!k.kernel.ioType.outputScalars.empty()) {
-            throw std::logic_error(
-                "FpgaDevice phase 1: output scalar ports are not yet supported "
-                "(kernel '" + k.kernel.name + "' declares " +
-                std::to_string(k.kernel.ioType.outputScalars.size()) + "); "
-                "RP1_OP_SCALAR_READ lowering lands in a future phase");
-        }
-
-        auto currentSize = [this](const GraphBuffer& buffer) -> std::size_t {
-            return bufferSize(scopedBufferKey(buffer.scopeId(), buffer.name()));
-        };
-        std::size_t defaultBufferSize = 0;
-        for (const BufferPort& port : k.kernel.ioType.inputBuffers) {
-            auto bit = k.ioMap.inputBuffers().find(port.name);
-            if (bit == k.ioMap.inputBuffers().end()) continue;
-            const std::size_t size = currentSize(bit->second);
-            if (size != 0) {
-                defaultBufferSize = size;
-                break;
-            }
-        }
-        if (defaultBufferSize == 0) {
-            for (const RWBufferPort& port : k.kernel.ioType.rwBuffers) {
-                auto bit = std::find_if(k.ioMap.rwBuffers().begin(),
-                                        k.ioMap.rwBuffers().end(),
-                                        [&](const IOMap::RWBinding& binding) {
-                                            return binding.inPort == port.in.name &&
-                                                   binding.outPort == port.out.name;
-                                        });
-                if (bit == k.ioMap.rwBuffers().end()) continue;
-                const std::size_t size = currentSize(bit->in);
-                if (size != 0) {
-                    defaultBufferSize = size;
-                    break;
-                }
-            }
-        }
-        auto appendAddress = [&](const std::string& portName,
-                                 const GraphBuffer& buffer,
-                                 std::size_t sizeBytes) {
-            const std::uint64_t addr = bufferDeviceAddress(buffer, sizeBytes);
-            std::uint32_t words[2] = {0u, 0u};
-            writeU64ToArgWords(addr, words);
-            const std::uint32_t base = layout.take(portName, 2u);
-            appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, 2u,
-                                  k.kernel.name, portName);
-            this_arg_count += 2u;
-        };
-
-        for (const BufferPort& port : k.kernel.ioType.inputBuffers) {
-            auto bit = k.ioMap.inputBuffers().find(port.name);
-            if (bit == k.ioMap.inputBuffers().end()) {
-                throw std::runtime_error(
-                    "FpgaDevice: kernel '" + k.kernel.name +
-                    "' input buffer port '" + port.name + "' has no IOMap binding");
-            }
-            appendAddress(port.name, bit->second, currentSize(bit->second));
-        }
-        for (const BufferPort& port : k.kernel.ioType.outputBuffers) {
-            auto bit = k.ioMap.outputBuffers().find(port.name);
-            if (bit == k.ioMap.outputBuffers().end()) {
-                throw std::runtime_error(
-                    "FpgaDevice: kernel '" + k.kernel.name +
-                    "' output buffer port '" + port.name + "' has no IOMap binding");
-            }
-            appendAddress(port.name, bit->second,
-                          std::max(defaultBufferSize, currentSize(bit->second)));
-        }
-        for (const RWBufferPort& port : k.kernel.ioType.rwBuffers) {
-            auto bit = std::find_if(k.ioMap.rwBuffers().begin(),
-                                    k.ioMap.rwBuffers().end(),
-                                    [&](const IOMap::RWBinding& binding) {
-                                        return binding.inPort == port.in.name &&
-                                               binding.outPort == port.out.name;
-                                    });
-            if (bit == k.ioMap.rwBuffers().end()) {
-                throw std::runtime_error(
-                    "FpgaDevice: kernel '" + k.kernel.name +
-                    "' RW buffer ports '" + port.in.name + "'/'" +
-                    port.out.name + "' have no IOMap binding");
-            }
-            const std::size_t inSize = currentSize(bit->in);
-            appendAddress(port.in.name, bit->in, inSize);
-            appendAddress(port.out.name, bit->out,
-                          std::max(inSize, currentSize(bit->out)));
-        }
-        if (this_arg_count > UINT16_MAX) {
-            throw std::logic_error(
-                "FpgaDevice: kernel '" + k.kernel.name + "' has " +
-                std::to_string(this_arg_count) + " arg pairs, exceeds uint16_t cap");
-        }
-
-        // ---- Compose the KERNEL_DISPATCH packet. ----
-        rp1_node_t packet{};
-        packet.opcode = RP1_OP_KERNEL_DISPATCH;
-        packet.flags  = 0;
-        packet.status = RP1_NODE_PENDING;
-
-        std::uint32_t await_mask = 0;
-        for (const std::string& depId : k.dependsOn) {
-            auto it = idToIdx.find(depId);
-            if (it == idToIdx.end()) continue;  // cross-DGraph; ignored in phase 1
-            await_mask |= bitMask[it->second];
-        }
-        packet.barrier_await_bucket = 0;
-        packet.barrier_await_mask   = await_mask;
-        packet.barrier_set_bucket   = 0;
-        packet.barrier_set_mask     = bitMask[i];
-
-        auto& kd = packet.payload.kernel_dispatch;
-        kd.kernel_base_addr  = loc.r5_base_addr;
-        kd.arg_buffer_offset = this_arg_offset * sizeof(std::uint32_t);
-        kd.arg_count         = static_cast<std::uint16_t>(this_arg_count);
-        kd.ctrl_flags        = 0;
-        kd.timeout_cycles    = loc.timeout_cycles;
-        kd.expected_image_id = k.kernel.image ? imageNumericId(*k.kernel.image) : 0u;
-
-        image.nodes.push_back(packet);
-
-        if (isLeaf[i]) {
-            leafMask |= bitMask[i];
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Pass 4: emit the trailing sentinel SIGNAL.  It awaits every leaf
-    //         kernel's set-bit (OR) and writes (sentinelSlot,
-    //         sentinelValue) so the host can confirm whole-graph
-    //         completion without scanning the CQ.
-    // -------------------------------------------------------------------
-    rp1_node_t sentinel{};
-    sentinel.opcode = RP1_OP_SIGNAL;
-    sentinel.flags  = 0;
-    sentinel.status = RP1_NODE_PENDING;
-    sentinel.barrier_await_bucket = 0;
-    sentinel.barrier_await_mask   = leafMask;
-    sentinel.barrier_set_bucket   = kSentinelBucket;
-    sentinel.barrier_set_mask     = kSentinelBit;
-    sentinel.payload.signal.target_slot = sentinelSlot_;
-    sentinel.payload.signal.value       = sentinelValue_;
-    sentinel.payload.signal.operation   = RP1_SIGOP_SET;
-    image.nodes.push_back(sentinel);
-
-    image.clear_signal_slots.push_back(sentinelSlot_);
-
-    return std::make_unique<FpgaDevicePlan>(submitter_,
-                                            std::move(image),
-                                            std::move(deferred),
+    return std::make_unique<FpgaDevicePlan>(*this,
+                                            dg,
                                             dg.scalarValues,
                                             sentinelSlot_,
                                             sentinelValue_,
                                             waitTimeout_);
+
 }
 
 }  // namespace vrt::graph

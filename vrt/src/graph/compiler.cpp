@@ -2276,7 +2276,7 @@ class RegionCompiler {
         rendezvousSlots_.reserve(RP1_MAX_SIGNALS - 1u);  // FPGA sentinel slot
     }
 
-    std::vector<DGraph> compileRegion(const GraphRegion& region) {
+    std::vector<DGraph> compileRegion(const GraphRegion& region, bool topLevel = true) {
         RegionCompilation rc;
         rc.ops = collectRegionOps(region);
         if (rc.ops.empty()) return {};
@@ -2295,7 +2295,9 @@ class RegionCompiler {
         insertAfterOpsBarriers(rc);
         populateDependsOn(rc);
         splitCrossQueueLoops(rc);
-        return assembleDGraphs(rc);
+        auto dgraphs = assembleDGraphs(rc);
+        if (topLevel) convertTopLevelBridgesToRendezvous(dgraphs);
+        return dgraphs;
     }
 
    private:
@@ -2360,14 +2362,14 @@ class RegionCompiler {
             if (const auto* loop = std::get_if<LoopOp>(&op)) {
                 rc.childrenByControlId[opId].push_back(
                     makeDGraphChild(opId, DGraphChildRole::LoopBody,
-                                    compileRegion(*loop->body)));
+                                    compileRegion(*loop->body, /*topLevel=*/false)));
             } else if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
                 rc.childrenByControlId[opId].push_back(
                     makeDGraphChild(opId, DGraphChildRole::ConditionalThen,
-                                    compileRegion(*cond->thenRegion)));
+                                    compileRegion(*cond->thenRegion, /*topLevel=*/false)));
                 rc.childrenByControlId[opId].push_back(
                     makeDGraphChild(opId, DGraphChildRole::ConditionalElse,
-                                    compileRegion(*cond->elseRegion)));
+                                    compileRegion(*cond->elseRegion, /*topLevel=*/false)));
             }
         }
     }
@@ -2738,6 +2740,11 @@ class RegionCompiler {
         return it != devices_.end() && it->second->type() == DeviceType::CPU;
     }
 
+    bool isFpgaDevice(const std::string& d) const {
+        auto it = devices_.find(d);
+        return it != devices_.end() && it->second->type() == DeviceType::FPGA;
+    }
+
     /// Convert the in-body cross-device bridges of a split loop's body slices
     /// into per-iteration SIGNAL/WAIT rendezvous (the depth-1 handshake: the
     /// producer raises READY then waits DONE+clears; the consumer waits READY+
@@ -2889,6 +2896,154 @@ class RegionCompiler {
                     convertBridgesToRendezvous(rc, child);
                 }
             }
+        }
+    }
+
+    /// Convert top-level FPGA<->CPU bridge closures into CPU-owned transfer
+    /// work plus RP1 SIGNAL/WAIT ordering nodes on the FPGA side.  Unlike the
+    /// split-loop body conversion, this is a one-shot transfer (not repeated
+    /// per iteration), so a single READY signal is enough: the producer side
+    /// raises READY after data is available/staged, and the consumer side waits
+    /// READY before using the data.
+    void convertTopLevelBridgesToRendezvous(std::vector<DGraph>& dgraphs) {
+        struct Half { DGraph* dg; const CompiledBridgeOpNode* node; };
+        std::map<const void*, std::vector<Half>> byOp;
+        for (DGraph& dg : dgraphs) {
+            for (const CompiledNode& n : dg.nodes) {
+                if (const auto* b = std::get_if<CompiledBridgeOpNode>(&n)) {
+                    if (b->op) byOp[b->op.get()].push_back({&dg, b});
+                }
+            }
+        }
+
+        std::map<DGraph*, std::set<std::string>> removeIds;
+        std::map<DGraph*, std::vector<CompiledNode>> appendNodes;
+        std::map<std::string, std::string> depRewrite;
+
+        for (auto& [op, halves] : byOp) {
+            (void)op;
+            if (halves.size() != 2) continue;
+            const CompiledBridgeOpNode* prod =
+                halves[0].node->side == CompiledBridgeOpNode::Side::Producer
+                    ? halves[0].node : halves[1].node;
+            const CompiledBridgeOpNode* cons =
+                halves[0].node->side == CompiledBridgeOpNode::Side::Producer
+                    ? halves[1].node : halves[0].node;
+            DGraph* prodDg = halves[0].node == prod ? halves[0].dg : halves[1].dg;
+            DGraph* consDg = halves[0].node == cons ? halves[0].dg : halves[1].dg;
+            if (prod->side != CompiledBridgeOpNode::Side::Producer ||
+                cons->side != CompiledBridgeOpNode::Side::Consumer) {
+                continue;
+            }
+
+            const bool prodCpu = isCpuDevice(prodDg->deviceId);
+            const bool consCpu = isCpuDevice(consDg->deviceId);
+            const bool prodFpga = isFpgaDevice(prodDg->deviceId);
+            const bool consFpga = isFpgaDevice(consDg->deviceId);
+            if (prodCpu == consCpu || prodFpga == consFpga) {
+                continue;  // only CPU<->FPGA is handled here
+            }
+
+            const std::uint32_t ready = rendezvousSlots_.alloc();
+            const std::string tag = "_top_rdv_" + std::to_string(ready) + "_";
+            auto pAction = prod->action;
+            auto cAction = cons->action;
+            std::function<void()> xferAction = [pAction, cAction]() {
+                if (pAction) pAction();
+                if (cAction) cAction();
+            };
+
+            removeIds[prodDg].insert(prod->id);
+            removeIds[consDg].insert(cons->id);
+
+            if (prodCpu) {
+                // CPU -> FPGA: CPU performs both bridge closures, then signals
+                // READY; FPGA waits READY before the consumer kernel.
+                CompiledBridgeOpNode xfer;
+                xfer.id = tag + "xfer";
+                xfer.deviceId = prodDg->deviceId;
+                xfer.op = prod->op;
+                xfer.action = std::move(xferAction);
+                xfer.side = CompiledBridgeOpNode::Side::Producer;
+                xfer.pairedKernelId = prod->pairedKernelId;
+                xfer.dependsOn = prod->dependsOn;
+
+                CompiledSignalNode readySet;
+                readySet.id = tag + "ready_set";
+                readySet.deviceId = prodDg->deviceId;
+                readySet.dependsOn = {xfer.id};
+                readySet.slot = ready;
+                readySet.value = 1;
+                readySet.operation = RP1_SIGOP_SET;
+
+                CompiledWaitNode waitReady;
+                waitReady.id = tag + "ready_wait";
+                waitReady.deviceId = consDg->deviceId;
+                waitReady.slot = ready;
+                waitReady.value = 1;
+                waitReady.conditionOp = RP1_COP_AND_NZ;
+
+                appendNodes[prodDg].emplace_back(std::move(xfer));
+                appendNodes[prodDg].emplace_back(std::move(readySet));
+                appendNodes[consDg].emplace_back(std::move(waitReady));
+                depRewrite[prod->id] = tag + "ready_set";
+                depRewrite[cons->id] = tag + "ready_wait";
+            } else if (consCpu) {
+                // FPGA -> CPU: FPGA signals READY after its producer; CPU waits
+                // READY, then performs both bridge closures before the consumer.
+                CompiledSignalNode readySet;
+                readySet.id = tag + "ready_set";
+                readySet.deviceId = prodDg->deviceId;
+                readySet.dependsOn = prod->dependsOn;
+                readySet.slot = ready;
+                readySet.value = 1;
+                readySet.operation = RP1_SIGOP_SET;
+
+                CompiledWaitNode waitReady;
+                waitReady.id = tag + "ready_wait";
+                waitReady.deviceId = consDg->deviceId;
+                waitReady.slot = ready;
+                waitReady.value = 1;
+                waitReady.conditionOp = RP1_COP_AND_NZ;
+
+                CompiledBridgeOpNode xfer;
+                xfer.id = tag + "xfer";
+                xfer.deviceId = consDg->deviceId;
+                xfer.op = prod->op;
+                xfer.action = std::move(xferAction);
+                xfer.side = CompiledBridgeOpNode::Side::Producer;
+                xfer.pairedKernelId = cons->pairedKernelId;
+                xfer.dependsOn = {waitReady.id};
+
+                appendNodes[prodDg].emplace_back(std::move(readySet));
+                appendNodes[consDg].emplace_back(std::move(waitReady));
+                appendNodes[consDg].emplace_back(std::move(xfer));
+                depRewrite[prod->id] = tag + "ready_set";
+                depRewrite[cons->id] = tag + "xfer";
+            }
+        }
+
+        for (DGraph& dg : dgraphs) {
+            auto rmIt = removeIds.find(&dg);
+            auto apIt = appendNodes.find(&dg);
+            if (rmIt == removeIds.end() && apIt == appendNodes.end() && depRewrite.empty()) {
+                continue;
+            }
+            std::vector<CompiledNode> kept;
+            kept.reserve(dg.nodes.size() + (apIt == appendNodes.end() ? 0 : apIt->second.size()));
+            for (CompiledNode& n : dg.nodes) {
+                if (rmIt != removeIds.end() && rmIt->second.count(compiledNodeId(n))) continue;
+                auto& deps = mutableCompiledNodeDependsOn(n);
+                for (std::string& dep : deps) {
+                    auto rw = depRewrite.find(dep);
+                    if (rw != depRewrite.end()) dep = rw->second;
+                }
+                kept.push_back(std::move(n));
+            }
+            if (apIt != appendNodes.end()) {
+                for (CompiledNode& n : apIt->second) kept.push_back(std::move(n));
+            }
+            dg.nodes = std::move(kept);
         }
     }
 
