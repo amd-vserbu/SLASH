@@ -120,8 +120,8 @@ class FpgaDevicePlan;
  *
  * Buffer arguments use the RP1-visible DDR window as a staging arena.
  * Kernel arguments are packed as all scalar inputs first, followed by
- * 64-bit DDR addresses for `IOTypeMap::inputBuffers`,
- * `IOTypeMap::outputBuffers`, and then each RW buffer pair's input and
+ * 64-bit DDR addresses for `IOTypeMap::inputs`,
+ * `IOTypeMap::outputs`, and then each RW buffer pair's input and
  * output addresses in declaration order.
  */
 class FpgaDevice : public IDevice {

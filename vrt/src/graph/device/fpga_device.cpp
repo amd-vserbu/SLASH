@@ -441,14 +441,14 @@ class FpgaDevicePlan : public IDevicePlan {
     }
 
     std::size_t defaultOutputSize(const CompiledKernelNode& node) const {
-        for (const auto& port : node.kernel.ioType.inputBuffers) {
-            auto it = node.ioMap.inputBuffers().find(port.name);
-            if (it == node.ioMap.inputBuffers().end()) continue;
+        for (const auto& port : node.kernel.ioType.inputs) {
+            auto it = node.ioMap.inputs().find(port.name);
+            if (it == node.ioMap.inputs().end()) continue;
             const std::size_t size = currentBufferSize(it->second);
             if (size != 0) return size;
         }
-        for (const auto& rw : node.kernel.ioType.rwBuffers) {
-            for (const auto& binding : node.ioMap.rwBuffers()) {
+        for (const auto& rw : node.kernel.ioType.inouts) {
+            for (const auto& binding : node.ioMap.inouts()) {
                 if (binding.inPort == rw.in.name && binding.outPort == rw.out.name) {
                     const std::size_t size = currentBufferSize(binding.in);
                     if (size != 0) return size;
@@ -483,13 +483,12 @@ class FpgaDevicePlan : public IDevicePlan {
 
         ArgLayout layout(device_->kernelArgOffsets(node.kernel), node.kernel.name);
 
-        const auto& boundScalars = node.ioMap.scalars();
         for (const ScalarPort& port : node.kernel.ioType.inputScalars) {
             // A loop-carried scalar input is fed each iteration by a SCALAR_COPY
             // from its signal slot into this register, not by a static arg.
             if (skipInputScalars.count(port.name)) continue;
-            auto it = boundScalars.find(port.name);
-            if (it == boundScalars.end()) {
+            auto it = node.ioMap.inputScalars().find(port.name);
+            if (it == node.ioMap.inputScalars().end()) {
                 throw std::runtime_error(
                     "FpgaDevice: kernel '" + node.kernel.name +
                     "' input scalar port '" + port.name + "' has no IOMap binding");
@@ -524,9 +523,9 @@ class FpgaDevicePlan : public IDevicePlan {
 
         const std::size_t defaultSize = defaultOutputSize(node);
 
-        for (const BufferPort& port : node.kernel.ioType.inputBuffers) {
-            auto it = node.ioMap.inputBuffers().find(port.name);
-            if (it == node.ioMap.inputBuffers().end()) {
+        for (const BufferPort& port : node.kernel.ioType.inputs) {
+            auto it = node.ioMap.inputs().find(port.name);
+            if (it == node.ioMap.inputs().end()) {
                 throw std::runtime_error(
                     "FpgaDevice: kernel '" + node.kernel.name +
                     "' input buffer port '" + port.name + "' has no IOMap binding");
@@ -535,9 +534,9 @@ class FpgaDevicePlan : public IDevicePlan {
                                 currentBufferSize(it->second), cursor_words, arg_count);
         }
 
-        for (const BufferPort& port : node.kernel.ioType.outputBuffers) {
-            auto it = node.ioMap.outputBuffers().find(port.name);
-            if (it == node.ioMap.outputBuffers().end()) {
+        for (const BufferPort& port : node.kernel.ioType.outputs) {
+            auto it = node.ioMap.outputs().find(port.name);
+            if (it == node.ioMap.outputs().end()) {
                 throw std::runtime_error(
                     "FpgaDevice: kernel '" + node.kernel.name +
                     "' output buffer port '" + port.name + "' has no IOMap binding");
@@ -547,14 +546,14 @@ class FpgaDevicePlan : public IDevicePlan {
                                 std::max(defaultSize, existing), cursor_words, arg_count);
         }
 
-        for (const RWBufferPort& port : node.kernel.ioType.rwBuffers) {
-            auto it = std::find_if(node.ioMap.rwBuffers().begin(),
-                                   node.ioMap.rwBuffers().end(),
-                                   [&](const IOMap::RWBinding& binding) {
+        for (const RWBufferPort& port : node.kernel.ioType.inouts) {
+            auto it = std::find_if(node.ioMap.inouts().begin(),
+                                   node.ioMap.inouts().end(),
+                                   [&](const IOMap::InoutBinding& binding) {
                                        return binding.inPort == port.in.name &&
                                               binding.outPort == port.out.name;
                                    });
-            if (it == node.ioMap.rwBuffers().end()) {
+            if (it == node.ioMap.inouts().end()) {
                 throw std::runtime_error(
                     "FpgaDevice: kernel '" + node.kernel.name +
                     "' RW buffer ports '" + port.in.name + "'/'" +
@@ -795,8 +794,8 @@ class FpgaDevicePlan : public IDevicePlan {
                     sr.payload.scalar_read.source_addr = loc.r5_base_addr + off;
                     sr.payload.scalar_read.target_slot = slot;
                     image.nodes.push_back(sr);
-                    auto bindIt = k->ioMap.scalars().find(sp.name);
-                    if (bindIt != k->ioMap.scalars().end()) {
+                    auto bindIt = k->ioMap.outputScalars().find(sp.name);
+                    if (bindIt != k->ioMap.outputScalars().end()) {
                         const GraphScalar& gs = bindIt->second;
                         scalarSlots_[scopedScalarKey(gs.scopeId(), gs.varName())] = slot;
                     }
@@ -932,8 +931,8 @@ class FpgaDevicePlan : public IDevicePlan {
                     sr.payload.scalar_read.source_addr = loc.r5_base_addr + off;
                     sr.payload.scalar_read.target_slot = slot;
                     image.nodes.push_back(sr);
-                    auto bindIt = k->ioMap.scalars().find(sp.name);
-                    if (bindIt != k->ioMap.scalars().end()) {
+                    auto bindIt = k->ioMap.outputScalars().find(sp.name);
+                    if (bindIt != k->ioMap.outputScalars().end()) {
                         const GraphScalar& gs = bindIt->second;
                         scalarSlots_[scopedScalarKey(gs.scopeId(), gs.varName())] = slot;
                     }
@@ -1132,9 +1131,9 @@ class FpgaDevicePlan : public IDevicePlan {
         for (const CompiledNode* bnp : bodyNodes) {
             const auto* k = std::get_if<CompiledKernelNode>(bnp);
             if (!k) continue;
-            for (const auto& [port, gb] : k->ioMap.inputBuffers())  { (void)port; noteBytes(gb); }
-            for (const auto& [port, gb] : k->ioMap.outputBuffers()) { (void)port; noteBytes(gb); }
-            for (const IOMap::RWBinding& rw : k->ioMap.rwBuffers())  { noteBytes(rw.in); noteBytes(rw.out); }
+            for (const auto& [port, gb] : k->ioMap.inputs())  { (void)port; noteBytes(gb); }
+            for (const auto& [port, gb] : k->ioMap.outputs()) { (void)port; noteBytes(gb); }
+            for (const IOMap::InoutBinding& rw : k->ioMap.inouts())  { noteBytes(rw.in); noteBytes(rw.out); }
         }
 
         // Loop-carried scalars: an import (Start) boundary feeds the parent
@@ -1188,8 +1187,8 @@ class FpgaDevicePlan : public IDevicePlan {
                 std::uint32_t preAw = bodyAwait(k->dependsOn);
                 const FpgaKernelLocation kloc = device_->resolveKernelLocation(k->kernel);
                 for (const ScalarPort& ip : k->kernel.ioType.inputScalars) {
-                    auto bindIt = k->ioMap.scalars().find(ip.name);
-                    if (bindIt == k->ioMap.scalars().end()) continue;
+                    auto bindIt = k->ioMap.inputScalars().find(ip.name);
+                    if (bindIt == k->ioMap.inputScalars().end()) continue;
                     const std::string localKey = scopedScalarKey(
                         bindIt->second.scopeId(), bindIt->second.varName());
                     auto impIt = scalarImport.find(localKey);
@@ -1223,10 +1222,10 @@ class FpgaDevicePlan : public IDevicePlan {
                 for (const ScalarPort& sp : k->kernel.ioType.outputScalars) {
                     const FpgaKernelLocation loc = device_->resolveKernelLocation(k->kernel);
                     const std::uint32_t off  = device_->outputScalarRegOffset(k->kernel, sp.name);
-                    auto bindIt = k->ioMap.scalars().find(sp.name);
+                    auto bindIt = k->ioMap.outputScalars().find(sp.name);
                     std::uint32_t slot;
                     std::string   localKey;
-                    if (bindIt != k->ioMap.scalars().end()) {
+                    if (bindIt != k->ioMap.outputScalars().end()) {
                         localKey = scopedScalarKey(bindIt->second.scopeId(),
                                                    bindIt->second.varName());
                     }
@@ -1797,20 +1796,20 @@ void FpgaDevice::populateBufferRegions(const DGraph& dg) {
         const auto* k = std::get_if<CompiledKernelNode>(&node);
         if (!k) continue;
 
-        for (const BufferPort& port : k->kernel.ioType.inputBuffers) {
-            auto it = k->ioMap.inputBuffers().find(port.name);
-            if (it != k->ioMap.inputBuffers().end()) {
+        for (const BufferPort& port : k->kernel.ioType.inputs) {
+            auto it = k->ioMap.inputs().find(port.name);
+            if (it != k->ioMap.inputs().end()) {
                 record(k->kernel, port.name, it->second);
             }
         }
-        for (const BufferPort& port : k->kernel.ioType.outputBuffers) {
-            auto it = k->ioMap.outputBuffers().find(port.name);
-            if (it != k->ioMap.outputBuffers().end()) {
+        for (const BufferPort& port : k->kernel.ioType.outputs) {
+            auto it = k->ioMap.outputs().find(port.name);
+            if (it != k->ioMap.outputs().end()) {
                 record(k->kernel, port.name, it->second);
             }
         }
-        for (const RWBufferPort& port : k->kernel.ioType.rwBuffers) {
-            for (const IOMap::RWBinding& binding : k->ioMap.rwBuffers()) {
+        for (const RWBufferPort& port : k->kernel.ioType.inouts) {
+            for (const IOMap::InoutBinding& binding : k->ioMap.inouts()) {
                 if (binding.inPort == port.in.name && binding.outPort == port.out.name) {
                     record(k->kernel, port.in.name, binding.in);
                     record(k->kernel, port.out.name, binding.out);
@@ -1872,7 +1871,7 @@ FpgaDevice::descriptorPortToArgName(const KernelDescriptor& kernel) const {
     // We deliberately do NOT trust the canonical IOTypeMap's input/output buffer
     // categories: the system_map marks every HLS m_axi pointer register as
     // write-only (r=0, w=1, because the *host* writes the pointer address), so
-    // ioTypeMapFromFunctionalArgs lumps all buffer pointers into inputBuffers
+    // ioTypeMapFromFunctionalArgs lumps all buffer pointers into inputs
     // regardless of data-flow direction.  A descriptor that splits ports into
     // input/output by intent would then fail to line up per-category.  Instead
     // we use the spec's idx-ordered `args` (the authoritative argument order)
@@ -1902,11 +1901,11 @@ FpgaDevice::descriptorPortToArgName(const KernelDescriptor& kernel) const {
     std::vector<std::string> descBuffers;
     for (const ScalarPort& p : d.inputScalars)  descScalars.push_back(p.name);
     for (const ScalarPort& p : d.outputScalars) descScalars.push_back(p.name);
-    for (const BufferPort& p : d.inputBuffers)  descBuffers.push_back(p.name);
-    for (const BufferPort& p : d.outputBuffers) descBuffers.push_back(p.name);
+    for (const BufferPort& p : d.inputs)  descBuffers.push_back(p.name);
+    for (const BufferPort& p : d.outputs) descBuffers.push_back(p.name);
     // An RW pair collapses onto a single underlying pointer arg: its in-port
     // consumes one buffer slot; its out-port aliases the same arg afterwards.
-    for (const RWBufferPort& p : d.rwBuffers) descBuffers.push_back(p.in.name);
+    for (const RWBufferPort& p : d.inouts) descBuffers.push_back(p.in.name);
 
     for (std::size_t i = 0; i < descScalars.size() && i < specScalars.size(); ++i) {
         out[descScalars[i]] = specScalars[i];
@@ -1914,7 +1913,7 @@ FpgaDevice::descriptorPortToArgName(const KernelDescriptor& kernel) const {
     for (std::size_t i = 0; i < descBuffers.size() && i < specBuffers.size(); ++i) {
         out[descBuffers[i]] = specBuffers[i];
     }
-    for (const RWBufferPort& p : d.rwBuffers) {
+    for (const RWBufferPort& p : d.inouts) {
         auto it = out.find(p.in.name);
         if (it != out.end()) {
             out[p.out.name] = it->second;

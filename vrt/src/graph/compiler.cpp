@@ -68,9 +68,9 @@ struct BridgeIds {
 bool hasDeclaredPorts(const IOTypeMap& ioType) {
     return !ioType.inputScalars.empty() ||
            !ioType.outputScalars.empty() ||
-           !ioType.inputBuffers.empty() ||
-           !ioType.outputBuffers.empty() ||
-           !ioType.rwBuffers.empty();
+           !ioType.inputs.empty() ||
+           !ioType.outputs.empty() ||
+           !ioType.inouts.empty();
 }
 
 const char* scalarTypeName(ScalarType type) {
@@ -114,7 +114,7 @@ const typename PortVec::value_type* findPortByName(const PortVec& ports,
     return (it == ports.end()) ? nullptr : &*it;
 }
 
-const RWBufferPort* findRWPortByNames(const std::vector<RWBufferPort>& ports,
+const RWBufferPort* findInoutPortByNames(const std::vector<RWBufferPort>& ports,
                                       const std::string& inName,
                                       const std::string& outName) {
     auto it = std::find_if(ports.begin(), ports.end(), [&](const RWBufferPort& port) {
@@ -141,24 +141,24 @@ void validateIoMapScopes(const std::string& opId,
                          const IOMap& ioMap,
                          uint64_t regionScope,
                          const std::set<uint64_t>& allowedScopes) {
-    for (const auto& [port, scalar] : ioMap.scalars()) {
+    for (const auto& [port, scalar] : ioMap.scalarBindings()) {
         (void)port;
         if (scalar.isConstant()) continue;
         requireAllowedScope(opId, "scalar", scalar.varName(), scalar.scopeId(),
                             regionScope, allowedScopes);
     }
 
-    for (const auto& [port, buffer] : ioMap.inputBuffers()) {
+    for (const auto& [port, buffer] : ioMap.inputs()) {
         (void)port;
         requireAllowedScope(opId, "input buffer", buffer.name(), buffer.scopeId(),
                             regionScope, allowedScopes);
     }
-    for (const auto& [port, buffer] : ioMap.outputBuffers()) {
+    for (const auto& [port, buffer] : ioMap.outputs()) {
         (void)port;
         requireAllowedScope(opId, "output buffer", buffer.name(), buffer.scopeId(),
                             regionScope, allowedScopes);
     }
-    for (const auto& rw : ioMap.rwBuffers()) {
+    for (const auto& rw : ioMap.inouts()) {
         requireAllowedScope(opId, "RW input buffer", rw.in.name(), rw.in.scopeId(),
                             regionScope, allowedScopes);
         requireAllowedScope(opId, "RW output buffer", rw.out.name(), rw.out.scopeId(),
@@ -381,7 +381,7 @@ void validateRootScopeScalarReferences(const GraphRegion& rootRegion) {
     };
 
     auto checkIoMap = [&](const IOMap& ioMap) {
-        for (const auto& [portName, scalar] : ioMap.scalars()) {
+        for (const auto& [portName, scalar] : ioMap.scalarBindings()) {
             (void)portName;
             checkScalar(scalar);
         }
@@ -424,19 +424,19 @@ void validateRootScopeBufferReferences(const GraphRegion& rootRegion) {
     const auto& declaredInputs = rootRegion.declaredInputBufferNames();
 
     // Collect every buffer name produced at root scope by any op of the root
-    // region. Kernel ops contribute outputBuffers and rwBuffers.out. Loop and
-    // conditional control ops publish their declared outputBuffers to the
+    // region. Kernel ops contribute outputs and inouts.out. Loop and
+    // conditional control ops publish their declared outputs to the
     // parent scope, so they count as producers too. Boundary ops at root
     // produce only into a child scope, so we skip them here.
     std::set<std::string> producedAtRoot;
     auto recordProduced = [&](const IOMap& ioMap) {
-        for (const auto& [port, buffer] : ioMap.outputBuffers()) {
+        for (const auto& [port, buffer] : ioMap.outputs()) {
             (void)port;
             if (buffer.scopeId() == rootScopeId) {
                 producedAtRoot.insert(buffer.name());
             }
         }
-        for (const auto& rw : ioMap.rwBuffers()) {
+        for (const auto& rw : ioMap.inouts()) {
             if (rw.out.scopeId() == rootScopeId) {
                 producedAtRoot.insert(rw.out.name());
             }
@@ -491,11 +491,11 @@ void validateRootScopeBufferReferences(const GraphRegion& rootRegion) {
     };
 
     auto checkIoMap = [&](const IOMap& ioMap) {
-        for (const auto& [port, buffer] : ioMap.inputBuffers()) {
+        for (const auto& [port, buffer] : ioMap.inputs()) {
             (void)port;
             requireDeclared(buffer);
         }
-        for (const auto& rw : ioMap.rwBuffers()) {
+        for (const auto& rw : ioMap.inouts()) {
             requireDeclared(rw.in);
         }
     };
@@ -596,8 +596,8 @@ void validateDeclaredRegionPorts(const RegionOp& op,
     const IOMap& ioMap = regionOpIoMap(op);
 
     for (const auto& expected : ioType.inputScalars) {
-        auto it = ioMap.scalars().find(expected.name);
-        if (it == ioMap.scalars().end()) {
+        auto it = ioMap.inputScalars().find(expected.name);
+        if (it == ioMap.inputScalars().end()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing mandatory input scalar port '" +
                 expected.name + "'");
@@ -611,8 +611,8 @@ void validateDeclaredRegionPorts(const RegionOp& op,
     }
 
     for (const auto& expected : ioType.outputScalars) {
-        auto it = ioMap.scalars().find(expected.name);
-        if (it == ioMap.scalars().end()) {
+        auto it = ioMap.outputScalars().find(expected.name);
+        if (it == ioMap.outputScalars().end()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing mandatory output scalar port '" +
                 expected.name + "'");
@@ -630,9 +630,9 @@ void validateDeclaredRegionPorts(const RegionOp& op,
         }
     }
 
-    for (const auto& expected : ioType.inputBuffers) {
-        auto it = ioMap.inputBuffers().find(expected.name);
-        if (it == ioMap.inputBuffers().end()) {
+    for (const auto& expected : ioType.inputs) {
+        auto it = ioMap.inputs().find(expected.name);
+        if (it == ioMap.inputs().end()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing mandatory input buffer port '" +
                 expected.name + "'");
@@ -645,9 +645,9 @@ void validateDeclaredRegionPorts(const RegionOp& op,
         }
     }
 
-    for (const auto& expected : ioType.outputBuffers) {
-        auto it = ioMap.outputBuffers().find(expected.name);
-        if (it == ioMap.outputBuffers().end()) {
+    for (const auto& expected : ioType.outputs) {
+        auto it = ioMap.outputs().find(expected.name);
+        if (it == ioMap.outputs().end()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing mandatory output buffer port '" +
                 expected.name + "'");
@@ -660,13 +660,13 @@ void validateDeclaredRegionPorts(const RegionOp& op,
         }
     }
 
-    for (const auto& expected : ioType.rwBuffers) {
-        auto it = std::find_if(ioMap.rwBuffers().begin(), ioMap.rwBuffers().end(),
-                               [&](const IOMap::RWBinding& binding) {
+    for (const auto& expected : ioType.inouts) {
+        auto it = std::find_if(ioMap.inouts().begin(), ioMap.inouts().end(),
+                               [&](const IOMap::InoutBinding& binding) {
                                    return binding.inPort == expected.in.name &&
                                           binding.outPort == expected.out.name;
                                });
-        if (it == ioMap.rwBuffers().end()) {
+        if (it == ioMap.inouts().end()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing mandatory RW buffer ports '" +
                 expected.in.name + "'/'" + expected.out.name + "'");
@@ -685,34 +685,43 @@ void validateDeclaredRegionPorts(const RegionOp& op,
         }
     }
 
-    for (const auto& [name, scalar] : ioMap.scalars()) {
+    for (const auto& [name, scalar] : ioMap.inputScalars()) {
         const auto* input = findPortByName(ioType.inputScalars, name);
-        const auto* output = findPortByName(ioType.outputScalars, name);
-        if (!input && !output) {
+        if (!input) {
             throw std::runtime_error(
-                "GraphCompiler: op '" + opId + "' binds unknown scalar port '" + name + "'");
+                "GraphCompiler: op '" + opId + "' binds unknown input scalar port '" +
+                name + "'");
         }
-        if (input && scalar.type() != input->type) {
+        if (scalar.type() != input->type) {
             throw std::runtime_error(
-                "GraphCompiler: op '" + opId + "' scalar '" + name +
+                "GraphCompiler: op '" + opId + "' input scalar '" + name +
                 "' type mismatch: declared " + scalarTypeName(input->type) +
                 ", bound " + scalarTypeName(scalar.type()));
         }
-        if (output && scalar.type() != output->type) {
+    }
+
+    for (const auto& [name, scalar] : ioMap.outputScalars()) {
+        const auto* output = findPortByName(ioType.outputScalars, name);
+        if (!output) {
             throw std::runtime_error(
-                "GraphCompiler: op '" + opId + "' scalar '" + name +
+                "GraphCompiler: op '" + opId + "' binds unknown output scalar port '" +
+                name + "'");
+        }
+        if (scalar.type() != output->type) {
+            throw std::runtime_error(
+                "GraphCompiler: op '" + opId + "' output scalar '" + name +
                 "' type mismatch: declared " + scalarTypeName(output->type) +
                 ", bound " + scalarTypeName(scalar.type()));
         }
-        if (output && scalar.isConstant()) {
+        if (scalar.isConstant()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' output scalar '" + name +
                 "' must be bound to GraphScalar::globalVar()");
         }
     }
 
-    for (const auto& [name, buffer] : ioMap.inputBuffers()) {
-        const auto* port = findPortByName(ioType.inputBuffers, name);
+    for (const auto& [name, buffer] : ioMap.inputs()) {
+        const auto* port = findPortByName(ioType.inputs, name);
         if (!port) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' binds unknown input buffer port '" +
@@ -726,8 +735,8 @@ void validateDeclaredRegionPorts(const RegionOp& op,
         }
     }
 
-    for (const auto& [name, buffer] : ioMap.outputBuffers()) {
-        const auto* port = findPortByName(ioType.outputBuffers, name);
+    for (const auto& [name, buffer] : ioMap.outputs()) {
+        const auto* port = findPortByName(ioType.outputs, name);
         if (!port) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' binds unknown output buffer port '" +
@@ -741,8 +750,8 @@ void validateDeclaredRegionPorts(const RegionOp& op,
         }
     }
 
-    for (const auto& binding : ioMap.rwBuffers()) {
-        const auto* port = findRWPortByNames(ioType.rwBuffers, binding.inPort, binding.outPort);
+    for (const auto& binding : ioMap.inouts()) {
+        const auto* port = findInoutPortByNames(ioType.inouts, binding.inPort, binding.outPort);
         if (!port) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' binds unknown RW buffer ports '" +
@@ -1029,14 +1038,14 @@ std::map<std::string, std::vector<std::string>> computeSideEffectOrderingEdges(
     // (b) Readers-before-mutator.
     for (const RegionOp* opPtr : ops) {
         const auto* mutator = std::get_if<KernelOp>(opPtr);
-        if (!mutator || mutator->ioMap.rwBuffers().empty()) continue;
-        for (const auto& rw : mutator->ioMap.rwBuffers()) {
+        if (!mutator || mutator->ioMap.inouts().empty()) continue;
+        for (const auto& rw : mutator->ioMap.inouts()) {
             const std::string inKey = scopedBufferKey(rw.in.scopeId(), rw.in.name());
             for (const RegionOp* readerPtr : ops) {
                 const std::string& readerId = regionOpId(*readerPtr);
                 if (readerId == mutator->id) continue;
                 bool readsKey = false;
-                for (const auto& [port, buf] : regionOpIoMap(*readerPtr).inputBuffers()) {
+                for (const auto& [port, buf] : regionOpIoMap(*readerPtr).inputs()) {
                     (void)port;
                     if (scopedBufferKey(buf.scopeId(), buf.name()) == inKey) {
                         readsKey = true;
@@ -1253,14 +1262,14 @@ CompiledLoopKind compiledLoopKind(LoopKind kind) {
     return CompiledLoopKind::FixedCount;
 }
 
-const IOMap::RWBinding* findRWBindingByNames(const IOMap& ioMap,
+const IOMap::InoutBinding* findInoutBindingByNames(const IOMap& ioMap,
                                              const std::string& inName,
                                              const std::string& outName) {
-    auto it = std::find_if(ioMap.rwBuffers().begin(), ioMap.rwBuffers().end(),
-                           [&](const IOMap::RWBinding& binding) {
+    auto it = std::find_if(ioMap.inouts().begin(), ioMap.inouts().end(),
+                           [&](const IOMap::InoutBinding& binding) {
                                return binding.inPort == inName && binding.outPort == outName;
                            });
-    return (it == ioMap.rwBuffers().end()) ? nullptr : &*it;
+    return (it == ioMap.inouts().end()) ? nullptr : &*it;
 }
 
 RegionOutputBindings collectOutputBindings(const IOTypeMap& ioType,
@@ -1268,9 +1277,9 @@ RegionOutputBindings collectOutputBindings(const IOTypeMap& ioType,
                                            const std::string& opId) {
     RegionOutputBindings outputs;
 
-    for (const auto& port : ioType.outputBuffers) {
-        auto bindingIt = ioMap.outputBuffers().find(port.name);
-        if (bindingIt == ioMap.outputBuffers().end()) {
+    for (const auto& port : ioType.outputs) {
+        auto bindingIt = ioMap.outputs().find(port.name);
+        if (bindingIt == ioMap.outputs().end()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing output buffer binding for port '" +
                 port.name + "'");
@@ -1280,9 +1289,9 @@ RegionOutputBindings collectOutputBindings(const IOTypeMap& ioType,
                                 bindingIt->second.scopeId(), port.type});
     }
 
-    for (const auto& port : ioType.rwBuffers) {
-        const IOMap::RWBinding* binding =
-            findRWBindingByNames(ioMap, port.in.name, port.out.name);
+    for (const auto& port : ioType.inouts) {
+        const IOMap::InoutBinding* binding =
+            findInoutBindingByNames(ioMap, port.in.name, port.out.name);
         if (!binding) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing RW output buffer binding for port '" +
@@ -1294,8 +1303,8 @@ RegionOutputBindings collectOutputBindings(const IOTypeMap& ioType,
     }
 
     for (const auto& port : ioType.outputScalars) {
-        auto bindingIt = ioMap.scalars().find(port.name);
-        if (bindingIt == ioMap.scalars().end() || bindingIt->second.isConstant()) {
+        auto bindingIt = ioMap.outputScalars().find(port.name);
+        if (bindingIt == ioMap.outputScalars().end() || bindingIt->second.isConstant()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing output scalar binding for port '" +
                 port.name + "'");
@@ -1407,11 +1416,11 @@ void appendChildEndBoundaryBufferTargets(std::vector<std::string>& keys,
 std::vector<ConsumedBufferRef> consumedBufferRefs(const RegionOp& op) {
     std::vector<ConsumedBufferRef> refs;
     const IOMap& ioMap = regionOpIoMap(op);
-    for (const auto& [port, buffer] : ioMap.inputBuffers()) {
+    for (const auto& [port, buffer] : ioMap.inputs()) {
         (void)port;
         appendConsumedBuffer(refs, buffer, "input buffer");
     }
-    for (const auto& rw : ioMap.rwBuffers()) {
+    for (const auto& rw : ioMap.inouts()) {
         appendConsumedBuffer(refs, rw.in, "RW input buffer");
     }
     if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
@@ -1453,11 +1462,11 @@ std::vector<std::string> consumedBufferKeys(const RegionOp& op) {
 std::vector<std::string> producedBufferKeys(const RegionOp& op) {
     std::vector<std::string> keys;
     const IOMap& ioMap = regionOpIoMap(op);
-    for (const auto& [port, buffer] : ioMap.outputBuffers()) {
+    for (const auto& [port, buffer] : ioMap.outputs()) {
         (void)port;
         keys.push_back(scopedBufferKey(buffer.scopeId(), buffer.name()));
     }
-    for (const auto& rw : ioMap.rwBuffers()) {
+    for (const auto& rw : ioMap.inouts()) {
         keys.push_back(scopedBufferKey(rw.out.scopeId(), rw.out.name()));
     }
     if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
@@ -1482,8 +1491,8 @@ std::vector<ConsumedScalarRef> consumedScalarRefs(const RegionOp& op) {
     const IOTypeMap& ioType = regionOpIoType(op);
     const IOMap& ioMap = regionOpIoMap(op);
     for (const auto& port : ioType.inputScalars) {
-        auto scalarIt = ioMap.scalars().find(port.name);
-        if (scalarIt == ioMap.scalars().end() || scalarIt->second.isConstant()) continue;
+        auto scalarIt = ioMap.inputScalars().find(port.name);
+        if (scalarIt == ioMap.inputScalars().end() || scalarIt->second.isConstant()) continue;
         appendConsumedScalar(refs, scalarIt->second.varName(), scalarIt->second.scopeId(),
                              "input scalar");
     }
@@ -1539,8 +1548,8 @@ std::vector<std::string> producedScalarKeys(const RegionOp& op) {
     const IOTypeMap& ioType = regionOpIoType(op);
     const IOMap& ioMap = regionOpIoMap(op);
     for (const auto& port : ioType.outputScalars) {
-        auto scalarIt = ioMap.scalars().find(port.name);
-        if (scalarIt == ioMap.scalars().end() || scalarIt->second.isConstant()) continue;
+        auto scalarIt = ioMap.outputScalars().find(port.name);
+        if (scalarIt == ioMap.outputScalars().end() || scalarIt->second.isConstant()) continue;
         keys.push_back(scopedScalarKey(scalarIt->second.scopeId(), scalarIt->second.varName()));
     }
     if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
@@ -2384,29 +2393,20 @@ class RegionCompiler {
             const auto* kernel = std::get_if<KernelOp>(&op);
             if (!kernel) continue;
             if (kernel->kernel.type != DeviceType::CPU) {
-                auto isOutputPort = [&](const std::string& port) {
-                    for (const auto& sp : kernel->kernel.ioType.outputScalars) {
-                        if (sp.name == port) return true;
-                    }
-                    return false;
-                };
                 // FPGA kernels may bind *output* scalars: the FpgaDevice captures
                 // them post-run via RP1_OP_SCALAR_READ into a signal slot (the
                 // value a downstream LOOP/COND predicate evaluates).  Non-constant
                 // *input* scalars on a non-CPU kernel are not yet supported (they
                 // would need a host/slot value written into the kernel register).
-                for (const auto& [portName, scalar] : kernel->ioMap.scalars()) {
+                for (const auto& [portName, scalar] : kernel->ioMap.inputScalars()) {
                     if (scalar.isConstant()) continue;
-                    if (kernel->kernel.type == DeviceType::FPGA && isOutputPort(portName)) {
-                        continue;
-                    }
                     throw std::runtime_error(
                         "GraphCompiler: non-constant scalar bindings are currently supported "
                         "only on CPU kernels (FPGA kernels may bind output scalars, captured "
                         "via SCALAR_READ)");
                 }
                 if (kernel->kernel.type != DeviceType::FPGA &&
-                    !kernel->kernel.ioType.outputScalars.empty()) {
+                    !kernel->ioMap.outputScalars().empty()) {
                     throw std::runtime_error(
                         "GraphCompiler: output scalar ports are currently supported only on "
                         "CPU and FPGA kernels");
@@ -2549,8 +2549,8 @@ class RegionCompiler {
                         if (!note(bk->deviceId)) return std::nullopt;
                         any = true;
                         for (const ScalarPort& sp : bk->kernel.ioType.outputScalars) {
-                            auto sb = bk->ioMap.scalars().find(sp.name);
-                            if (sb != bk->ioMap.scalars().end()) {
+                            auto sb = bk->ioMap.outputScalars().find(sp.name);
+                            if (sb != bk->ioMap.outputScalars().end()) {
                                 producedScalars.insert(scopedScalarKey(
                                     sb->second.scopeId(), sb->second.varName()));
                             }
@@ -2652,8 +2652,8 @@ class RegionCompiler {
             if (!k || !opPtr) continue;
             if (resolveKernelDevice(*k, devices_) != *dev) continue;
             for (const ScalarPort& sp : k->kernel.ioType.outputScalars) {
-                auto sb = k->ioMap.scalars().find(sp.name);
-                if (sb != k->ioMap.scalars().end() &&
+                auto sb = k->ioMap.outputScalars().find(sp.name);
+                if (sb != k->ioMap.outputScalars().end() &&
                     scopedScalarKey(sb->second.scopeId(), sb->second.varName()) == predKey) {
                     predProduced = true;
                 }
@@ -3206,11 +3206,11 @@ class RegionCompiler {
             const RegionOp& op = *rc.opById.at(id);
             const std::string& consumerDevId = rc.nodeDevice.at(id);
             const IOMap& ioMap = regionOpIoMap(op);
-            for (const auto& [port, buf] : ioMap.inputBuffers()) {
+            for (const auto& [port, buf] : ioMap.inputs()) {
                 (void)port;
                 routeBufferTransferIfNeeded(rc, op, consumerDevId, buf);
             }
-            for (const auto& rw : ioMap.rwBuffers()) {
+            for (const auto& rw : ioMap.inouts()) {
                 routeBufferTransferIfNeeded(rc, op, consumerDevId, rw.in);
             }
             // A loop placed on a non-CPU (FPGA) queue consumes its carried/
@@ -3250,11 +3250,11 @@ class RegionCompiler {
         auto opIt = rc.opById.find(producerId);
         if (opIt == rc.opById.end()) return nullptr;
         const IOMap& io = regionOpIoMap(*opIt->second);
-        for (const auto& [port, gb] : io.outputBuffers()) {
+        for (const auto& [port, gb] : io.outputs()) {
             (void)port;
             if (scopedBufferKey(gb.scopeId(), gb.name()) == key) return &gb;
         }
-        for (const IOMap::RWBinding& rw : io.rwBuffers()) {
+        for (const IOMap::InoutBinding& rw : io.inouts()) {
             if (scopedBufferKey(rw.out.scopeId(), rw.out.name()) == key) return &rw.out;
         }
         return nullptr;

@@ -31,8 +31,8 @@
  *
  * In normal usage the factory is invoked indirectly through:
  *  - Graph::inputBuffer()         — graph-level inputs (no producer node)
- *  - IOMap::bindOutputBuffer()    — output of a kernel node
- *  - IOMap::bindRWBuffer()        — output side of an in-place RW operation
+ *  - IOMap::bindOutput()    — output of a kernel node
+ *  - IOMap::bindInout()        — output side of an in-place RW operation
  *
  * A default-constructed GraphBuffer is invalid (valid() == false).
  */

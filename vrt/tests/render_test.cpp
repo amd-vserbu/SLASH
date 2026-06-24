@@ -84,8 +84,8 @@ ChainGraph buildChain() {
     c.cpu = std::make_shared<CpuDevice>("cpu");
 
     IOTypeMap io;
-    io.inputBuffers.push_back({"in", BufferType::U8});
-    io.outputBuffers.push_back({"out", BufferType::U8});
+    io.inputs.push_back({"in", BufferType::U8});
+    io.outputs.push_back({"out", BufferType::U8});
 
     c.cpu->registerKernel(std::make_shared<CopyKernel>("kA", io));
     c.cpu->registerKernel(std::make_shared<CopyKernel>("kB", io));
@@ -97,15 +97,15 @@ ChainGraph buildChain() {
     GraphBuffer outA, outB, outC;
 
     IOMap mA;
-    mA.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::U8, outA);
+    mA.bindInput("in", raw).bindOutput("out", BufferType::U8, outA);
     c.nodeA = c.g.addNode(cpuKernel("kA", io), std::move(mA), "cpu");
 
     IOMap mB;
-    mB.bindInputBuffer("in", outA).bindOutputBuffer("out", BufferType::U8, outB);
+    mB.bindInput("in", outA).bindOutput("out", BufferType::U8, outB);
     c.nodeB = c.g.addNode(cpuKernel("kB", io), std::move(mB), "cpu");
 
     IOMap mC;
-    mC.bindInputBuffer("in", outB).bindOutputBuffer("out", BufferType::U8, outC);
+    mC.bindInput("in", outB).bindOutput("out", BufferType::U8, outC);
     c.nodeC = c.g.addNode(cpuKernel("kC", io), std::move(mC), "cpu",
                           /*afterNodes=*/{c.nodeA});  // explicit ordering edge
 
@@ -239,12 +239,12 @@ TEST(RenderDotTest, DGraphRendersAfterCompile) {
     auto c = buildChain();
     std::vector<uint8_t> data(16, 0xAB);
     c.cpu->setInputBuffer("raw", data.data(), data.size());
-    c.g.compile();
-    c.g.run();
+    auto exec = c.g.compile();
+    exec.run();
 
-    ASSERT_FALSE(c.g.dgraphs().empty());
+    ASSERT_FALSE(exec.dgraphs().empty());
     bool sawCpuDg = false;
-    for (const auto& dg : c.g.dgraphs()) {
+    for (const auto& dg : exec.dgraphs()) {
         if (dg.deviceId == "cpu") {
             sawCpuDg = true;
             auto dot = render::renderToDot(dg);
@@ -392,8 +392,8 @@ TEST(RenderDotTest, WriteToDotFileWritesGraphAndDGraph) {
     auto c = buildChain();
     std::vector<uint8_t> data(8, 0xCD);
     c.cpu->setInputBuffer("raw", data.data(), data.size());
-    c.g.compile();
-    c.g.run();
+    auto exec = c.g.compile();
+    exec.run();
 
     char gpath[]  = "/tmp/vrt_render_test_graph_XXXXXX.dot";
     char dgpath[] = "/tmp/vrt_render_test_dgraph_XXXXXX.dot";
@@ -405,8 +405,8 @@ TEST(RenderDotTest, WriteToDotFileWritesGraphAndDGraph) {
     ::close(dgfd);
 
     ASSERT_NO_THROW(render::writeToDotFile(c.g, gpath));
-    ASSERT_FALSE(c.g.dgraphs().empty());
-    ASSERT_NO_THROW(render::writeToDotFile(c.g.dgraphs().front(), dgpath));
+    ASSERT_FALSE(exec.dgraphs().empty());
+    ASSERT_NO_THROW(render::writeToDotFile(exec.dgraphs().front(), dgpath));
 
     auto slurp = [](const std::string& p) {
         std::ifstream     ifs(p);
@@ -417,7 +417,7 @@ TEST(RenderDotTest, WriteToDotFileWritesGraphAndDGraph) {
     auto gtxt  = slurp(gpath);
     auto dgtxt = slurp(dgpath);
     EXPECT_EQ(gtxt,  render::renderToDot(c.g));
-    EXPECT_EQ(dgtxt, render::renderToDot(c.g.dgraphs().front()));
+    EXPECT_EQ(dgtxt, render::renderToDot(exec.dgraphs().front()));
     EXPECT_EQ(gtxt.rfind("digraph", 0), 0u);
     EXPECT_EQ(dgtxt.rfind("digraph", 0), 0u);
 

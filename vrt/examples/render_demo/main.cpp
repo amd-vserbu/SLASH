@@ -223,29 +223,29 @@ class DemoCpuKernel : public CpuKernel {
 
 static IOTypeMap io1in1out() {
     IOTypeMap io;
-    io.inputBuffers.push_back({"in",  BufferType::U8});
-    io.outputBuffers.push_back({"out", BufferType::U8});
+    io.inputs.push_back({"in",  BufferType::U8});
+    io.outputs.push_back({"out", BufferType::U8});
     return io;
 }
 
 static IOTypeMap io1in1stage() {
     IOTypeMap io;
-    io.inputBuffers.push_back({"in",    BufferType::U8});
-    io.outputBuffers.push_back({"stage", BufferType::U8});
+    io.inputs.push_back({"in",    BufferType::U8});
+    io.outputs.push_back({"stage", BufferType::U8});
     return io;
 }
 
 static IOTypeMap io2in1out() {
     IOTypeMap io;
-    io.inputBuffers.push_back({"in_a", BufferType::U8});
-    io.inputBuffers.push_back({"in_b", BufferType::U8});
-    io.outputBuffers.push_back({"out", BufferType::U8});
+    io.inputs.push_back({"in_a", BufferType::U8});
+    io.inputs.push_back({"in_b", BufferType::U8});
+    io.outputs.push_back({"out", BufferType::U8});
     return io;
 }
 
 static IOTypeMap io1out() {
     IOTypeMap io;
-    io.outputBuffers.push_back({"out", BufferType::U8});
+    io.outputs.push_back({"out", BufferType::U8});
     return io;
 }
 
@@ -329,16 +329,16 @@ int main(int argc, char** argv) {
     auto add1 = [&](std::string name, DeviceType dt, const std::string& did,
                     const GraphBuffer& in, GraphBuffer& out,
                     std::vector<std::string> after = {}) {
-        IOMap m; m.bindInputBuffer("in", in).bindOutputBuffer("out", BufferType::U8, out);
+        IOMap m; m.bindInput("in", in).bindOutput("out", BufferType::U8, out);
         return g.addNode(kd(std::move(name), dt), std::move(m), did, std::move(after));
     };
 
     auto add2 = [&](std::string name, DeviceType dt, const std::string& did,
                     const GraphBuffer& inA, const GraphBuffer& inB, GraphBuffer& out) {
         IOMap m;
-        m.bindInputBuffer("in_a", inA)
-         .bindInputBuffer("in_b", inB)
-         .bindOutputBuffer("out", BufferType::U8, out);
+        m.bindInput("in_a", inA)
+         .bindInput("in_b", inB)
+         .bindOutput("out", BufferType::U8, out);
         return g.addNode(kd(std::move(name), dt, io2in1out()), std::move(m), did);
     };
 
@@ -377,23 +377,23 @@ int main(int argc, char** argv) {
 
     IOMap loopPrepareIo;
     GraphBuffer loopCpuStage;
-    loopPrepareIo.bindInputBuffer("in", loopInput)
-                 .bindOutputBuffer("stage", BufferType::U8, loopCpuStage,
+    loopPrepareIo.bindInput("in", loopInput)
+                 .bindOutput("stage", BufferType::U8, loopCpuStage,
                                    loopBody->scopeId());
     loopBody->addKernel(kd("loop_prepare", DeviceType::CPU, io1in1stage()),
                         std::move(loopPrepareIo), "cpu", {loopStart});
 
     IOMap loopRemoteIo;
     GraphBuffer loopRemoteOutput;
-    loopRemoteIo.bindInputBuffer("in", loopCpuStage)
-                .bindOutputBuffer("out", BufferType::U8, loopRemoteOutput,
+    loopRemoteIo.bindInput("in", loopCpuStage)
+                .bindOutput("out", BufferType::U8, loopRemoteOutput,
                                   loopBody->scopeId());
     loopBody->addKernel(kd("loop_refine_remote", DeviceType::MOCK_CPU),
                         std::move(loopRemoteIo), "mock_a");
 
     LoopSpec loopSpec;
     loopSpec.ioType = io1out();
-    loopSpec.ioMap.bindOutputBuffer("out", BufferType::U8, bLoop,
+    loopSpec.ioMap.bindOutput("out", BufferType::U8, bLoop,
                                     g.rootRegion().scopeId());
     loopSpec.tripCount = LoopTripCount::constant<int32_t>(2);
     loopSpec.body = loopBody;
@@ -410,8 +410,8 @@ int main(int argc, char** argv) {
         std::vector<BufferBoundaryMapping>{{bLoop, thenInput}});
     IOMap thenIo;
     GraphBuffer thenOutput;
-    thenIo.bindInputBuffer("in", thenInput)
-          .bindOutputBuffer("out", BufferType::U8, thenOutput,
+    thenIo.bindInput("in", thenInput)
+          .bindOutput("out", BufferType::U8, thenOutput,
                             thenRegion->scopeId());
     thenRegion->addKernel(kd("condition_then_copy", DeviceType::CPU),
                           std::move(thenIo), "cpu", {thenStart});
@@ -422,15 +422,15 @@ int main(int argc, char** argv) {
         std::vector<BufferBoundaryMapping>{{bLoop, elseInput}});
     IOMap elsePrepareIo;
     GraphBuffer elseCpuStage;
-    elsePrepareIo.bindInputBuffer("in", elseInput)
-                 .bindOutputBuffer("stage", BufferType::U8, elseCpuStage,
+    elsePrepareIo.bindInput("in", elseInput)
+                 .bindOutput("stage", BufferType::U8, elseCpuStage,
                                    elseRegion->scopeId());
     elseRegion->addKernel(kd("condition_else_prepare", DeviceType::CPU, io1in1stage()),
                           std::move(elsePrepareIo), "cpu", {elseStart});
     IOMap elseRemoteIo;
     GraphBuffer elseOutput;
-    elseRemoteIo.bindInputBuffer("in", elseCpuStage)
-                .bindOutputBuffer("out", BufferType::U8, elseOutput,
+    elseRemoteIo.bindInput("in", elseCpuStage)
+                .bindOutput("out", BufferType::U8, elseOutput,
                                   elseRegion->scopeId());
     elseRegion->addKernel(kd("condition_else_remote", DeviceType::MOCK_CPU),
                           std::move(elseRemoteIo), "mock_b");
@@ -442,7 +442,7 @@ int main(int argc, char** argv) {
         ConditionOperand::constant<int32_t>(1));
         ConditionalSpec conditionalSpec;
         conditionalSpec.ioType = io1out();
-        conditionalSpec.ioMap.bindOutputBuffer("out", BufferType::U8, bConditional,
+        conditionalSpec.ioMap.bindOutput("out", BufferType::U8, bConditional,
                                        g.rootRegion().scopeId());
         conditionalSpec.condition = std::move(renderCondition);
         conditionalSpec.thenRegion = thenRegion;
@@ -459,7 +459,8 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> data(64, 0xAA);
     cpu->setInputBuffer("raw", data.data(), data.size());
     g.setScalar<int32_t>("render_branch_flag", 1);
-    g.compile(); g.run();
+    auto exec = g.compile();
+    exec.run();
 
     // --- Verify the executed pipeline ---
     //
@@ -542,7 +543,7 @@ int main(int argc, char** argv) {
         }
     };
 
-    for (const auto& dg : g.dgraphs()) {
+    for (const auto& dg : exec.dgraphs()) {
         writeDGraphTree(dg, "dgraph_" + dg.deviceId);
     }
 

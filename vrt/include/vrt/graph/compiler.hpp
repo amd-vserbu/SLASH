@@ -22,8 +22,8 @@
  * @file compiler.hpp
  * @brief GraphCompiler — translates a Graph into a list of per-device DGraphs.
  *
- * GraphCompiler is an internal component; users interact with Graph::run() /
- * Graph::launch() which invoke the compiler transparently.
+ * GraphCompiler is an internal component; users interact with Graph::compile(),
+ * which returns a CompiledGraph executable snapshot.
  *
  * Compilation steps:
  *  1. Topologically sort authored operations within each GraphRegion using
@@ -38,7 +38,7 @@
  *     a `RoutedLeg` (one direct hop or two via the CPU bounce). Each leg's
  *     `BridgeStepPair` is materialised as producer-side and consumer-side
  *     `CompiledBridgeOpNode`s and spliced into the corresponding DGraphs.
- *  4. Return the top-level per-device DGraphs. Graph owns the follow-up
+ *  4. Return the top-level per-device DGraphs. CompiledGraph owns the follow-up
  *     conversion from each top-level DGraph into a backend-specific
  *     IDevicePlan; control-flow execution is implemented by device runtimes.
  */

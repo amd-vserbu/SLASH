@@ -53,7 +53,7 @@ struct BufferPort {
 /**
  * @brief A read-write buffer port pair.
  *
- * From the graph's perspective an RW buffer "consumes" one GraphBuffer token
+ * From the graph's perspective an inout buffer "consumes" one GraphBuffer token
  * and "produces" a new one (even though physically it may be the same
  * allocation).  The in/out port names are distinct so that the IOMap can bind
  * each side independently.
@@ -72,9 +72,9 @@ struct RWBufferPort {
 struct IOTypeMap {
     std::vector<ScalarPort>   inputScalars;   ///< Read-only scalar arguments
     std::vector<ScalarPort>   outputScalars;  ///< Written scalar results
-    std::vector<BufferPort>   inputBuffers;   ///< Read-only buffer arguments
-    std::vector<BufferPort>   outputBuffers;  ///< Write-only buffer results
-    std::vector<RWBufferPort> rwBuffers;      ///< In-place read-write buffers
+    std::vector<BufferPort>   inputs;         ///< Read-only buffer arguments
+    std::vector<BufferPort>   outputs;        ///< Write-only buffer results
+    std::vector<RWBufferPort> inouts;         ///< In-place read-write buffers
 
     // --- Fluent typed builders -------------------------------------------
     //
@@ -96,13 +96,13 @@ struct IOTypeMap {
 
     template <class T>
     IOTypeMap& in(std::string name) {
-        inputBuffers.push_back({std::move(name), typeToBufferType<T>()});
+        inputs.push_back({std::move(name), typeToBufferType<T>()});
         return *this;
     }
 
     template <class T>
     IOTypeMap& out(std::string name) {
-        outputBuffers.push_back({std::move(name), typeToBufferType<T>()});
+        outputs.push_back({std::move(name), typeToBufferType<T>()});
         return *this;
     }
 
@@ -112,8 +112,8 @@ struct IOTypeMap {
      */
     template <class T>
     IOTypeMap& inout(std::string name) {
-        rwBuffers.push_back(RWBufferPort{BufferPort{name, typeToBufferType<T>()},
-                                         BufferPort{name, typeToBufferType<T>()}});
+        inouts.push_back(RWBufferPort{BufferPort{name, typeToBufferType<T>()},
+                                      BufferPort{name, typeToBufferType<T>()}});
         return *this;
     }
 };

@@ -327,8 +327,8 @@ hipGraphNode_t GpuDevicePlan::addKernelNode(const CompiledKernelNode& node,
 
     // Determine the element count from the first input buffer (for grid sizing)
     size_t firstInputElements = 1;
-    if (!node.ioMap.inputBuffers().empty()) {
-        const std::string& firstName = node.ioMap.inputBuffers().begin()->second.name();
+    if (!node.ioMap.inputs().empty()) {
+        const std::string& firstName = node.ioMap.inputs().begin()->second.name();
         auto sit = device_.deviceBufferSizes_.find(firstName);
         if (sit != device_.deviceBufferSizes_.end()) {
             // Default to sizeof(float) elements if unknown
@@ -341,19 +341,19 @@ hipGraphNode_t GpuDevicePlan::addKernelNode(const CompiledKernelNode& node,
     std::map<std::string, void*>    bufferPtrs;
     std::map<std::string, uint64_t> scalarVals;
 
-    for (const auto& [portName, gbuf] : node.ioMap.inputBuffers()) {
+    for (const auto& [portName, gbuf] : node.ioMap.inputs()) {
         auto dit = device_.deviceBuffers_.find(gbuf.name());
         if (dit != device_.deviceBuffers_.end()) {
             bufferPtrs[portName] = dit->second;
         }
     }
-    for (const auto& [portName, gbuf] : node.ioMap.outputBuffers()) {
+    for (const auto& [portName, gbuf] : node.ioMap.outputs()) {
         auto dit = device_.deviceBuffers_.find(gbuf.name());
         if (dit != device_.deviceBuffers_.end()) {
             bufferPtrs[portName] = dit->second;
         }
     }
-    for (const auto& rwb : node.ioMap.rwBuffers()) {
+    for (const auto& rwb : node.ioMap.inouts()) {
         auto inIt = device_.deviceBuffers_.find(rwb.in.name());
         if (inIt != device_.deviceBuffers_.end()) {
             bufferPtrs[rwb.inPort] = inIt->second;
@@ -363,7 +363,7 @@ hipGraphNode_t GpuDevicePlan::addKernelNode(const CompiledKernelNode& node,
             bufferPtrs[rwb.outPort] = outIt->second;
         }
     }
-    for (const auto& [portName, gs] : node.ioMap.scalars()) {
+    for (const auto& [portName, gs] : node.ioMap.inputScalars()) {
         scalarVals[portName] = gs.isConstant() ? gs.constantBits() : 0;
     }
 
@@ -431,7 +431,7 @@ GpuDevicePlan::GpuDevicePlan(GpuDevice& device, const DGraph& dg)
         const CompiledKernelNode& k = std::get<CompiledKernelNode>(node);
         size_t defaultSize = 0;
 
-        for (const auto& [portName, gbuf] : k.ioMap.inputBuffers()) {
+        for (const auto& [portName, gbuf] : k.ioMap.inputs()) {
             auto hostIt = device_.hostBuffers_.find(gbuf.name());
             if (hostIt != device_.hostBuffers_.end()) {
                 size_t sz = hostIt->second.size();
@@ -440,12 +440,12 @@ GpuDevicePlan::GpuDevicePlan(GpuDevice& device, const DGraph& dg)
             }
         }
 
-        for (const auto& [portName, gbuf] : k.ioMap.outputBuffers()) {
+        for (const auto& [portName, gbuf] : k.ioMap.outputs()) {
             size_t sz = (defaultSize > 0) ? defaultSize : 1024;
             device_.ensureDeviceBuffer(gbuf.name(), sz);
         }
 
-        for (const auto& rwb : k.ioMap.rwBuffers()) {
+        for (const auto& rwb : k.ioMap.inouts()) {
             auto hostIt = device_.hostBuffers_.find(rwb.in.name());
             size_t sz = (hostIt != device_.hostBuffers_.end()) ? hostIt->second.size() : defaultSize;
             device_.ensureDeviceBuffer(rwb.in.name(), sz);
@@ -461,10 +461,10 @@ GpuDevicePlan::GpuDevicePlan(GpuDevice& device, const DGraph& dg)
     for (const CompiledNode& node : dg.nodes) {
         if (!std::holds_alternative<CompiledKernelNode>(node)) continue;
         const CompiledKernelNode& k = std::get<CompiledKernelNode>(node);
-        for (const auto& [_, gbuf] : k.ioMap.outputBuffers()) producedHere.insert(gbuf.name());
-        for (const auto& rwb : k.ioMap.rwBuffers())           producedHere.insert(rwb.out.name());
-        for (const auto& [_, gbuf] : k.ioMap.inputBuffers())  consumedHere.insert(gbuf.name());
-        for (const auto& rwb : k.ioMap.rwBuffers())           consumedHere.insert(rwb.in.name());
+        for (const auto& [_, gbuf] : k.ioMap.outputs()) producedHere.insert(gbuf.name());
+        for (const auto& rwb : k.ioMap.inouts())           producedHere.insert(rwb.out.name());
+        for (const auto& [_, gbuf] : k.ioMap.inputs())  consumedHere.insert(gbuf.name());
+        for (const auto& rwb : k.ioMap.inouts())           consumedHere.insert(rwb.in.name());
     }
 
     // --- Build HIP Graph ---
@@ -501,7 +501,7 @@ GpuDevicePlan::GpuDevicePlan(GpuDevice& device, const DGraph& dg)
                     // For each input buffer NOT produced locally and present
                     // in the host store, inject (or reuse) an H2D copy and
                     // chain the kernel after it.
-                    for (const auto& [_, gbuf] : n.ioMap.inputBuffers()) {
+                    for (const auto& [_, gbuf] : n.ioMap.inputs()) {
                         const std::string& bn = gbuf.name();
                         if (producedHere.count(bn)) continue;
                         auto hostIt = device_.hostBuffers_.find(bn);
@@ -540,7 +540,7 @@ GpuDevicePlan::GpuDevicePlan(GpuDevice& device, const DGraph& dg)
         const CompiledKernelNode& k = std::get<CompiledKernelNode>(node);
         auto knIt = hipNodeById_.find(k.id);
         if (knIt == hipNodeById_.end()) continue;
-        for (const auto& [_, gbuf] : k.ioMap.outputBuffers()) {
+        for (const auto& [_, gbuf] : k.ioMap.outputs()) {
             const std::string& bn = gbuf.name();
             if (consumedHere.count(bn)) continue;
             auto sit = device_.deviceBufferSizes_.find(bn);

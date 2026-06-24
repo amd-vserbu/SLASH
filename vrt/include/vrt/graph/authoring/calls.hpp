@@ -145,16 +145,16 @@ struct TripCount {
  * @brief One node authored as a struct literal.
  *
  * Data dependencies are inferred from token use in `.inputs`/`.outputs`/
- * `.scalar*`/`.inout`; `.after` carries only side-effect ordering edges
+ * `.inputScalars`/`.outputScalars`/`.inouts`; `.after` carries only side-effect ordering edges
  * (reprogram gating / drains).
  */
 struct KernelCallSpec {
     KernelHandle           kernel;
-    std::vector<ScalarArg> scalarInputs;
+    std::vector<ScalarArg> inputScalars;
     std::vector<BufferArg> inputs;
     std::vector<BufferArg> outputs;
-    std::vector<ScalarArg> scalarOutputs;
-    std::vector<InoutArg>  inout;
+    std::vector<ScalarArg> outputScalars;
+    std::vector<InoutArg>  inouts;
     std::vector<GraphNode> after;
 };
 

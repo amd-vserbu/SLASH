@@ -337,7 +337,7 @@ int main(int argc, char** argv) try {
         GraphBuffer afterA = loop.buffer<int32_t>("afterA", cli.elementCount);
         loop.addKernelCall({
             .kernel       = fpgaA,
-            .scalarInputs = {{"n", elementCount}},
+            .inputScalars = {{"n", elementCount}},
             .inputs       = {{"in", staged}},
             .outputs      = {{"out", afterA}},
             .after        = {rA},
@@ -348,7 +348,7 @@ int main(int argc, char** argv) try {
         GraphBuffer bumped = loop.buffer<int32_t>("bumped", cli.elementCount);
         loop.addKernelCall({
             .kernel = sparse,
-            .inout  = {{"data", afterA, bumped}},
+            .inouts = {{"data", afterA, bumped}},
         });
 
         // Chain to the prior reprogram: compile() expands `.after = {rA}` to also
@@ -361,7 +361,7 @@ int main(int argc, char** argv) try {
         GraphBuffer afterB = loop.buffer<int32_t>("afterB", cli.elementCount);
         loop.addKernelCall({
             .kernel       = fpgaB,
-            .scalarInputs = {{"n", elementCount}},
+            .inputScalars = {{"n", elementCount}},
             .inputs       = {{"in", bumped}},
             .outputs      = {{"out", afterB}},
             .after        = {rB},
@@ -380,7 +380,7 @@ int main(int argc, char** argv) try {
     graph.addKernelCall({
         .kernel        = parityKernel,
         .inputs        = {{"in", post}},
-        .scalarOutputs = {{"parity", parity}},
+        .outputScalars = {{"parity", parity}},
     });
 
     GraphBuffer out = graph.buffer<int32_t>("out", cli.elementCount);
@@ -414,10 +414,10 @@ int main(int argc, char** argv) try {
     std::cout << "[rp1_graph_vbin_full] compiling graph with "
               << cli.iterations << " loop iteration(s), "
               << cli.elementCount << " element(s)" << std::endl;
-    graph.compile();
+    auto exec = graph.compile();
 
     std::cout << "[rp1_graph_vbin_full] running graph..." << std::endl;
-    graph.run();
+    exec.run();
     std::cout << "[rp1_graph_vbin_full] graph run complete; checking output..." << std::endl;
 
     std::vector<std::int32_t> output(cli.elementCount, 0);

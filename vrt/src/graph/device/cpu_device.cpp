@@ -851,13 +851,13 @@ void CpuDevicePlan::executeKernel(const CompiledKernelNode& node) {
 
     std::map<std::string, CpuBufferView> bufViews;
 
-    for (const auto& [portName, gbuf] : node.ioMap.inputBuffers()) {
+    for (const auto& [portName, gbuf] : node.ioMap.inputs()) {
         CpuBufferView v = resolveBuffer(gbuf);
         v.elementType   = gbuf.type();
         bufViews[portName] = v;
     }
 
-    const auto& inBufs = node.ioMap.inputBuffers();
+    const auto& inBufs = node.ioMap.inputs();
     size_t defaultOutputSize = 0;
     if (!inBufs.empty()) {
         const GraphBuffer& firstBuffer = inBufs.begin()->second;
@@ -868,12 +868,12 @@ void CpuDevicePlan::executeKernel(const CompiledKernelNode& node) {
         }
     }
 
-    for (const auto& [portName, gbuf] : node.ioMap.outputBuffers()) {
+    for (const auto& [portName, gbuf] : node.ioMap.outputs()) {
         auto& storage = ensureBuffer(gbuf, defaultOutputSize);
         bufViews[portName] = CpuBufferView{storage.data(), storage.size(), gbuf.type()};
     }
 
-    for (const auto& rwb : node.ioMap.rwBuffers()) {
+    for (const auto& rwb : node.ioMap.inouts()) {
         bufViews[rwb.inPort] = resolveBuffer(rwb.in);
         const std::string inKey = scopedBufferKey(rwb.in.scopeId(), rwb.in.name());
         const std::string outKey = scopedBufferKey(rwb.out.scopeId(), rwb.out.name());
@@ -888,23 +888,17 @@ void CpuDevicePlan::executeKernel(const CompiledKernelNode& node) {
 
     std::map<std::string, uint64_t> scalars;
     std::map<std::string, uint64_t*> writableScalars;
-    std::set<std::string> outputScalarPorts;
-    for (const auto& port : node.kernel.ioType.outputScalars) {
-        outputScalarPorts.insert(port.name);
+    for (const auto& [portName, gs] : node.ioMap.outputScalars()) {
+        if (gs.isConstant()) {
+            throw std::runtime_error(
+                "CpuDevice: output scalar port '" + portName +
+                "' cannot be bound to a constant");
+        }
+        writableScalars[portName] =
+            &(*scalarValues_)[scopedScalarKey(gs.scopeId(), gs.varName())];
     }
 
-    for (const auto& [portName, gs] : node.ioMap.scalars()) {
-        if (outputScalarPorts.count(portName)) {
-            if (gs.isConstant()) {
-                throw std::runtime_error(
-                    "CpuDevice: output scalar port '" + portName +
-                    "' cannot be bound to a constant");
-            }
-            writableScalars[portName] =
-                &(*scalarValues_)[scopedScalarKey(gs.scopeId(), gs.varName())];
-            continue;
-        }
-
+    for (const auto& [portName, gs] : node.ioMap.inputScalars()) {
         if (gs.isConstant()) {
             scalars[portName] = gs.constantBits();
         } else {

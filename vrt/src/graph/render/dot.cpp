@@ -93,11 +93,11 @@ std::unordered_map<std::string, std::string> buildProducerMap(
     const std::vector<KernelT>& nodes) {
     std::unordered_map<std::string, std::string> producers;
     for (const auto& n : nodes) {
-        for (const auto& [port, buf] : n.ioMap.outputBuffers()) {
+        for (const auto& [port, buf] : n.ioMap.outputs()) {
             (void)port;
             producers[scopedBufferKey(buf.scopeId(), buf.name())] = n.id;
         }
-        for (const auto& rw : n.ioMap.rwBuffers()) {
+        for (const auto& rw : n.ioMap.inouts()) {
             producers[scopedBufferKey(rw.out.scopeId(), rw.out.name())] = n.id;
         }
     }
@@ -116,12 +116,12 @@ struct ConsumedBufferRef {
 template <typename KernelT>
 std::vector<ConsumedBufferRef> consumedBuffers(const KernelT& n) {
     std::vector<ConsumedBufferRef> refs;
-    refs.reserve(n.ioMap.inputBuffers().size() + n.ioMap.rwBuffers().size());
-    for (const auto& [port, buf] : n.ioMap.inputBuffers()) {
+    refs.reserve(n.ioMap.inputs().size() + n.ioMap.inouts().size());
+    for (const auto& [port, buf] : n.ioMap.inputs()) {
         (void)port;
         refs.push_back({scopedBufferKey(buf.scopeId(), buf.name()), buf.name()});
     }
-    for (const auto& rw : n.ioMap.rwBuffers()) {
+    for (const auto& rw : n.ioMap.inouts()) {
         refs.push_back({scopedBufferKey(rw.in.scopeId(), rw.in.name()), rw.in.name()});
     }
     return refs;
@@ -382,12 +382,12 @@ std::string authoredBufferKey(const GraphBuffer& buffer) {
 std::vector<GraphBuffer> authoredConsumedBuffers(const RegionOp& op) {
     const IOMap& ioMap = authoredIoMap(op);
     std::vector<GraphBuffer> buffers;
-    buffers.reserve(ioMap.inputBuffers().size() + ioMap.rwBuffers().size());
-    for (const auto& [port, buffer] : ioMap.inputBuffers()) {
+    buffers.reserve(ioMap.inputs().size() + ioMap.inouts().size());
+    for (const auto& [port, buffer] : ioMap.inputs()) {
         (void)port;
         buffers.push_back(buffer);
     }
-    for (const auto& rw : ioMap.rwBuffers()) {
+    for (const auto& rw : ioMap.inouts()) {
         buffers.push_back(rw.in);
     }
     return buffers;
@@ -410,7 +410,7 @@ using ProducerMap = std::unordered_map<std::string, Producer>;
 /// into a child region via `SubgraphBoundaryOp::bufferMappings`).
 ///
 /// For each op we register:
-///   - `ioMap.outputBuffers` and `ioMap.rwBuffers.out` (the regular kernel /
+///   - `ioMap.outputs` and `ioMap.inouts.out` (the regular kernel /
 ///     control-op outputs).
 ///   - For `SubgraphBoundaryOp`: each `bufferMappings[i].target`, with the
 ///     boundary itself as the producer. This makes local consumers of the
@@ -423,12 +423,12 @@ void collectGlobalProducers(const GraphRegion& region, ProducerMap& producers) {
         const std::string qualifiedId = qualifiedNodeId(scopeId, regionOpId(op));
 
         const IOMap& ioMap = authoredIoMap(op);
-        for (const auto& [port, buffer] : ioMap.outputBuffers()) {
+        for (const auto& [port, buffer] : ioMap.outputs()) {
             (void)port;
             producers[authoredBufferKey(buffer)] =
                 Producer{qualifiedId, buffer.name()};
         }
-        for (const auto& rw : ioMap.rwBuffers()) {
+        for (const auto& rw : ioMap.inouts()) {
             producers[authoredBufferKey(rw.out)] =
                 Producer{qualifiedId, rw.out.name()};
         }

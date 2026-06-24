@@ -37,8 +37,8 @@ TEST(FpgaVbinSpecTest, ConvertsFunctionalArgsToIoTypeMap) {
     ASSERT_EQ(io.inputScalars.size(), 1u);
     EXPECT_EQ(io.inputScalars[0].name, "n");
     EXPECT_EQ(io.inputScalars[0].type, ScalarType::U32);
-    ASSERT_EQ(io.inputBuffers.size(), 1u);
-    EXPECT_EQ(io.inputBuffers[0].name, "in");
+    ASSERT_EQ(io.inputs.size(), 1u);
+    EXPECT_EQ(io.inputs[0].name, "in");
     ASSERT_EQ(io.outputScalars.size(), 1u);
     EXPECT_EQ(io.outputScalars[0].name, "result");
     EXPECT_EQ(io.outputScalars[0].type, ScalarType::U64);

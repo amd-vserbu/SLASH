@@ -511,8 +511,8 @@ namespace {
 class CopyKernel : public CpuKernel {
    public:
     CopyKernel() : CpuKernel("copy") {
-        ioType_.inputBuffers.push_back({"in", BufferType::I32});
-        ioType_.outputBuffers.push_back({"out", BufferType::I32});
+        ioType_.inputs.push_back({"in", BufferType::I32});
+        ioType_.outputs.push_back({"out", BufferType::I32});
     }
     IOTypeMap ioTypeMap() const override { return ioType_; }
     void run(Args& args) override {
@@ -538,27 +538,26 @@ TEST_F(FpgaDeviceFixture, CpuToFpgaBufferEdgeCopiesIntoFpgaStore) {
 
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     IOTypeMap cpuIo;
-    cpuIo.inputBuffers.push_back({"in", BufferType::I32});
-    cpuIo.outputBuffers.push_back({"out", BufferType::I32});
+    cpuIo.inputs.push_back({"in", BufferType::I32});
+    cpuIo.outputs.push_back({"out", BufferType::I32});
     KernelDescriptor cpu{"copy", DeviceType::CPU, std::nullopt, cpuIo};
 
     IOMap io1;
     GraphBuffer staged;
-    io1.bindInputBuffer("in", raw)
-       .bindOutputBuffer("out", BufferType::I32, staged);
+    io1.bindInput("in", raw)
+       .bindOutput("out", BufferType::I32, staged);
     g.addNode(cpu, std::move(io1), "cpu");
 
     IOTypeMap fpgaIo;
-    fpgaIo.inputBuffers.push_back({"in", BufferType::I32});
+    fpgaIo.inputs.push_back({"in", BufferType::I32});
     IOMap io2;
-    io2.bindInputBuffer("in", staged);
+    io2.bindInput("in", staged);
     g.addNode(fpgaKernel("kA", fpgaIo), std::move(io2), "fpga:0");
 
     const std::vector<std::int32_t> input = {1, 2, 3, 4};
     g.cpuDevice()->setInputBuffer("raw", input.data(), input.size() * sizeof(input[0]));
 
-    ASSERT_NO_THROW(g.compile());
-    ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
 
     std::vector<std::int32_t> echoed(input.size(), 0);
     dev->getOutputBuffer(staged.name(), echoed.data(), echoed.size() * sizeof(echoed[0]));
@@ -575,40 +574,39 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
 
     IOTypeMap cpuIo;
-    cpuIo.inputBuffers.push_back({"in", BufferType::I32});
-    cpuIo.outputBuffers.push_back({"out", BufferType::I32});
+    cpuIo.inputs.push_back({"in", BufferType::I32});
+    cpuIo.outputs.push_back({"out", BufferType::I32});
     KernelDescriptor cpu{"copy", DeviceType::CPU, std::nullopt, cpuIo};
 
     IOMap cpuProduceIo;
     GraphBuffer toFpga = g.buffer<std::int32_t>("toFpga", 4);
-    cpuProduceIo.bindInputBuffer("in", raw)
-                .bindExistingOutputBuffer("out", toFpga);
+    cpuProduceIo.bindInput("in", raw)
+                .bindExistingOutput("out", toFpga);
     const std::string cpuProducer = g.addNode(cpu, std::move(cpuProduceIo), "cpu");
 
     IOTypeMap fpgaIo;
     fpgaIo.inputScalars.push_back({"bytes", ScalarType::U32});
-    fpgaIo.inputBuffers.push_back({"in", BufferType::I32});
-    fpgaIo.outputBuffers.push_back({"out", BufferType::I32});
+    fpgaIo.inputs.push_back({"in", BufferType::I32});
+    fpgaIo.outputs.push_back({"out", BufferType::I32});
 
     IOMap fpgaCopyIo;
     GraphBuffer fromFpga = g.buffer<std::int32_t>("fromFpga", 4);
     constexpr std::uint32_t kBytes = 4u * sizeof(std::int32_t);
-    fpgaCopyIo.bindScalar("bytes", GraphScalar::constant<std::uint32_t>(kBytes))
-              .bindInputBuffer("in", toFpga)
-              .bindExistingOutputBuffer("out", fromFpga);
+    fpgaCopyIo.bindInputScalar("bytes", GraphScalar::constant<std::uint32_t>(kBytes))
+              .bindInput("in", toFpga)
+              .bindExistingOutput("out", fromFpga);
     g.addNode(fpgaKernel("kA", fpgaIo), std::move(fpgaCopyIo), "fpga:0", {cpuProducer});
 
     IOMap cpuConsumeIo;
     GraphBuffer finalOut = g.buffer<std::int32_t>("finalOut", 4);
-    cpuConsumeIo.bindInputBuffer("in", fromFpga)
-                .bindExistingOutputBuffer("out", finalOut);
+    cpuConsumeIo.bindInput("in", fromFpga)
+                .bindExistingOutput("out", finalOut);
     g.addNode(cpu, std::move(cpuConsumeIo), "cpu");
 
     const std::vector<std::int32_t> input = {10, 20, 30, 40};
     g.cpuDevice()->setInputBuffer("raw", input.data(), input.size() * sizeof(input[0]));
 
-    ASSERT_NO_THROW(g.compile());
-    ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
 
     std::vector<std::int32_t> output(input.size(), 0);
     g.cpuDevice()->getOutputBuffer(finalOut.name(), output.data(),
@@ -630,10 +628,10 @@ TEST_F(FpgaDeviceFixture, GraphReprogramNodeCompilesIntoFpgaDGraph) {
     spec.deviceHint = "fpga:0";
 
     const std::string reprogramId = g.addReprogram(std::move(spec));
-    ASSERT_NO_THROW(g.compile());
+    auto exec = g.compile();
 
     const DGraph* fpgaDg = nullptr;
-    for (const DGraph& dg : g.dgraphs()) {
+    for (const DGraph& dg : exec.dgraphs()) {
         if (dg.deviceId == "fpga:0") fpgaDg = &dg;
     }
     ASSERT_NE(fpgaDg, nullptr);
@@ -731,8 +729,7 @@ TEST_F(FpgaDeviceFixture, DiamondGraphCompletesAndSentinelFires) {
     std::string c = g.addNode(fpgaKernel("kC"), std::move(ioC), "fpga:0", {a});
     g.addNode(fpgaKernel("kD"), std::move(ioD), "fpga:0", {b, c});
 
-    g.compile();
-    ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
 
     EXPECT_EQ(ddr_.signals()[kDefaultSentinelSlot].value, kDefaultSentinelValue);
     // 4 kernels + 1 sentinel signal = 5 CQ entries.
@@ -750,9 +747,9 @@ TEST_F(FpgaDeviceFixture, DiamondBarrierMasksAreCorrect) {
     std::string c_id = g.addNode(fpgaKernel("kC"), std::move(ioC), "fpga:0", {a});
     g.addNode(fpgaKernel("kD"), std::move(ioD), "fpga:0", {b, c_id});
 
-    g.compile();
-    g.launch();  // submits the graph
-    g.wait();    // joins; firmware has by now processed the nodes
+    auto exec = g.compile();
+    exec.launch();  // submits the graph
+    exec.wait();    // joins; firmware has by now processed the nodes
 
     // Inspect the node array we wrote to DDR.
     const rp1_node_t* n = ddr_.nodes();
@@ -799,13 +796,13 @@ TEST_F(FpgaDeviceFixture, ScalarArgsAreConstantsBakedAtCompileTime) {
     g.registerDevice(dev);
 
     IOMap io;
-    io.bindScalar("size",  GraphScalar::constant<std::uint32_t>(123));
-    io.bindScalar("flags", GraphScalar::constant<std::uint8_t>(7));
+    io.bindInputScalar("size",  GraphScalar::constant<std::uint32_t>(123));
+    io.bindInputScalar("flags", GraphScalar::constant<std::uint8_t>(7));
     g.addNode(fpgaKernel("kA", iot), std::move(io), "fpga:0");
 
-    g.compile();
-    g.launch();
-    g.wait();
+    auto exec = g.compile();
+    exec.launch();
+    exec.wait();
 
     // Protocol v2: each arg is a (reg_offset, value) pair.  On the mock
     // lookup path offsets are handed out contiguously from 0x10, so:
@@ -826,13 +823,13 @@ TEST_F(FpgaDeviceFixture, U64ScalarArgsConsumeTwoArgWords) {
     g.registerDevice(dev);
 
     IOMap io;
-    io.bindScalar("addr",
+    io.bindInputScalar("addr",
                   GraphScalar::constant<std::uint64_t>(0xDEAD'BEEF'CAFE'BABEull));
     g.addNode(fpgaKernel("kA", iot), std::move(io), "fpga:0");
 
-    g.compile();
-    g.launch();
-    g.wait();
+    auto exec = g.compile();
+    exec.launch();
+    exec.wait();
 
     // A U64 occupies two registers (0x10, 0x14), emitted as two v2 pairs.
     EXPECT_EQ(ddr_.args()[0], 0x10u);
@@ -860,7 +857,7 @@ TEST_F(FpgaDeviceFixture, GlobalScalarOnFpgaKernelIsRejectedByCompiler) {
     GraphScalar var = g.globalScalar(ScalarType::U32, "size");
 
     IOMap io;
-    io.bindScalar("size", var);
+    io.bindInputScalar("size", var);
     g.addNode(fpgaKernel("kA", iot), std::move(io), "fpga:0");
 
     EXPECT_THROW(g.compile(), std::runtime_error);
@@ -882,7 +879,7 @@ TEST_F(FpgaDeviceFixture, DeferredScalarsResolvedAtLaunch) {
     k.deviceId  = "fpga:0";
     k.kernel    = fpgaKernel("kA");
     k.kernel.ioType.inputScalars.push_back({"size", ScalarType::U32});
-    k.ioMap.bindScalar("size", GraphScalar::globalVar(ScalarType::U32, "size", 0));
+    k.ioMap.bindInputScalar("size", GraphScalar::globalVar(ScalarType::U32, "size", 0));
     dg.nodes.push_back(k);
 
     auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
@@ -911,16 +908,16 @@ TEST_F(FpgaDeviceFixture, ArgBufferIsContiguousAcrossMultipleKernels) {
 
     auto bind = [&](std::uint32_t v) {
         IOMap io;
-        io.bindScalar("s0", GraphScalar::constant<std::uint32_t>(v));
+        io.bindInputScalar("s0", GraphScalar::constant<std::uint32_t>(v));
         return io;
     };
     std::string a = g.addNode(fpgaKernel("kA", iot), bind(0x11), "fpga:0");
     std::string b = g.addNode(fpgaKernel("kB", iot), bind(0x22), "fpga:0", {a});
     g.addNode(fpgaKernel("kC", iot), bind(0x33), "fpga:0", {b});
 
-    g.compile();
-    g.launch();
-    g.wait();
+    auto exec = g.compile();
+    exec.launch();
+    exec.wait();
 
     // Each kernel contributes one (reg_offset=0x10, value) pair = two words.
     EXPECT_EQ(ddr_.args()[1], 0x11u);
@@ -955,8 +952,8 @@ TEST_F(FpgaDeviceFixture, NonContiguousSystemMapOffsetsAreHonored) {
     k.name = "graph_kernel";
     k.r5_base_addr = kKernelA_R5;
     k.ioType.inputScalars.push_back({"n", ScalarType::U64});
-    k.ioType.inputBuffers.push_back({"in", BufferType::I32});
-    k.ioType.outputBuffers.push_back({"out", BufferType::I32});
+    k.ioType.inputs.push_back({"in", BufferType::I32});
+    k.ioType.outputs.push_back({"out", BufferType::I32});
     k.args.push_back({0u, "n",   "ap_uint<64>", 0x10u, 64u, false, false, ""});
     k.args.push_back({1u, "in",  "int*",        0x1cu, 64u, false, false, ""});
     k.args.push_back({2u, "out", "int*",        0x28u, 64u, true,  false, ""});
@@ -976,9 +973,9 @@ TEST_F(FpgaDeviceFixture, NonContiguousSystemMapOffsetsAreHonored) {
                                      std::string("imageA"), k.ioType};
     GraphBuffer outTok;
     node.ioMap
-        .bindScalar("n", GraphScalar::constant<std::uint64_t>(0x1122'3344'5566'7788ull))
-        .bindInputBuffer("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
-        .bindOutputBuffer("out", BufferType::I32, outTok);
+        .bindInputScalar("n", GraphScalar::constant<std::uint64_t>(0x1122'3344'5566'7788ull))
+        .bindInput("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
+        .bindOutput("out", BufferType::I32, outTok);
     dg.nodes.push_back(std::move(node));
 
     auto plan = dev->compilePlan(dg);
@@ -1021,7 +1018,7 @@ TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
     //
     // Crucially this mirrors the real hardware system_map: every HLS m_axi
     // pointer register is write-only (r=0, w=1, the *host* writes the pointer),
-    // so ioTypeMapFromFunctionalArgs lumps BOTH buffer args into inputBuffers
+    // so ioTypeMapFromFunctionalArgs lumps BOTH buffer args into inputs
     // regardless of data-flow direction.  The descriptor, by contrast, splits
     // them into input/output by intent.  Mapping must therefore be by
     // scalar-vs-buffer position over the idx-ordered args, not by per-category
@@ -1035,10 +1032,10 @@ TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
     k.name = "graph_kernel_0";
     k.r5_base_addr = kKernelA_R5;
     // Canonical IOTypeMap as ioTypeMapFromFunctionalArgs would build it from the
-    // real flags: both pointer args land in inputBuffers (write-only registers).
+    // real flags: both pointer args land in inputs (write-only registers).
     k.ioType.inputScalars.push_back({"n", ScalarType::U64});
-    k.ioType.inputBuffers.push_back({"in_r", BufferType::I32});
-    k.ioType.inputBuffers.push_back({"out_r", BufferType::I32});
+    k.ioType.inputs.push_back({"in_r", BufferType::I32});
+    k.ioType.inputs.push_back({"out_r", BufferType::I32});
     k.args.push_back({0u, "n",     "ap_uint<64>", 0x10u, 64u, false, false, ""});
     k.args.push_back({1u, "in_r",  "int*",        0x1cu, 64u, false, true,  "m_axi_gmem0"});
     k.args.push_back({2u, "out_r", "int*",        0x28u, 64u, false, true,  "m_axi_gmem1"});
@@ -1054,8 +1051,8 @@ TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
     // Descriptor renames the buffer ports, as the real example does.
     IOTypeMap renamed;
     renamed.inputScalars.push_back({"n", ScalarType::U64});
-    renamed.inputBuffers.push_back({"in", BufferType::I32});
-    renamed.outputBuffers.push_back({"image_out", BufferType::I32});
+    renamed.inputs.push_back({"in", BufferType::I32});
+    renamed.outputs.push_back({"image_out", BufferType::I32});
 
     CompiledKernelNode node;
     node.id       = "k0";
@@ -1064,9 +1061,9 @@ TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
                                      std::string("imageA"), renamed};
     GraphBuffer outTok;
     node.ioMap
-        .bindScalar("n", GraphScalar::constant<std::uint64_t>(0x1122'3344'5566'7788ull))
-        .bindInputBuffer("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
-        .bindOutputBuffer("image_out", BufferType::I32, outTok);
+        .bindInputScalar("n", GraphScalar::constant<std::uint64_t>(0x1122'3344'5566'7788ull))
+        .bindInput("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
+        .bindOutput("image_out", BufferType::I32, outTok);
     dg.nodes.push_back(std::move(node));
 
     auto plan = dev->compilePlan(dg);
@@ -1148,8 +1145,7 @@ TEST_F(FpgaDeviceFixture, SentinelSlotAndValueAreCustomisable) {
     g.registerDevice(dev);
     g.addNode(fpgaKernel("kA"), IOMap{}, "fpga:0");
 
-    g.compile();
-    g.run();
+    g.compile().run();
 
     EXPECT_EQ(ddr_.signals()[42].value, 0xC0FFEE00u);
 }
@@ -1169,11 +1165,11 @@ TEST_F(FpgaDeviceFixture, KernelLocationLookupIsCalledOncePerKernel) {
     std::string a = g.addNode(fpgaKernel("kA"), IOMap{}, "fpga:0");
     g.addNode(fpgaKernel("kB"), IOMap{}, "fpga:0", {a});
 
-    g.compile();
+    auto exec = g.compile();
     EXPECT_EQ(kAcalls, 1);
     EXPECT_EQ(kBcalls, 1);
 
-    g.run();
+    exec.run();
     EXPECT_EQ(kAcalls, 1) << "lookup should not be re-called at launch";
     EXPECT_EQ(kBcalls, 1);
 }
@@ -1192,8 +1188,7 @@ TEST_F(FpgaDeviceFixture, ManyKernelsSpanMultipleBarrierBuckets) {
             : std::vector<std::string>{prev};
         prev = g.addNode(fpgaKernel(names[i % 4]), IOMap{}, "fpga:0", after);
     }
-    ASSERT_NO_THROW(g.compile());
-    ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
     // Whole 40-kernel chain went out as a single RP1 submission.
     EXPECT_EQ(ddr_.ctrl().graph_seq, 1u);
     EXPECT_EQ(ddr_.signals()[kDefaultSentinelSlot].value, kDefaultSentinelValue);
@@ -1222,8 +1217,7 @@ TEST_F(FpgaDeviceFixture, CrossBucketFanInInsertsJoinAggregator) {
     g.addNode(fpgaKernel("kD"), IOMap{}, "fpga:0",
               std::vector<std::string>{ids.front(), ids.back()});
 
-    ASSERT_NO_THROW(g.compile());
-    ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
     EXPECT_EQ(ddr_.ctrl().graph_seq, 1u);
     EXPECT_EQ(ddr_.signals()[kDefaultSentinelSlot].value, kDefaultSentinelValue);
 }
@@ -1374,7 +1368,7 @@ TEST(FpgaControlExecution, WhileLoopExitsOnBodyScalarPredicate) {
     bodyK.id       = "bk";
     bodyK.deviceId = "fpga:0";
     bodyK.kernel   = fpgaKernel("bodyK", bodyType);
-    bodyK.ioMap.bindScalar("i", GraphScalar::globalVar(ScalarType::U32, "i"));
+    bodyK.ioMap.bindOutputScalar("i", GraphScalar::globalVar(ScalarType::U32, "i"));
 
     auto body = std::make_shared<DGraph>();
     body->deviceId     = "fpga:0";
@@ -1433,7 +1427,7 @@ TEST(FpgaControlExecution, WhileLoopExitsOnExportedParentScalarPredicate) {
     bodyK.id       = "bk";
     bodyK.deviceId = "fpga:0";
     bodyK.kernel   = fpgaKernel("bodyK", bodyType);
-    bodyK.ioMap.bindScalar("out", GraphScalar::globalVar(ScalarType::U32, "next", 1));
+    bodyK.ioMap.bindOutputScalar("out", GraphScalar::globalVar(ScalarType::U32, "next", 1));
 
     // End boundary exports local "next" (scope 1) to parent "counter" (scope 0).
     CompiledBoundaryNode exportB;
@@ -1499,8 +1493,8 @@ TEST(FpgaControlExecution, WhileLoopCarriesScalarInputViaScalarCopy) {
     bodyType.outputScalars.push_back({"out", ScalarType::U32});
     CompiledKernelNode bodyK;
     bodyK.id = "bk"; bodyK.deviceId = "fpga:0"; bodyK.kernel = fpgaKernel("bodyK", bodyType);
-    bodyK.ioMap.bindScalar("in",  GraphScalar::globalVar(ScalarType::U32, "lin",  1));
-    bodyK.ioMap.bindScalar("out", GraphScalar::globalVar(ScalarType::U32, "lout", 1));
+    bodyK.ioMap.bindInputScalar("in",  GraphScalar::globalVar(ScalarType::U32, "lin",  1));
+    bodyK.ioMap.bindOutputScalar("out", GraphScalar::globalVar(ScalarType::U32, "lout", 1));
 
     // Import counter(0) -> lin(1) (Start); export lout(1) -> counter(0) (End).
     CompiledBoundaryNode importB;
@@ -1580,7 +1574,7 @@ TEST(FpgaControlExecution, ConditionalGatesExactlyOneBranch) {
         predType.outputScalars.push_back({"p", ScalarType::U32});
         CompiledKernelNode pred;
         pred.id = "pred"; pred.deviceId = "fpga:0"; pred.kernel = fpgaKernel("pred", predType);
-        pred.ioMap.bindScalar("p", GraphScalar::globalVar(ScalarType::U32, "p"));
+        pred.ioMap.bindOutputScalar("p", GraphScalar::globalVar(ScalarType::U32, "p"));
 
         auto mk = [](const char* id, const char* name, std::uint32_t /*base*/) {
             CompiledKernelNode k;
@@ -1710,7 +1704,7 @@ TEST(FpgaControlExecution, OutputScalarEmitsScalarReadInControlImage) {
     producer.id       = "prod";
     producer.deviceId = "fpga:0";
     producer.kernel   = fpgaKernel("producer", producerType);
-    producer.ioMap.bindScalar("parity", GraphScalar::globalVar(ScalarType::U64, "parity"));
+    producer.ioMap.bindOutputScalar("parity", GraphScalar::globalVar(ScalarType::U64, "parity"));
 
     CompiledKernelNode bodyK;
     bodyK.id       = "bk";

@@ -28,7 +28,7 @@
  *     A → {B, C} → D  (+ auto-generated sentinel SIGNAL → slot 0)
  *
  * Pass iff:
- *   - signal slot 0 reads back 0xD1A1D0DD after `Graph::run()` returns;
+ *   - signal slot 0 reads back 0xD1A1D0DD after the compiled graph run returns;
  *   - exactly 5 CQ entries land (4 kernel dispatches + 1 sentinel signal).
  *
  * Usage:
@@ -191,10 +191,10 @@ int main(int argc, char** argv) try {
 
     auto bindArgs = [] {
         IOMap io;
-        io.bindScalar("size",
-                      vrt::graph::GraphScalar::constant<std::uint32_t>(kSharedArg0));
-        io.bindScalar("in_ptr",
-                      vrt::graph::GraphScalar::constant<std::uint64_t>(kSharedAddr));
+        io.bindInputScalar("size",
+                           vrt::graph::GraphScalar::constant<std::uint32_t>(kSharedArg0));
+        io.bindInputScalar("in_ptr",
+                           vrt::graph::GraphScalar::constant<std::uint64_t>(kSharedAddr));
         return io;
     };
 
@@ -216,7 +216,7 @@ int main(int argc, char** argv) try {
                                std::nullopt, iot},
               bindArgs(), "fpga:0", {idB, idC});
 
-    g.compile();
+    auto exec = g.compile();
     std::cout << "[rp1_bringup_vrt] compiled diamond ("
               << "A=0x" << std::hex << kKernelA_R5
               << " B=0x" << kKernelB_R5
@@ -225,8 +225,8 @@ int main(int argc, char** argv) try {
               << std::endl;
 
     const std::uint32_t prior_cq = fpga->submitter()->lastCqStart();
-    g.launch();
-    g.wait();
+    exec.launch();
+    exec.wait();
     const std::uint32_t post_cq = fpga->window()->readCqWriteIdx();
     const std::uint32_t cq_delta = post_cq - prior_cq;
 

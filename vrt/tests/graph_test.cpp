@@ -108,14 +108,14 @@ TEST(GraphTest, WithDefaultsRegistersCpuAndKnownBridgeTypes) {
 
     IOMap io;
     GraphBuffer copied;
-    io.bindInputBuffer("in", raw)
-      .bindOutputBuffer("out", BufferType::I32, copied);
+    io.bindInput("in", raw)
+      .bindOutput("out", BufferType::I32, copied);
     graph.addNode(cpuKernel("copy"), std::move(io), "cpu");
 
     std::vector<int32_t> input = {7, 11, 13};
     cpu->setInputBuffer("raw", input.data(), input.size() * sizeof(int32_t));
 
-    graph.compile(); ASSERT_NO_THROW(graph.run());
+    ASSERT_NO_THROW(graph.compile().run());
 
     std::vector<int32_t> output(input.size(), 0);
     cpu->getOutputBuffer(copied.name(), output.data(), output.size() * sizeof(int32_t));
@@ -250,25 +250,25 @@ class MockCpuDevice : public IDevice {
 
         std::map<std::string, CpuBufferView> bufViews;
 
-        for (const auto& [port, buf] : node.ioMap.inputBuffers()) {
+        for (const auto& [port, buf] : node.ioMap.inputs()) {
             CpuBufferView v = resolveBuffer(buf);
             v.elementType   = buf.type();
             bufViews[port]  = v;
         }
 
         size_t defaultSize = 0;
-        if (!node.ioMap.inputBuffers().empty()) {
-            const GraphBuffer& firstBuffer = node.ioMap.inputBuffers().begin()->second;
+        if (!node.ioMap.inputs().empty()) {
+            const GraphBuffer& firstBuffer = node.ioMap.inputs().begin()->second;
             auto fit = buffers_.find(bufferStorageKey(firstBuffer));
             if (fit != buffers_.end()) defaultSize = fit->second.size();
         }
 
-        for (const auto& [port, buf] : node.ioMap.outputBuffers()) {
+        for (const auto& [port, buf] : node.ioMap.outputs()) {
             auto& storage = ensureBuffer(buf, defaultSize);
             bufViews[port] = CpuBufferView{storage.data(), storage.size(), buf.type()};
         }
 
-        for (const auto& rw : node.ioMap.rwBuffers()) {
+        for (const auto& rw : node.ioMap.inouts()) {
             bufViews[rw.inPort] = resolveBuffer(rw.in);
             bufViews[rw.inPort].elementType = rw.in.type();
             auto& inStorage = buffers_.at(bufferStorageKey(rw.in));
@@ -279,7 +279,17 @@ class MockCpuDevice : public IDevice {
         }
 
         std::map<std::string, uint64_t> scalars;
-        for (const auto& [port, gs] : node.ioMap.scalars()) {
+        std::map<std::string, uint64_t*> writableScalars;
+        for (const auto& [port, gs] : node.ioMap.outputScalars()) {
+            if (gs.isConstant()) {
+                throw std::runtime_error(
+                    "MockCpuDevice: output scalar port '" + port +
+                    "' cannot be bound to a constant");
+            }
+            writableScalars[port] =
+                &scalarStore_[scopedScalarKey(gs.scopeId(), gs.varName())];
+        }
+        for (const auto& [port, gs] : node.ioMap.inputScalars()) {
             if (gs.isConstant()) {
                 scalars[port] = gs.constantBits();
             } else {
@@ -296,7 +306,8 @@ class MockCpuDevice : public IDevice {
             }
         }
 
-        CpuKernelArgs args(std::move(bufViews), std::move(scalars));
+        CpuKernelArgs args(std::move(bufViews), std::move(scalars),
+                           std::move(writableScalars));
         it->second->run(args);
     }
 
@@ -506,23 +517,23 @@ TEST(GraphTest, ThreeNodePipeline) {
     // Node A: add offset=10
     IOMap ioA;
     GraphBuffer afterAdd;
-    ioA.bindInputBuffer("in", raw)
-       .bindOutputBuffer("out", BufferType::I32, afterAdd)
-       .bindScalar("offset", GraphScalar::constant<int32_t>(10));
+    ioA.bindInput("in", raw)
+       .bindOutput("out", BufferType::I32, afterAdd)
+       .bindInputScalar("offset", GraphScalar::constant<int32_t>(10));
     g.addNode(cpuKernel("add"), std::move(ioA), "cpu");
 
     // Node B: double
     IOMap ioB;
     GraphBuffer afterDbl;
-    ioB.bindInputBuffer("in", afterAdd)
-       .bindOutputBuffer("out", BufferType::I32, afterDbl);
+    ioB.bindInput("in", afterAdd)
+       .bindOutput("out", BufferType::I32, afterDbl);
     g.addNode(cpuKernel("dbl"), std::move(ioB), "cpu");
 
     // Node C: negate
     IOMap ioC;
     GraphBuffer afterNeg;
-    ioC.bindInputBuffer("in", afterDbl)
-       .bindOutputBuffer("out", BufferType::I32, afterNeg);
+    ioC.bindInput("in", afterDbl)
+       .bindOutput("out", BufferType::I32, afterNeg);
     g.addNode(cpuKernel("neg"), std::move(ioC), "cpu");
 
     // Provide input data.
@@ -530,7 +541,7 @@ TEST(GraphTest, ThreeNodePipeline) {
     cpu->setInputBuffer("raw", input.data(), input.size() * sizeof(int32_t));
 
     // Run.
-    g.compile(); g.run();
+    g.compile().run();
 
     // Read output: (x + 10) * 2 * (-1)
     std::vector<int32_t> output(4);
@@ -592,37 +603,37 @@ TEST(GraphTest, DiamondDependency) {
     // A: split
     IOMap ioA;
     GraphBuffer leftBuf, rightBuf;
-    ioA.bindInputBuffer("in", raw)
-       .bindOutputBuffer("left", BufferType::I32, leftBuf)
-       .bindOutputBuffer("right", BufferType::I32, rightBuf);
+    ioA.bindInput("in", raw)
+       .bindOutput("left", BufferType::I32, leftBuf)
+       .bindOutput("right", BufferType::I32, rightBuf);
     g.addNode(cpuKernel("split"), std::move(ioA), "cpu");
 
     // B: pass left
     IOMap ioB;
     GraphBuffer leftOut;
-    ioB.bindInputBuffer("in", leftBuf)
-       .bindOutputBuffer("out", BufferType::I32, leftOut);
+    ioB.bindInput("in", leftBuf)
+       .bindOutput("out", BufferType::I32, leftOut);
     g.addNode(cpuKernel("passL"), std::move(ioB), "cpu");
 
     // C: pass right
     IOMap ioC;
     GraphBuffer rightOut;
-    ioC.bindInputBuffer("in", rightBuf)
-       .bindOutputBuffer("out", BufferType::I32, rightOut);
+    ioC.bindInput("in", rightBuf)
+       .bindOutput("out", BufferType::I32, rightOut);
     g.addNode(cpuKernel("passR"), std::move(ioC), "cpu");
 
     // D: merge
     IOMap ioD;
     GraphBuffer finalBuf;
-    ioD.bindInputBuffer("left", leftOut)
-       .bindInputBuffer("right", rightOut)
-       .bindOutputBuffer("out", BufferType::I32, finalBuf);
+    ioD.bindInput("left", leftOut)
+       .bindInput("right", rightOut)
+       .bindOutput("out", BufferType::I32, finalBuf);
     g.addNode(cpuKernel("merge"), std::move(ioD), "cpu");
 
     std::vector<int32_t> input = {1, 2, 3};
     cpu->setInputBuffer("raw", input.data(), input.size() * sizeof(int32_t));
 
-    g.compile(); g.run();
+    g.compile().run();
 
     // left = x+1, right = x*10, merge = left+right = x+1+x*10 = 11x+1
     std::vector<int32_t> output(3);
@@ -649,7 +660,7 @@ TEST(GraphTest, NoDeviceThrows) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     IOMap io;
     GraphBuffer out;
-    io.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, out);
+    io.bindInput("in", raw).bindOutput("out", BufferType::I32, out);
     g.addNode(cpuKernel("k"), std::move(io));
     EXPECT_THROW(g.compile(), std::runtime_error);
 }
@@ -662,7 +673,7 @@ TEST(GraphTest, MissingDeviceHintThrows) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     IOMap io;
     GraphBuffer out;
-    io.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, out);
+    io.bindInput("in", raw).bindOutput("out", BufferType::I32, out);
     g.addNode(cpuKernel("k"), std::move(io), "nonexistent");
 
     EXPECT_THROW(g.compile(), std::runtime_error);
@@ -673,8 +684,8 @@ TEST(GraphTest, DuplicateInputBufferBindThrows) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
 
     IOMap io;
-    io.bindInputBuffer("in", raw);
-    EXPECT_THROW(io.bindInputBuffer("in", raw), std::invalid_argument);
+    io.bindInput("in", raw);
+    EXPECT_THROW(io.bindInput("in", raw), std::invalid_argument);
 }
 
 TEST(GraphTest, MissingMandatoryInputBufferPortThrows) {
@@ -683,7 +694,7 @@ TEST(GraphTest, MissingMandatoryInputBufferPortThrows) {
     g.registerDevice(cpu);
 
     IOTypeMap ioType;
-    ioType.inputBuffers.push_back({"in", BufferType::I32});
+    ioType.inputs.push_back({"in", BufferType::I32});
 
     IOMap io;
     g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
@@ -697,12 +708,12 @@ TEST(GraphTest, UnknownInputBufferPortThrows) {
     g.registerDevice(cpu);
 
     IOTypeMap ioType;
-    ioType.inputBuffers.push_back({"in", BufferType::I32});
+    ioType.inputs.push_back({"in", BufferType::I32});
 
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     IOMap io;
-    io.bindInputBuffer("in", raw)
-      .bindInputBuffer("extra", raw);
+    io.bindInput("in", raw)
+      .bindInput("extra", raw);
     g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
 
     EXPECT_THROW(g.compile(), std::runtime_error);
@@ -714,11 +725,11 @@ TEST(GraphTest, InputBufferTypeMismatchThrows) {
     g.registerDevice(cpu);
 
     IOTypeMap ioType;
-    ioType.inputBuffers.push_back({"in", BufferType::I32});
+    ioType.inputs.push_back({"in", BufferType::I32});
 
     GraphBuffer raw = g.inputBuffer(BufferType::U8, "raw");
     IOMap io;
-    io.bindInputBuffer("in", raw);
+    io.bindInput("in", raw);
     g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
 
     EXPECT_THROW(g.compile(), std::runtime_error);
@@ -733,7 +744,71 @@ TEST(GraphTest, OutputScalarMustUseGlobalVar) {
     ioType.outputScalars.push_back({"out", ScalarType::I32});
 
     IOMap io;
-    io.bindScalar("out", GraphScalar::constant<int32_t>(1));
+    io.bindOutputScalar("out", GraphScalar::constant<int32_t>(1));
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.compile(), std::runtime_error);
+}
+
+TEST(GraphTest, InputScalarMustBeBoundAsInputScalar) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOTypeMap ioType;
+    ioType.inputScalars.push_back({"n", ScalarType::I32});
+
+    IOMap io;
+    io.bindOutputScalar("n", GraphScalar::constant<int32_t>(3));
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.compile(), std::runtime_error);
+}
+
+TEST(GraphTest, OutputScalarMustBeBoundAsOutputScalar) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOTypeMap ioType;
+    ioType.outputScalars.push_back({"out", ScalarType::I32});
+    GraphScalar out = g.globalScalar(ScalarType::I32, "wrong_direction_out");
+
+    IOMap io;
+    io.bindInputScalar("out", out);
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.compile(), std::runtime_error);
+}
+
+TEST(GraphTest, MissingMandatoryInoutPortThrows) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOTypeMap ioType;
+    ioType.inouts.push_back(RWBufferPort{BufferPort{"data", BufferType::I32},
+                                         BufferPort{"data", BufferType::I32}});
+
+    IOMap io;
+    g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
+
+    EXPECT_THROW(g.compile(), std::runtime_error);
+}
+
+TEST(GraphTest, InoutBufferTypeMismatchThrows) {
+    Graph g;
+    auto cpu = std::make_shared<CpuDevice>("cpu");
+    g.registerDevice(cpu);
+
+    IOTypeMap ioType;
+    ioType.inouts.push_back(RWBufferPort{BufferPort{"data", BufferType::I32},
+                                         BufferPort{"data", BufferType::I32}});
+
+    GraphBuffer raw = g.inputBuffer(BufferType::U8, "raw_inout_mismatch");
+    IOMap io;
+    GraphBuffer out;
+    io.bindInout("data", "data", raw, out);
     g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
 
     EXPECT_THROW(g.compile(), std::runtime_error);
@@ -768,14 +843,50 @@ TEST(GraphTest, CpuGlobalScalarRoundTrip) {
     GraphScalar output = g.globalScalar(ScalarType::I32, "output");
 
     IOMap io;
-    io.bindScalar("in", input)
-      .bindScalar("out", output);
+    io.bindInputScalar("in", input)
+      .bindOutputScalar("out", output);
     g.addNode(cpuKernel("scalar_copy", ioType), std::move(io), "cpu");
 
     g.setScalar<int32_t>("input", 41);
-    g.compile(); ASSERT_NO_THROW(g.run());
+    auto exec = g.compile();
+    ASSERT_NO_THROW(exec.run());
 
-    EXPECT_EQ(g.getScalar<int32_t>("output"), 42);
+    EXPECT_EQ(exec.getScalar<int32_t>("output"), 42);
+}
+
+TEST(GraphTest, CpuGlobalScalarUpdatesStayLiveAfterCompile) {
+    Graph g = Graph::withDefaults();
+    auto cpu = g.cpuDevice();
+    ASSERT_NE(cpu, nullptr);
+
+    IOTypeMap ioType;
+    ioType.inputScalars.push_back({"in", ScalarType::I32});
+    ioType.outputScalars.push_back({"out", ScalarType::I32});
+
+    cpu->registerKernel(makeCpuKernel("live_scalar_copy", [](const CpuKernelArgs& args) {
+        auto value = static_cast<int32_t>(args.scalar("in"));
+        args.setScalar("out", static_cast<uint64_t>(value + 1));
+    }, ioType));
+
+    GraphScalar input = g.globalScalar(ScalarType::I32, "live_input");
+    GraphScalar output = g.globalScalar(ScalarType::I32, "live_output");
+
+    IOMap io;
+    io.bindInputScalar("in", input)
+      .bindOutputScalar("out", output);
+    g.addNode(cpuKernel("live_scalar_copy", ioType), std::move(io), "cpu");
+
+    g.setScalar<int32_t>("live_input", 41);
+    auto exec = g.compile();
+    ASSERT_FALSE(exec.dgraphs().empty());
+
+    g.setScalar<int32_t>("live_input", 200);
+    ASSERT_NO_THROW(exec.run());
+    EXPECT_EQ(exec.getScalar<int32_t>("live_output"), 42);
+
+    exec.setScalar<int32_t>("live_input", 100);
+    ASSERT_NO_THROW(exec.run());
+    EXPECT_EQ(exec.getScalar<int32_t>("live_output"), 101);
 }
 
 TEST(GraphTest, CpuScalarDependencyOrdersNodes) {
@@ -801,16 +912,17 @@ TEST(GraphTest, CpuScalarDependencyOrdersNodes) {
     GraphScalar result = g.globalScalar(ScalarType::I32, "result");
 
     IOMap consumeIo;
-    consumeIo.bindScalar("value", value)
-             .bindScalar("result", result);
+    consumeIo.bindInputScalar("value", value)
+             .bindOutputScalar("result", result);
     g.addNode(cpuKernel("consume_scalar", consumerType), std::move(consumeIo), "cpu");
 
     IOMap produceIo;
-    produceIo.bindScalar("value", value);
+    produceIo.bindOutputScalar("value", value);
     g.addNode(cpuKernel("produce_scalar", producerType), std::move(produceIo), "cpu");
 
-    g.compile(); ASSERT_NO_THROW(g.run());
-    EXPECT_EQ(g.getScalar<int32_t>("result"), 42);
+    auto exec = g.compile();
+    ASSERT_NO_THROW(exec.run());
+    EXPECT_EQ(exec.getScalar<int32_t>("result"), 42);
 }
 
 TEST(GraphTest, UndeclaredGlobalScalarThrows) {
@@ -823,7 +935,7 @@ TEST(GraphTest, UndeclaredGlobalScalarThrows) {
 
     GraphScalar undeclared = GraphScalar::globalVar(ScalarType::I32, "missing");
     IOMap io;
-    io.bindScalar("in", undeclared);
+    io.bindInputScalar("in", undeclared);
     g.addNode(cpuKernel("typed", ioType), std::move(io), "cpu");
 
     EXPECT_THROW(g.compile(), std::runtime_error);
@@ -836,14 +948,14 @@ TEST(GraphTest, UndeclaredGlobalScalarThrows) {
 // Helper lambda factories (reused across devices)
 static IOTypeMap i32BufferInOutType() {
     IOTypeMap ioType;
-    ioType.inputBuffers.push_back({"in", BufferType::I32});
-    ioType.outputBuffers.push_back({"out", BufferType::I32});
+    ioType.inputs.push_back({"in", BufferType::I32});
+    ioType.outputs.push_back({"out", BufferType::I32});
     return ioType;
 }
 
 static IOTypeMap i32BufferOutType() {
     IOTypeMap ioType;
-    ioType.outputBuffers.push_back({"out", BufferType::I32});
+    ioType.outputs.push_back({"out", BufferType::I32});
     return ioType;
 }
 
@@ -900,31 +1012,31 @@ TEST(GraphTest, CrossDevicePipeline) {
     // A on cpu: add 10
     IOMap ioA;
     GraphBuffer afterAdd;
-    ioA.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, afterAdd);
+    ioA.bindInput("in", raw).bindOutput("out", BufferType::I32, afterAdd);
     g.addNode(cpuKernel("add10"), std::move(ioA), "cpu");
 
     // B on mcpu:0: double
     IOMap ioB;
     GraphBuffer afterDbl;
-    ioB.bindInputBuffer("in", afterAdd).bindOutputBuffer("out", BufferType::I32, afterDbl);
+    ioB.bindInput("in", afterAdd).bindOutput("out", BufferType::I32, afterDbl);
     g.addNode(mockCpuKernel("dbl"), std::move(ioB), "mcpu:0");
 
     // C on mcpu:1: negate
     IOMap ioC;
     GraphBuffer afterNeg;
-    ioC.bindInputBuffer("in", afterDbl).bindOutputBuffer("out", BufferType::I32, afterNeg);
+    ioC.bindInput("in", afterDbl).bindOutput("out", BufferType::I32, afterNeg);
     g.addNode(mockCpuKernel("neg"), std::move(ioC), "mcpu:1");
 
     // D on cpu: add 1
     IOMap ioD;
     GraphBuffer finalBuf;
-    ioD.bindInputBuffer("in", afterNeg).bindOutputBuffer("out", BufferType::I32, finalBuf);
+    ioD.bindInput("in", afterNeg).bindOutput("out", BufferType::I32, finalBuf);
     g.addNode(cpuKernel("add1"), std::move(ioD), "cpu");
 
     std::vector<int32_t> input = {1, 2, 3, 4};
     cpu->setInputBuffer("raw", input.data(), input.size() * sizeof(int32_t));
 
-    g.compile(); g.run();
+    g.compile().run();
 
     // ((x + 10) * 2 * (-1)) + 1
     std::vector<int32_t> output(4);
@@ -974,35 +1086,35 @@ TEST(GraphTest, CrossDeviceDiamond) {
     // A on cpu: split
     IOMap ioA;
     GraphBuffer leftBuf, rightBuf;
-    ioA.bindInputBuffer("in", raw)
-       .bindOutputBuffer("left", BufferType::I32, leftBuf)
-       .bindOutputBuffer("right", BufferType::I32, rightBuf);
+    ioA.bindInput("in", raw)
+       .bindOutput("left", BufferType::I32, leftBuf)
+       .bindOutput("right", BufferType::I32, rightBuf);
     g.addNode(cpuKernel("split"), std::move(ioA), "cpu");
 
     // B on mcpu:0: double the left branch
     IOMap ioB;
     GraphBuffer leftOut;
-    ioB.bindInputBuffer("in", leftBuf).bindOutputBuffer("out", BufferType::I32, leftOut);
+    ioB.bindInput("in", leftBuf).bindOutput("out", BufferType::I32, leftOut);
     g.addNode(mockCpuKernel("dbl"), std::move(ioB), "mcpu:0");
 
     // C on mcpu:1: double the right branch
     IOMap ioC;
     GraphBuffer rightOut;
-    ioC.bindInputBuffer("in", rightBuf).bindOutputBuffer("out", BufferType::I32, rightOut);
+    ioC.bindInput("in", rightBuf).bindOutput("out", BufferType::I32, rightOut);
     g.addNode(mockCpuKernel("dbl"), std::move(ioC), "mcpu:1");
 
     // D on cpu: merge
     IOMap ioD;
     GraphBuffer finalBuf;
-    ioD.bindInputBuffer("left", leftOut)
-       .bindInputBuffer("right", rightOut)
-       .bindOutputBuffer("out", BufferType::I32, finalBuf);
+    ioD.bindInput("left", leftOut)
+       .bindInput("right", rightOut)
+       .bindOutput("out", BufferType::I32, finalBuf);
     g.addNode(cpuKernel("merge"), std::move(ioD), "cpu");
 
     std::vector<int32_t> input = {1, 2, 3};
     cpu->setInputBuffer("raw", input.data(), input.size() * sizeof(int32_t));
 
-    g.compile(); g.run();
+    g.compile().run();
 
     // left = (x+1)*2, right = (x*10)*2, merge = 2(x+1) + 2(10x) = 22x + 2
     std::vector<int32_t> output(3);
@@ -1034,20 +1146,20 @@ TEST(GraphTest, CpuLoopRunsCrossDeviceChildBody) {
 
     IOMap addIo;
     GraphBuffer cpuStage;
-    addIo.bindInputBuffer("in", localState)
-         .bindOutputBuffer("out", BufferType::I32, cpuStage, body->scopeId());
+    addIo.bindInput("in", localState)
+         .bindOutput("out", BufferType::I32, cpuStage, body->scopeId());
     body->addKernel(cpuKernel("loop_add1", ioType), std::move(addIo), "cpu");
 
     IOMap doubleIo;
     GraphBuffer mockStage;
-    doubleIo.bindInputBuffer("in", cpuStage)
-            .bindOutputBuffer("out", BufferType::I32, mockStage, body->scopeId());
+    doubleIo.bindInput("in", cpuStage)
+            .bindOutput("out", BufferType::I32, mockStage, body->scopeId());
     body->addKernel(mockCpuKernel("loop_dbl", ioType), std::move(doubleIo), "mcpu:0");
 
     IOMap finishIo;
     GraphBuffer localNext;
-    finishIo.bindInputBuffer("in", mockStage)
-            .bindOutputBuffer("out", BufferType::I32, localNext, body->scopeId());
+    finishIo.bindInput("in", mockStage)
+            .bindOutput("out", BufferType::I32, localNext, body->scopeId());
     body->addKernel(cpuKernel("loop_add3", ioType), std::move(finishIo), "cpu");
     body->exportToParent(std::vector<BufferBoundaryMapping>{{localNext, state}});
 
@@ -1056,7 +1168,8 @@ TEST(GraphTest, CpuLoopRunsCrossDeviceChildBody) {
     std::vector<int32_t> input = {1, 2, 4};
     cpu->setInputBuffer(state.name(), input.data(), input.size() * sizeof(int32_t));
 
-    g.compile(); ASSERT_NO_THROW(g.run());
+    auto exec = g.compile();
+    ASSERT_NO_THROW(exec.run());
 
     std::vector<int32_t> output(input.size(), 0);
     cpu->getOutputBuffer(state.name(), output.data(), output.size() * sizeof(int32_t));
@@ -1116,23 +1229,23 @@ TEST(GraphTest, CpuConditionalRunsSelectedCrossDeviceChildBranch) {
 
     IOMap thenAddIo;
     GraphBuffer thenCpuStage;
-    thenAddIo.bindInputBuffer("in", thenInput)
-             .bindOutputBuffer("out", BufferType::I32, thenCpuStage,
+    thenAddIo.bindInput("in", thenInput)
+             .bindOutput("out", BufferType::I32, thenCpuStage,
                                thenRegion->scopeId());
     thenRegion->addKernel(cpuKernel("cond_then_add1", ioType), std::move(thenAddIo), "cpu");
 
     IOMap thenDoubleIo;
     GraphBuffer thenMockStage;
-    thenDoubleIo.bindInputBuffer("in", thenCpuStage)
-                .bindOutputBuffer("out", BufferType::I32, thenMockStage,
+    thenDoubleIo.bindInput("in", thenCpuStage)
+                .bindOutput("out", BufferType::I32, thenMockStage,
                                   thenRegion->scopeId());
     thenRegion->addKernel(mockCpuKernel("cond_then_dbl", ioType),
                           std::move(thenDoubleIo), "mcpu:0");
 
     IOMap thenFinishIo;
     GraphBuffer thenOutput;
-    thenFinishIo.bindInputBuffer("in", thenMockStage)
-                .bindOutputBuffer("out", BufferType::I32, thenOutput,
+    thenFinishIo.bindInput("in", thenMockStage)
+                .bindOutput("out", BufferType::I32, thenOutput,
                                   thenRegion->scopeId());
     thenRegion->addKernel(cpuKernel("cond_then_add3", ioType),
                           std::move(thenFinishIo), "cpu");
@@ -1143,8 +1256,8 @@ TEST(GraphTest, CpuConditionalRunsSelectedCrossDeviceChildBranch) {
     elseRegion->importFromParent(std::vector<BufferBoundaryMapping>{{source, elseInput}});
     IOMap elseIo;
     GraphBuffer elseOutput;
-    elseIo.bindInputBuffer("in", elseInput)
-          .bindOutputBuffer("out", BufferType::I32, elseOutput, elseRegion->scopeId());
+    elseIo.bindInput("in", elseInput)
+          .bindOutput("out", BufferType::I32, elseOutput, elseRegion->scopeId());
     elseRegion->addKernel(cpuKernel("cond_else_sub5", ioType), std::move(elseIo), "cpu");
     elseRegion->exportToParent(std::vector<BufferBoundaryMapping>{{elseOutput, result}});
 
@@ -1158,7 +1271,7 @@ TEST(GraphTest, CpuConditionalRunsSelectedCrossDeviceChildBranch) {
                          std::vector<int32_t> expected) {
         cpu->setInputBuffer(source.name(), input.data(), input.size() * sizeof(int32_t));
         g.setScalar<int32_t>(flag.varName(), branchFlag);
-        g.compile(); ASSERT_NO_THROW(g.run());
+        ASSERT_NO_THROW(g.compile().run());
         std::vector<int32_t> output(input.size(), 0);
         cpu->getOutputBuffer(result.name(), output.data(), output.size() * sizeof(int32_t));
         EXPECT_EQ(output, expected);
@@ -1188,8 +1301,8 @@ TEST(GraphTest, CpuLoopPublishesRemoteBufferOutputToCpuParentConsumer) {
     auto mcpu = std::make_shared<MockCpuDevice>("mcpu:0");
 
     IOTypeMap stageType;
-    stageType.inputBuffers.push_back({"in", BufferType::I32});
-    stageType.outputBuffers.push_back({"stage", BufferType::I32});
+    stageType.inputs.push_back({"in", BufferType::I32});
+    stageType.outputs.push_back({"stage", BufferType::I32});
     cpu->registerKernel(makeCpuKernel("phase7c_loop_add1", [](const CpuKernelArgs& args) {
         auto in = args.buffer("in").as<const int32_t>();
         auto out = args.buffer("stage").as<int32_t>();
@@ -1212,20 +1325,20 @@ TEST(GraphTest, CpuLoopPublishesRemoteBufferOutputToCpuParentConsumer) {
 
     IOMap cpuStageIo;
     GraphBuffer cpuStage;
-    cpuStageIo.bindInputBuffer("in", bodyInput)
-              .bindOutputBuffer("stage", BufferType::I32, cpuStage, body->scopeId());
+    cpuStageIo.bindInput("in", bodyInput)
+              .bindOutput("stage", BufferType::I32, cpuStage, body->scopeId());
     body->addKernel(cpuKernel("phase7c_loop_add1", stageType), std::move(cpuStageIo), "cpu");
 
     IOMap remoteIo;
     GraphBuffer remoteOutput;
-    remoteIo.bindInputBuffer("in", cpuStage)
-            .bindOutputBuffer("out", BufferType::I32, remoteOutput, body->scopeId());
+    remoteIo.bindInput("in", cpuStage)
+            .bindOutput("out", BufferType::I32, remoteOutput, body->scopeId());
     body->addKernel(mockCpuKernel("phase7c_loop_dbl", ioType), std::move(remoteIo), "mcpu:0");
 
     LoopSpec loopSpec;
     loopSpec.ioType = i32BufferOutType();
     GraphBuffer loopOutput;
-    loopSpec.ioMap.bindOutputBuffer("out", BufferType::I32, loopOutput,
+    loopSpec.ioMap.bindOutput("out", BufferType::I32, loopOutput,
                                     g.rootRegion().scopeId());
     loopSpec.tripCount = LoopTripCount::constant<int32_t>(1);
     loopSpec.body = body;
@@ -1234,14 +1347,14 @@ TEST(GraphTest, CpuLoopPublishesRemoteBufferOutputToCpuParentConsumer) {
 
     IOMap sinkIo;
     GraphBuffer finalOutput;
-    sinkIo.bindInputBuffer("in", loopOutput)
-          .bindOutputBuffer("out", BufferType::I32, finalOutput,
+    sinkIo.bindInput("in", loopOutput)
+          .bindOutput("out", BufferType::I32, finalOutput,
                             g.rootRegion().scopeId());
     g.addNode(cpuKernel("phase7c_loop_sink", ioType), std::move(sinkIo), "cpu");
 
     auto runCase = [&](std::vector<int32_t> input, std::vector<int32_t> expected) {
         cpu->setInputBuffer(source.name(), input.data(), input.size() * sizeof(int32_t));
-        g.compile(); ASSERT_NO_THROW(g.run());
+        ASSERT_NO_THROW(g.compile().run());
         std::vector<int32_t> output(input.size(), 0);
         cpu->getOutputBuffer(finalOutput.name(), output.data(),
                              output.size() * sizeof(int32_t));
@@ -1270,8 +1383,8 @@ TEST(GraphTest, CpuConditionalPublishesRemoteBufferOutputToCpuParentConsumer) {
         for (size_t i = 0; i < n; ++i) out[i] = in[i] + 10;
     }, ioType));
     IOTypeMap elseStageType;
-    elseStageType.inputBuffers.push_back({"in", BufferType::I32});
-    elseStageType.outputBuffers.push_back({"stage", BufferType::I32});
+    elseStageType.inputs.push_back({"in", BufferType::I32});
+    elseStageType.outputs.push_back({"stage", BufferType::I32});
     cpu->registerKernel(makeCpuKernel("phase7c_else_add1", [elseCpuCalls](const CpuKernelArgs& args) {
         ++*elseCpuCalls;
         auto in = args.buffer("in").as<const int32_t>();
@@ -1307,8 +1420,8 @@ TEST(GraphTest, CpuConditionalPublishesRemoteBufferOutputToCpuParentConsumer) {
     thenRegion->importFromParent(std::vector<BufferBoundaryMapping>{{source, thenInput}});
     IOMap thenIo;
     GraphBuffer thenOutput;
-    thenIo.bindInputBuffer("in", thenInput)
-          .bindOutputBuffer("out", BufferType::I32, thenOutput,
+    thenIo.bindInput("in", thenInput)
+          .bindOutput("out", BufferType::I32, thenOutput,
                             thenRegion->scopeId());
     thenRegion->addKernel(cpuKernel("phase7c_then_add10", ioType),
                           std::move(thenIo), "cpu");
@@ -1318,15 +1431,15 @@ TEST(GraphTest, CpuConditionalPublishesRemoteBufferOutputToCpuParentConsumer) {
     elseRegion->importFromParent(std::vector<BufferBoundaryMapping>{{source, elseInput}});
     IOMap elseCpuIo;
     GraphBuffer elseStage;
-    elseCpuIo.bindInputBuffer("in", elseInput)
-             .bindOutputBuffer("stage", BufferType::I32, elseStage,
+    elseCpuIo.bindInput("in", elseInput)
+             .bindOutput("stage", BufferType::I32, elseStage,
                                elseRegion->scopeId());
     elseRegion->addKernel(cpuKernel("phase7c_else_add1", elseStageType),
                           std::move(elseCpuIo), "cpu");
     IOMap elseMockIo;
     GraphBuffer elseOutput;
-    elseMockIo.bindInputBuffer("in", elseStage)
-              .bindOutputBuffer("out", BufferType::I32, elseOutput,
+    elseMockIo.bindInput("in", elseStage)
+              .bindOutput("out", BufferType::I32, elseOutput,
                                 elseRegion->scopeId());
     elseRegion->addKernel(mockCpuKernel("phase7c_else_dbl", ioType),
                           std::move(elseMockIo), "mcpu:0");
@@ -1334,7 +1447,7 @@ TEST(GraphTest, CpuConditionalPublishesRemoteBufferOutputToCpuParentConsumer) {
     ConditionalSpec conditionalSpec;
     conditionalSpec.ioType = i32BufferOutType();
     GraphBuffer conditionalOutput;
-    conditionalSpec.ioMap.bindOutputBuffer("out", BufferType::I32, conditionalOutput,
+    conditionalSpec.ioMap.bindOutput("out", BufferType::I32, conditionalOutput,
                                            g.rootRegion().scopeId());
     conditionalSpec.condition = Condition::compare(
         CompareOp::EQ,
@@ -1347,8 +1460,8 @@ TEST(GraphTest, CpuConditionalPublishesRemoteBufferOutputToCpuParentConsumer) {
 
     IOMap sinkIo;
     GraphBuffer finalOutput;
-    sinkIo.bindInputBuffer("in", conditionalOutput)
-          .bindOutputBuffer("out", BufferType::I32, finalOutput,
+    sinkIo.bindInput("in", conditionalOutput)
+          .bindOutput("out", BufferType::I32, finalOutput,
                             g.rootRegion().scopeId());
     g.addNode(cpuKernel("phase7c_cond_sink", ioType), std::move(sinkIo), "cpu");
 
@@ -1357,7 +1470,7 @@ TEST(GraphTest, CpuConditionalPublishesRemoteBufferOutputToCpuParentConsumer) {
                        std::vector<int32_t> expected) {
         cpu->setInputBuffer(source.name(), input.data(), input.size() * sizeof(int32_t));
         g.setScalar<int32_t>(flag.varName(), branchFlag);
-        g.compile(); ASSERT_NO_THROW(g.run());
+        ASSERT_NO_THROW(g.compile().run());
         std::vector<int32_t> output(input.size(), 0);
         cpu->getOutputBuffer(finalOutput.name(), output.data(),
                              output.size() * sizeof(int32_t));
@@ -1438,21 +1551,22 @@ TEST(GraphTest, CompilerPopulatesDependsOnAcrossDevices) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     GraphBuffer b1, b2, b3;
 
-    IOMap m1; m1.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, b1);
+    IOMap m1; m1.bindInput("in", raw).bindOutput("out", BufferType::I32, b1);
     auto idA = g.addNode(cpuKernel("add10"), std::move(m1), "cpu");
 
-    IOMap m2; m2.bindInputBuffer("in", b1).bindOutputBuffer("out", BufferType::I32, b2);
+    IOMap m2; m2.bindInput("in", b1).bindOutput("out", BufferType::I32, b2);
     auto idB = g.addNode(mockCpuKernel("dbl"), std::move(m2), "mcpu:0");
 
-    IOMap m3; m3.bindInputBuffer("in", b2).bindOutputBuffer("out", BufferType::I32, b3);
+    IOMap m3; m3.bindInput("in", b2).bindOutput("out", BufferType::I32, b3);
     auto idC = g.addNode(cpuKernel("add1"), std::move(m3), "cpu");
 
     std::vector<int32_t> in = {1};
     cpu->setInputBuffer("raw", in.data(), sizeof(int32_t));
-    g.compile(); g.run();
+    auto exec = g.compile();
+    exec.run();
 
-    const auto* dgCpu = findDg(g.dgraphs(), "cpu");
-    const auto* dgM   = findDg(g.dgraphs(), "mcpu:0");
+    const auto* dgCpu = findDg(exec.dgraphs(), "cpu");
+    const auto* dgM   = findDg(exec.dgraphs(), "mcpu:0");
     ASSERT_NE(dgCpu, nullptr);
     ASSERT_NE(dgM,   nullptr);
 
@@ -1526,26 +1640,27 @@ TEST(GraphTest, CompilerHonoursCrossDeviceAfterNodesViaBarrier) {
     GraphBuffer rawB = g.inputBuffer(BufferType::I32, "rawB");
     GraphBuffer outA, outB;
 
-    IOMap mA; mA.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, outA);
+    IOMap mA; mA.bindInput("in", raw).bindOutput("out", BufferType::I32, outA);
     auto idA = g.addNode(cpuKernel("a"), std::move(mA), "cpu");
 
     // B has its own input from rawB and a CROSS-DEVICE afterNodes={idA}.
-    IOMap mB; mB.bindInputBuffer("in", rawB).bindOutputBuffer("out", BufferType::I32, outB);
+    IOMap mB; mB.bindInput("in", rawB).bindOutput("out", BufferType::I32, outB);
     auto idB = g.addNode(mockCpuKernel("b"), std::move(mB), "mcpu:0",
                          /*afterNodes=*/{idA});
 
     std::vector<int32_t> in = {1};
     cpu->setInputBuffer("raw",  in.data(), sizeof(int32_t));
     mcpu->setInputBuffer("rawB", in.data(), sizeof(int32_t));
-    g.compile(); g.run();
+    auto exec = g.compile();
+    exec.run();
 
     // Phase 2: cross-device afterNodes materialises a barrier op pair.
     // - On 'cpu' (source side): a Producer-side barrier with
     //   pairedKernelId == idA, dependsOn == {idA}.
     // - On 'mcpu:0' (dest side): a Consumer-side barrier with
     //   pairedKernelId == idB; B.dependsOn must contain its id.
-    const auto* dgCpu = findDg(g.dgraphs(), "cpu");
-    const auto* dgM   = findDg(g.dgraphs(), "mcpu:0");
+    const auto* dgCpu = findDg(exec.dgraphs(), "cpu");
+    const auto* dgM   = findDg(exec.dgraphs(), "mcpu:0");
     ASSERT_NE(dgCpu, nullptr);
     ASSERT_NE(dgM, nullptr);
 
@@ -1601,20 +1716,21 @@ TEST(GraphTest, CompilerChainsBounceLegsViaDependsOn) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     GraphBuffer b1, b2;
 
-    IOMap m1; m1.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, b1);
+    IOMap m1; m1.bindInput("in", raw).bindOutput("out", BufferType::I32, b1);
     g.addNode(mockCpuKernel("dbl"), std::move(m1), "mcpu:0");
 
-    IOMap m2; m2.bindInputBuffer("in", b1).bindOutputBuffer("out", BufferType::I32, b2);
+    IOMap m2; m2.bindInput("in", b1).bindOutput("out", BufferType::I32, b2);
     g.addNode(mockCpuKernel("neg"), std::move(m2), "mcpu:1");
 
     std::vector<int32_t> in = {1};
     mcpu0->setInputBuffer("raw", in.data(), sizeof(int32_t));
-    g.compile(); g.run();
+    auto exec = g.compile();
+    exec.run();
 
     // The bounce intermediary lives on the cpu DGraph: there must be one
     // CompiledBridgeOpNode pair (consumer of leg1, producer of leg2) where the
     // producer's dependsOn includes the consumer's id.
-    const auto* dgCpu = findDg(g.dgraphs(), "cpu");
+    const auto* dgCpu = findDg(exec.dgraphs(), "cpu");
     ASSERT_NE(dgCpu, nullptr);
 
     bool chained = false;
@@ -1673,9 +1789,9 @@ TEST(GraphTest, CompilerErrorsWhenNoBridgeFactoryRegistered) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     GraphBuffer b1, b2;
 
-    IOMap m1; m1.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, b1);
+    IOMap m1; m1.bindInput("in", raw).bindOutput("out", BufferType::I32, b1);
     g.addNode(mockCpuKernel("dbl"), std::move(m1), "mcpu:0");
-    IOMap m2; m2.bindInputBuffer("in", b1).bindOutputBuffer("out", BufferType::I32, b2);
+    IOMap m2; m2.bindInput("in", b1).bindOutput("out", BufferType::I32, b2);
     g.addNode(mockCpuKernel("neg"), std::move(m2), "mcpu:1");
 
     std::vector<int32_t> in = {1};
@@ -1710,21 +1826,21 @@ TEST(GraphTest, CpuExecutorRunsDiamondAcrossTwoBranches) {
     GraphBuffer raw  = g.inputBuffer(BufferType::I32, "raw");
     GraphBuffer rOut, aOut, bOut, joined;
 
-    IOMap ioR; ioR.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, rOut);
+    IOMap ioR; ioR.bindInput("in", raw).bindOutput("out", BufferType::I32, rOut);
     g.addNode(cpuKernel("root"), std::move(ioR), "cpu");
-    IOMap ioA; ioA.bindInputBuffer("in", rOut).bindOutputBuffer("out", BufferType::I32, aOut);
+    IOMap ioA; ioA.bindInput("in", rOut).bindOutput("out", BufferType::I32, aOut);
     g.addNode(cpuKernel("addA"), std::move(ioA), "cpu");
-    IOMap ioB; ioB.bindInputBuffer("in", rOut).bindOutputBuffer("out", BufferType::I32, bOut);
+    IOMap ioB; ioB.bindInput("in", rOut).bindOutput("out", BufferType::I32, bOut);
     g.addNode(cpuKernel("addB"), std::move(ioB), "cpu");
-    IOMap ioJ; ioJ.bindInputBuffer("a", aOut)
-                  .bindInputBuffer("b", bOut)
-                  .bindOutputBuffer("out", BufferType::I32, joined);
+    IOMap ioJ; ioJ.bindInput("a", aOut)
+                  .bindInput("b", bOut)
+                  .bindOutput("out", BufferType::I32, joined);
     g.addNode(cpuKernel("join"), std::move(ioJ), "cpu");
 
     std::vector<int32_t> in = {1, 2, 3};
     cpu->setInputBuffer("raw", in.data(), in.size() * sizeof(int32_t));
 
-    g.compile(); g.run();
+    g.compile().run();
 
     std::vector<int32_t> out(3);
     cpu->getOutputBuffer(joined.name(), out.data(), out.size() * sizeof(int32_t));
@@ -1746,15 +1862,15 @@ TEST(GraphTest, CpuExecutorResetsDependencyStateAcrossRuns) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     GraphBuffer mid, finalBuf;
 
-    IOMap ioA; ioA.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, mid);
+    IOMap ioA; ioA.bindInput("in", raw).bindOutput("out", BufferType::I32, mid);
     g.addNode(cpuKernel("copy"), std::move(ioA), "cpu");
 
-    IOMap ioB; ioB.bindInputBuffer("in", mid).bindOutputBuffer("out", BufferType::I32, finalBuf);
+    IOMap ioB; ioB.bindInput("in", mid).bindOutput("out", BufferType::I32, finalBuf);
     g.addNode(cpuKernel("add1"), std::move(ioB), "cpu");
 
     auto runOnce = [&](int32_t value) {
         cpu->setInputBuffer("raw", &value, sizeof(value));
-        g.compile(); g.run();
+        g.compile().run();
         int32_t out = 0;
         cpu->getOutputBuffer(finalBuf.name(), &out, sizeof(out));
         return out;
@@ -1775,7 +1891,7 @@ TEST(GraphTest, CpuDevicePlansRemainIndependentAfterAnotherCompile) {
 
     IOMap io1;
     GraphBuffer out1;
-    io1.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, out1);
+    io1.bindInput("in", raw).bindOutput("out", BufferType::I32, out1);
 
     DGraph dg1;
     dg1.deviceId = "cpu";
@@ -1785,7 +1901,7 @@ TEST(GraphTest, CpuDevicePlansRemainIndependentAfterAnotherCompile) {
 
     IOMap io2;
     GraphBuffer out2;
-    io2.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, out2);
+    io2.bindInput("in", raw).bindOutput("out", BufferType::I32, out2);
 
     DGraph dg2;
     dg2.deviceId = "cpu";
@@ -1831,8 +1947,8 @@ TEST(GraphTest, CpuDevicePlansHaveIndependentScalarMaps) {
                            const std::shared_ptr<std::map<std::string, uint64_t>>&
                                scalarValues) {
         IOMap io;
-        io.bindScalar("in", GraphScalar::globalVar(ScalarType::I32, "input"))
-          .bindScalar("out", GraphScalar::globalVar(ScalarType::I32, "output"));
+        io.bindInputScalar("in", GraphScalar::globalVar(ScalarType::I32, "input"))
+          .bindOutputScalar("out", GraphScalar::globalVar(ScalarType::I32, "output"));
 
         DGraph dg;
         dg.deviceId = "cpu";
@@ -1873,7 +1989,7 @@ TEST(GraphTest, CpuFixedCountLoopWithZeroIterationsAndNoOutputsNoops) {
     auto body = g.rootRegion().createChild();
     g.addLoop(fixedLoopSpec(LoopTripCount::constant<int32_t>(0), body));
 
-    g.compile(); EXPECT_NO_THROW(g.run());
+    EXPECT_NO_THROW(g.compile().run());
 }
 
 TEST(GraphTest, CpuFixedCountLoopWithZeroIterationsAndOutputsThrows) {
@@ -1890,13 +2006,13 @@ TEST(GraphTest, CpuFixedCountLoopWithZeroIterationsAndOutputsThrows) {
     body->importFromParent(std::vector<BufferBoundaryMapping>{{rootInput, bodyInput}});
     GraphBuffer bodyOutput;
     IOMap bodyIo;
-    bodyIo.bindInputBuffer("in", bodyInput)
-          .bindOutputBuffer("out", BufferType::I32, bodyOutput, body->scopeId());
+    bodyIo.bindInput("in", bodyInput)
+          .bindOutput("out", BufferType::I32, bodyOutput, body->scopeId());
     body->addKernel(cpuKernel("copy", ioType), std::move(bodyIo), "cpu");
 
     IOMap loopIo;
     GraphBuffer loopOutput;
-    loopIo.bindOutputBuffer("out", BufferType::I32, loopOutput, g.rootRegion().scopeId());
+    loopIo.bindOutput("out", BufferType::I32, loopOutput, g.rootRegion().scopeId());
     g.addLoop(fixedLoopSpec(i32BufferOutType(), std::move(loopIo),
                             LoopTripCount::constant<int32_t>(0), body));
 
@@ -1924,20 +2040,21 @@ TEST(GraphTest, CpuFixedCountLoopPublishesFinalBufferOutput) {
     body->importFromParent(std::vector<BufferBoundaryMapping>{{loopInput, bodyInput}});
     GraphBuffer bodyOutput;
     IOMap bodyIo;
-    bodyIo.bindInputBuffer("in", bodyInput)
-          .bindOutputBuffer("out", BufferType::I32, bodyOutput, body->scopeId());
+    bodyIo.bindInput("in", bodyInput)
+          .bindOutput("out", BufferType::I32, bodyOutput, body->scopeId());
     body->addKernel(cpuKernel("loop_body", ioType), std::move(bodyIo), "cpu");
 
     IOMap loopIo;
     GraphBuffer loopOutput;
-    loopIo.bindOutputBuffer("out", BufferType::I32, loopOutput, g.rootRegion().scopeId());
+    loopIo.bindOutput("out", BufferType::I32, loopOutput, g.rootRegion().scopeId());
     g.addLoop(fixedLoopSpec(i32BufferOutType(), std::move(loopIo),
                             LoopTripCount::constant<int32_t>(3), body));
 
     std::vector<int32_t> input = {10, 20};
     cpu->setInputBuffer(loopInput.name(), input.data(), input.size() * sizeof(int32_t));
 
-    g.compile(); ASSERT_NO_THROW(g.run());
+    auto exec = g.compile();
+    ASSERT_NO_THROW(exec.run());
 
     std::vector<int32_t> output(2);
     cpu->getOutputBuffer(loopOutput.name(), output.data(), output.size() * sizeof(int32_t));
@@ -1964,15 +2081,15 @@ TEST(GraphTest, CpuScalarTripCountLoopResetsAcrossRuns) {
         body));
 
     g.setScalar<int32_t>("trip_count", 1);
-    g.compile(); ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
     EXPECT_EQ(*calls, 1);
 
     g.setScalar<int32_t>("trip_count", 3);
-    g.compile(); ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
     EXPECT_EQ(*calls, 4);
 
     g.setScalar<int32_t>("trip_count", 2);
-    g.compile(); ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
     EXPECT_EQ(*calls, 6);
 }
 
@@ -2009,21 +2126,21 @@ TEST(GraphTest, CpuConditionalUsesScalarConditionAndPublishesSelectedBranch) {
     thenRegion->importFromParent(std::vector<BufferBoundaryMapping>{{thenSource, thenInput}});
     GraphBuffer thenOutput;
     IOMap thenIo;
-    thenIo.bindInputBuffer("in", thenInput)
-          .bindOutputBuffer("out", BufferType::I32, thenOutput, thenRegion->scopeId());
+    thenIo.bindInput("in", thenInput)
+          .bindOutput("out", BufferType::I32, thenOutput, thenRegion->scopeId());
     thenRegion->addKernel(cpuKernel("then_branch", ioType), std::move(thenIo), "cpu");
 
     GraphBuffer elseInput = elseRegion->inputBuffer(BufferType::I32, "else_input");
     elseRegion->importFromParent(std::vector<BufferBoundaryMapping>{{elseSource, elseInput}});
     GraphBuffer elseOutput;
     IOMap elseIo;
-    elseIo.bindInputBuffer("in", elseInput)
-          .bindOutputBuffer("out", BufferType::I32, elseOutput, elseRegion->scopeId());
+    elseIo.bindInput("in", elseInput)
+          .bindOutput("out", BufferType::I32, elseOutput, elseRegion->scopeId());
     elseRegion->addKernel(cpuKernel("else_branch", ioType), std::move(elseIo), "cpu");
 
     IOMap conditionalIo;
     GraphBuffer conditionalOutput;
-    conditionalIo.bindOutputBuffer("out", BufferType::I32, conditionalOutput,
+    conditionalIo.bindOutput("out", BufferType::I32, conditionalOutput,
                                    g.rootRegion().scopeId());
     Condition condition = Condition::compare(
         CompareOp::EQ,
@@ -2038,7 +2155,7 @@ TEST(GraphTest, CpuConditionalUsesScalarConditionAndPublishesSelectedBranch) {
     cpu->setInputBuffer(elseSource.name(), &elseValue, sizeof(elseValue));
 
     g.setScalar<int32_t>("branch_flag", 1);
-    g.compile(); ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
     int32_t output = 0;
     cpu->getOutputBuffer(conditionalOutput.name(), &output, sizeof(output));
     EXPECT_EQ(output, 101);
@@ -2046,7 +2163,7 @@ TEST(GraphTest, CpuConditionalUsesScalarConditionAndPublishesSelectedBranch) {
     EXPECT_EQ(*elseCalls, 0);
 
     g.setScalar<int32_t>("branch_flag", 0);
-    g.compile(); ASSERT_NO_THROW(g.run());
+    ASSERT_NO_THROW(g.compile().run());
     cpu->getOutputBuffer(conditionalOutput.name(), &output, sizeof(output));
     EXPECT_EQ(output, 202);
     EXPECT_EQ(*thenCalls, 1);
@@ -2077,8 +2194,8 @@ TEST(GraphTest, CpuFixedCountLoopBufferBoundaryCarriesUpdatedStateAcrossRuns) {
 
     IOMap bodyIo;
     GraphBuffer localNext;
-    bodyIo.bindInputBuffer("in", localState)
-          .bindOutputBuffer("out", BufferType::I32, localNext, body->scopeId());
+    bodyIo.bindInput("in", localState)
+          .bindOutput("out", BufferType::I32, localNext, body->scopeId());
     body->addKernel(cpuKernel("buffer_boundary_increment", ioType), std::move(bodyIo), "cpu");
     body->exportToParent(std::vector<BufferBoundaryMapping>{{localNext, state}});
 
@@ -2089,7 +2206,7 @@ TEST(GraphTest, CpuFixedCountLoopBufferBoundaryCarriesUpdatedStateAcrossRuns) {
     auto runWithCount = [&](int32_t count, std::vector<int32_t> input) {
         cpu->setInputBuffer(state.name(), input.data(), input.size() * sizeof(int32_t));
         g.setScalar<int32_t>("buffer_boundary_trip_count", count);
-        g.compile(); ASSERT_NO_THROW(g.run());
+        ASSERT_NO_THROW(g.compile().run());
         std::vector<int32_t> output(input.size(), 0);
         cpu->getOutputBuffer(state.name(), output.data(), output.size() * sizeof(int32_t));
         for (size_t i = 0; i < input.size(); ++i) {
@@ -2137,8 +2254,8 @@ TEST(GraphTest, CpuConditionalBufferBoundaryExportsOnlySelectedBranch) {
     thenRegion->importFromParent(std::vector<BufferBoundaryMapping>{{source, thenInput}});
     IOMap thenIo;
     GraphBuffer thenOutput;
-    thenIo.bindInputBuffer("in", thenInput)
-          .bindOutputBuffer("out", BufferType::I32, thenOutput, thenRegion->scopeId());
+    thenIo.bindInput("in", thenInput)
+          .bindOutput("out", BufferType::I32, thenOutput, thenRegion->scopeId());
     thenRegion->addKernel(cpuKernel("then_buffer_boundary", ioType), std::move(thenIo), "cpu");
     thenRegion->exportToParent(std::vector<BufferBoundaryMapping>{{thenOutput, result}});
 
@@ -2147,8 +2264,8 @@ TEST(GraphTest, CpuConditionalBufferBoundaryExportsOnlySelectedBranch) {
     elseRegion->importFromParent(std::vector<BufferBoundaryMapping>{{source, elseInput}});
     IOMap elseIo;
     GraphBuffer elseOutput;
-    elseIo.bindInputBuffer("in", elseInput)
-          .bindOutputBuffer("out", BufferType::I32, elseOutput, elseRegion->scopeId());
+    elseIo.bindInput("in", elseInput)
+          .bindOutput("out", BufferType::I32, elseOutput, elseRegion->scopeId());
     elseRegion->addKernel(cpuKernel("else_buffer_boundary", ioType), std::move(elseIo), "cpu");
     elseRegion->exportToParent(std::vector<BufferBoundaryMapping>{{elseOutput, result}});
 
@@ -2161,7 +2278,7 @@ TEST(GraphTest, CpuConditionalBufferBoundaryExportsOnlySelectedBranch) {
     auto runBranch = [&](int32_t branchFlag, int32_t input, int32_t expected) {
         cpu->setInputBuffer(source.name(), &input, sizeof(input));
         g.setScalar<int32_t>("buffer_branch_flag", branchFlag);
-        g.compile(); ASSERT_NO_THROW(g.run());
+        ASSERT_NO_THROW(g.compile().run());
         int32_t output = 0;
         cpu->getOutputBuffer(result.name(), &output, sizeof(output));
         EXPECT_EQ(output, expected);
@@ -2209,8 +2326,8 @@ TEST(GraphTest, CpuConditionalScalarBoundaryExportsOnlySelectedBranch) {
     GraphScalar thenOutput = thenRegion->scalar(ScalarType::I32, "output");
     thenRegion->importFromParent({{source, thenInput}});
     IOMap thenIo;
-    thenIo.bindScalar("in", thenInput)
-          .bindScalar("out", thenOutput);
+    thenIo.bindInputScalar("in", thenInput)
+          .bindOutputScalar("out", thenOutput);
     thenRegion->addKernel(cpuKernel("then_scalar_boundary", scalarInOutType),
                           std::move(thenIo), "cpu");
     thenRegion->exportToParent({{thenOutput, result}});
@@ -2220,8 +2337,8 @@ TEST(GraphTest, CpuConditionalScalarBoundaryExportsOnlySelectedBranch) {
     GraphScalar elseOutput = elseRegion->scalar(ScalarType::I32, "output");
     elseRegion->importFromParent({{source, elseInput}});
     IOMap elseIo;
-    elseIo.bindScalar("in", elseInput)
-          .bindScalar("out", elseOutput);
+    elseIo.bindInputScalar("in", elseInput)
+          .bindOutputScalar("out", elseOutput);
     elseRegion->addKernel(cpuKernel("else_scalar_boundary", scalarInOutType),
                           std::move(elseIo), "cpu");
     elseRegion->exportToParent({{elseOutput, result}});
@@ -2234,22 +2351,25 @@ TEST(GraphTest, CpuConditionalScalarBoundaryExportsOnlySelectedBranch) {
 
     g.setScalar<int32_t>("scalar_branch_flag", 1);
     g.setScalar<int32_t>("scalar_branch_source", 7);
-    g.compile(); ASSERT_NO_THROW(g.run());
-    EXPECT_EQ(g.getScalar<int32_t>("scalar_branch_result"), 107);
+    auto execThen = g.compile();
+    ASSERT_NO_THROW(execThen.run());
+    EXPECT_EQ(execThen.getScalar<int32_t>("scalar_branch_result"), 107);
     EXPECT_EQ(*thenCalls, 1);
     EXPECT_EQ(*elseCalls, 0);
 
     g.setScalar<int32_t>("scalar_branch_flag", 0);
     g.setScalar<int32_t>("scalar_branch_source", 11);
-    g.compile(); ASSERT_NO_THROW(g.run());
-    EXPECT_EQ(g.getScalar<int32_t>("scalar_branch_result"), 211);
+    auto execElse = g.compile();
+    ASSERT_NO_THROW(execElse.run());
+    EXPECT_EQ(execElse.getScalar<int32_t>("scalar_branch_result"), 211);
     EXPECT_EQ(*thenCalls, 1);
     EXPECT_EQ(*elseCalls, 1);
 
     g.setScalar<int32_t>("scalar_branch_flag", 1);
     g.setScalar<int32_t>("scalar_branch_source", 3);
-    g.compile(); ASSERT_NO_THROW(g.run());
-    EXPECT_EQ(g.getScalar<int32_t>("scalar_branch_result"), 103);
+    auto execThenAgain = g.compile();
+    ASSERT_NO_THROW(execThenAgain.run());
+    EXPECT_EQ(execThenAgain.getScalar<int32_t>("scalar_branch_result"), 103);
     EXPECT_EQ(*thenCalls, 2);
     EXPECT_EQ(*elseCalls, 1);
 }
@@ -2268,7 +2388,7 @@ TEST(GraphTest, CpuWhileLoopFalseConditionNoops) {
     body->addKernel(cpuKernel("while_tick"), IOMap{}, "cpu");
     g.addLoop(whileLoopSpec(Condition::alwaysFalse(), body));
 
-    g.compile(); EXPECT_NO_THROW(g.run());
+    EXPECT_NO_THROW(g.compile().run());
     EXPECT_EQ(*calls, 0);
 }
 
@@ -2298,8 +2418,8 @@ TEST(GraphTest, CpuWhileLoopScalarBoundaryCarriesUpdatedCondition) {
     std::string startId = body->importFromParent({{counter, localCounter}});
 
     IOMap bodyIo;
-    bodyIo.bindScalar("in", localCounter)
-          .bindScalar("out", localNext);
+    bodyIo.bindInputScalar("in", localCounter)
+          .bindOutputScalar("out", localNext);
     std::string kernelId = body->addKernel(cpuKernel("increment_scalar", incrementType),
                                            std::move(bodyIo), "cpu", {startId});
     body->exportToParent({{localNext, counter}}, {kernelId});
@@ -2312,20 +2432,23 @@ TEST(GraphTest, CpuWhileLoopScalarBoundaryCarriesUpdatedCondition) {
 
     g.setScalar<int32_t>("boundary_counter", 0);
     g.setScalar<int32_t>("boundary_limit", 1);
-    g.compile(); ASSERT_NO_THROW(g.run());
-    EXPECT_EQ(g.getScalar<int32_t>("boundary_counter"), 1);
+    auto execOne = g.compile();
+    ASSERT_NO_THROW(execOne.run());
+    EXPECT_EQ(execOne.getScalar<int32_t>("boundary_counter"), 1);
     EXPECT_EQ(*calls, 1);
 
     g.setScalar<int32_t>("boundary_counter", 0);
     g.setScalar<int32_t>("boundary_limit", 3);
-    g.compile(); ASSERT_NO_THROW(g.run());
-    EXPECT_EQ(g.getScalar<int32_t>("boundary_counter"), 3);
+    auto execThree = g.compile();
+    ASSERT_NO_THROW(execThree.run());
+    EXPECT_EQ(execThree.getScalar<int32_t>("boundary_counter"), 3);
     EXPECT_EQ(*calls, 4);
 
     g.setScalar<int32_t>("boundary_counter", 0);
     g.setScalar<int32_t>("boundary_limit", 2);
-    g.compile(); ASSERT_NO_THROW(g.run());
-    EXPECT_EQ(g.getScalar<int32_t>("boundary_counter"), 2);
+    auto execTwo = g.compile();
+    ASSERT_NO_THROW(execTwo.run());
+    EXPECT_EQ(execTwo.getScalar<int32_t>("boundary_counter"), 2);
     EXPECT_EQ(*calls, 6);
 }
 
@@ -2347,15 +2470,15 @@ TEST(GraphTest, CpuExecutorBlocksConsumerUntilProducerSignals) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     GraphBuffer dbld, finalBuf;
 
-    IOMap ioM; ioM.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, dbld);
+    IOMap ioM; ioM.bindInput("in", raw).bindOutput("out", BufferType::I32, dbld);
     g.addNode(mockCpuKernel("dbl"), std::move(ioM), "mcpu:0");
-    IOMap ioS; ioS.bindInputBuffer("in", dbld).bindOutputBuffer("out", BufferType::I32, finalBuf);
+    IOMap ioS; ioS.bindInput("in", dbld).bindOutput("out", BufferType::I32, finalBuf);
     g.addNode(cpuKernel("sink"), std::move(ioS), "cpu");
 
     std::vector<int32_t> in = {3, 5, 9};
     mcpu->setInputBuffer("raw", in.data(), in.size() * sizeof(int32_t));
 
-    g.compile(); g.run();
+    g.compile().run();
 
     std::vector<int32_t> out(3);
     cpu->getOutputBuffer(finalBuf.name(), out.data(), out.size() * sizeof(int32_t));
@@ -2391,31 +2514,32 @@ TEST(GraphTest, CpuExecutorSharedRemoteBufferFanoutUsesSameConsumerBridge) {
     GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
     GraphBuffer sharedBuf, leftBuf, rightBuf, sumBuf;
 
-    IOMap ioP; ioP.bindInputBuffer("in", raw).bindOutputBuffer("out", BufferType::I32, sharedBuf);
+    IOMap ioP; ioP.bindInput("in", raw).bindOutput("out", BufferType::I32, sharedBuf);
     g.addNode(mockCpuKernel("dbl"), std::move(ioP), "mcpu:0");
 
-    IOMap ioL; ioL.bindInputBuffer("in", sharedBuf).bindOutputBuffer("out", BufferType::I32, leftBuf);
+    IOMap ioL; ioL.bindInput("in", sharedBuf).bindOutput("out", BufferType::I32, leftBuf);
     auto idL = g.addNode(cpuKernel("add1"), std::move(ioL), "cpu");
 
-    IOMap ioR; ioR.bindInputBuffer("in", sharedBuf).bindOutputBuffer("out", BufferType::I32, rightBuf);
+    IOMap ioR; ioR.bindInput("in", sharedBuf).bindOutput("out", BufferType::I32, rightBuf);
     auto idR = g.addNode(cpuKernel("add2"), std::move(ioR), "cpu");
 
-    IOMap ioS; ioS.bindInputBuffer("left", leftBuf)
-                  .bindInputBuffer("right", rightBuf)
-                  .bindOutputBuffer("out", BufferType::I32, sumBuf);
+    IOMap ioS; ioS.bindInput("left", leftBuf)
+                  .bindInput("right", rightBuf)
+                  .bindOutput("out", BufferType::I32, sumBuf);
     g.addNode(cpuKernel("sum"), std::move(ioS), "cpu");
 
     std::vector<int32_t> in = {3, 5};
     mcpu->setInputBuffer("raw", in.data(), in.size() * sizeof(int32_t));
 
-    g.compile(); ASSERT_NO_THROW(g.run());
+    auto exec = g.compile();
+    ASSERT_NO_THROW(exec.run());
 
     std::vector<int32_t> out(2);
     cpu->getOutputBuffer(sumBuf.name(), out.data(), out.size() * sizeof(int32_t));
     EXPECT_EQ(out[0], 15);  // (3*2 + 1) + (3*2 + 2)
     EXPECT_EQ(out[1], 23);  // (5*2 + 1) + (5*2 + 2)
 
-    const auto* dgCpu = findDg(g.dgraphs(), "cpu");
+    const auto* dgCpu = findDg(exec.dgraphs(), "cpu");
     ASSERT_NE(dgCpu, nullptr);
 
     const CompiledNode* nL = findNode(*dgCpu, idL);
@@ -2506,37 +2630,37 @@ TEST(GraphTest, CpuConditionalSelectedBranchSharedRemoteFanoutUsesSameConsumerBr
 
     IOMap seedIo;
     GraphBuffer seeded;
-    seedIo.bindInputBuffer("in", thenInput)
-          .bindOutputBuffer("out", BufferType::I32, seeded, thenRegion->scopeId());
+    seedIo.bindInput("in", thenInput)
+          .bindOutput("out", BufferType::I32, seeded, thenRegion->scopeId());
     thenRegion->addKernel(cpuKernel("fanout_seed", ioType), std::move(seedIo), "cpu");
 
     IOMap remoteIo;
     GraphBuffer sharedRemote;
-    remoteIo.bindInputBuffer("in", seeded)
-            .bindOutputBuffer("out", BufferType::I32, sharedRemote,
+    remoteIo.bindInput("in", seeded)
+            .bindOutput("out", BufferType::I32, sharedRemote,
                               thenRegion->scopeId());
     thenRegion->addKernel(mockCpuKernel("fanout_dbl", ioType), std::move(remoteIo),
                           "mcpu:0");
 
     IOMap leftIo;
     GraphBuffer leftOut;
-    leftIo.bindInputBuffer("in", sharedRemote)
-          .bindOutputBuffer("out", BufferType::I32, leftOut, thenRegion->scopeId());
+    leftIo.bindInput("in", sharedRemote)
+          .bindOutput("out", BufferType::I32, leftOut, thenRegion->scopeId());
     std::string leftId = thenRegion->addKernel(cpuKernel("fanout_add1", ioType),
                                                std::move(leftIo), "cpu");
 
     IOMap rightIo;
     GraphBuffer rightOut;
-    rightIo.bindInputBuffer("in", sharedRemote)
-           .bindOutputBuffer("out", BufferType::I32, rightOut, thenRegion->scopeId());
+    rightIo.bindInput("in", sharedRemote)
+           .bindOutput("out", BufferType::I32, rightOut, thenRegion->scopeId());
     std::string rightId = thenRegion->addKernel(cpuKernel("fanout_add2", ioType),
                                                 std::move(rightIo), "cpu");
 
     IOMap sumIo;
     GraphBuffer thenOutput;
-    sumIo.bindInputBuffer("left", leftOut)
-         .bindInputBuffer("right", rightOut)
-         .bindOutputBuffer("out", BufferType::I32, thenOutput, thenRegion->scopeId());
+    sumIo.bindInput("left", leftOut)
+         .bindInput("right", rightOut)
+         .bindOutput("out", BufferType::I32, thenOutput, thenRegion->scopeId());
     thenRegion->addKernel(cpuKernel("fanout_sum"), std::move(sumIo), "cpu");
     thenRegion->exportToParent(std::vector<BufferBoundaryMapping>{{thenOutput, result}});
 
@@ -2545,8 +2669,8 @@ TEST(GraphTest, CpuConditionalSelectedBranchSharedRemoteFanoutUsesSameConsumerBr
     elseRegion->importFromParent(std::vector<BufferBoundaryMapping>{{source, elseInput}});
     IOMap elseIo;
     GraphBuffer elseOutput;
-    elseIo.bindInputBuffer("in", elseInput)
-          .bindOutputBuffer("out", BufferType::I32, elseOutput, elseRegion->scopeId());
+    elseIo.bindInput("in", elseInput)
+          .bindOutput("out", BufferType::I32, elseOutput, elseRegion->scopeId());
     elseRegion->addKernel(cpuKernel("fanout_else", ioType), std::move(elseIo), "cpu");
     elseRegion->exportToParent(std::vector<BufferBoundaryMapping>{{elseOutput, result}});
 
@@ -2561,7 +2685,7 @@ TEST(GraphTest, CpuConditionalSelectedBranchSharedRemoteFanoutUsesSameConsumerBr
                          std::vector<int32_t> expected) {
         cpu->setInputBuffer(source.name(), input.data(), input.size() * sizeof(int32_t));
         g.setScalar<int32_t>(flag.varName(), branchFlag);
-        g.compile(); ASSERT_NO_THROW(g.run());
+        ASSERT_NO_THROW(g.compile().run());
         std::vector<int32_t> output(input.size(), 0);
         cpu->getOutputBuffer(result.name(), output.data(), output.size() * sizeof(int32_t));
         EXPECT_EQ(output, expected);
@@ -2588,7 +2712,8 @@ TEST(GraphTest, CpuConditionalSelectedBranchSharedRemoteFanoutUsesSameConsumerBr
     EXPECT_EQ(*rightCalls, 2);
     EXPECT_EQ(*elseCalls, 1);
 
-    const DGraph* cpuDGraph = findDg(g.dgraphs(), "cpu");
+    auto structureExec = g.compile();
+    const DGraph* cpuDGraph = findDg(structureExec.dgraphs(), "cpu");
     ASSERT_NE(cpuDGraph, nullptr);
     const DGraphChild* thenChild = findChildDGraphs(
         *cpuDGraph, conditionalId, DGraphChildRole::ConditionalThen);
@@ -2649,16 +2774,16 @@ TEST(GraphTest, CpuExecutorMultipleConsumersOutOfOrderSignals) {
     GraphBuffer rawC = g.inputBuffer(BufferType::I32, "rawC");
     GraphBuffer aOut, bOut, cOut, sumBuf;
 
-    IOMap ioA; ioA.bindInputBuffer("in", rawA).bindOutputBuffer("out", BufferType::I32, aOut);
+    IOMap ioA; ioA.bindInput("in", rawA).bindOutput("out", BufferType::I32, aOut);
     g.addNode(mockCpuKernel("k"), std::move(ioA), "mcpu:0");
-    IOMap ioB; ioB.bindInputBuffer("in", rawB).bindOutputBuffer("out", BufferType::I32, bOut);
+    IOMap ioB; ioB.bindInput("in", rawB).bindOutput("out", BufferType::I32, bOut);
     g.addNode(mockCpuKernel("k"), std::move(ioB), "mcpu:1");
-    IOMap ioC; ioC.bindInputBuffer("in", rawC).bindOutputBuffer("out", BufferType::I32, cOut);
+    IOMap ioC; ioC.bindInput("in", rawC).bindOutput("out", BufferType::I32, cOut);
     g.addNode(mockCpuKernel("k"), std::move(ioC), "mcpu:2");
-    IOMap ioJ; ioJ.bindInputBuffer("a", aOut)
-                  .bindInputBuffer("b", bOut)
-                  .bindInputBuffer("c", cOut)
-                  .bindOutputBuffer("out", BufferType::I32, sumBuf);
+    IOMap ioJ; ioJ.bindInput("a", aOut)
+                  .bindInput("b", bOut)
+                  .bindInput("c", cOut)
+                  .bindOutput("out", BufferType::I32, sumBuf);
     g.addNode(cpuKernel("fanin"), std::move(ioJ), "cpu");
 
     std::vector<int32_t> a = {1, 2}, b = {3, 4}, c = {5, 6};
@@ -2666,7 +2791,7 @@ TEST(GraphTest, CpuExecutorMultipleConsumersOutOfOrderSignals) {
     mcpu1->setInputBuffer("rawB", b.data(), b.size() * sizeof(int32_t));
     mcpu2->setInputBuffer("rawC", c.data(), c.size() * sizeof(int32_t));
 
-    g.compile(); g.run();
+    g.compile().run();
 
     std::vector<int32_t> out(2);
     cpu->getOutputBuffer(sumBuf.name(), out.data(), out.size() * sizeof(int32_t));

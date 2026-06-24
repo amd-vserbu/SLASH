@@ -24,11 +24,11 @@
  *
  * IOMap is constructed by the user before calling Graph::addNode().  It maps
  * each port name declared in the kernel's IOTypeMap to a concrete value:
- *  - Input scalars   → GraphScalar (constant or global variable)
- *  - Output scalars  → GraphScalar (global variable name, written by the kernel)
- *  - Input buffers   → an existing GraphBuffer token (produced earlier in the graph)
- *  - Output buffers  → a new GraphBuffer token (captured by the caller)
- *  - RW buffers      → an existing input token + a new output token
+ *  - inputScalars   → GraphScalar (constant or global variable)
+ *  - outputScalars  → GraphScalar (global variable name, written by the kernel)
+ *  - inputs         → an existing GraphBuffer token (produced earlier in the graph)
+ *  - outputs        → a new GraphBuffer token (captured by the caller)
+ *  - inouts         → an existing input token + a new output token
  *
  * All bind*() methods return *this for method chaining.
  */
@@ -52,29 +52,40 @@ namespace vrt::graph {
 class IOMap {
    public:
     /**
-     * @brief Bind a scalar port to a GraphScalar (constant or global variable).
-     *
-     * Works for both input and output scalar ports.
+     * @brief Bind an input scalar port to a GraphScalar.
      */
-    IOMap& bindScalar(std::string portName, GraphScalar scalar) {
-        if (scalars_.count(portName)) {
-            throw std::invalid_argument("bindScalar: port '" + portName + "' already bound");
+    IOMap& bindInputScalar(std::string portName, GraphScalar scalar) {
+        if (inputScalars_.count(portName)) {
+            throw std::invalid_argument(
+                "bindInputScalar: port '" + portName + "' already bound");
         }
-        scalars_.emplace(std::move(portName), std::move(scalar));
+        inputScalars_.emplace(std::move(portName), std::move(scalar));
+        return *this;
+    }
+
+    /**
+     * @brief Bind an output scalar port to a writable GraphScalar.
+     */
+    IOMap& bindOutputScalar(std::string portName, GraphScalar scalar) {
+        if (outputScalars_.count(portName)) {
+            throw std::invalid_argument(
+                "bindOutputScalar: port '" + portName + "' already bound");
+        }
+        outputScalars_.emplace(std::move(portName), std::move(scalar));
         return *this;
     }
 
     /**
      * @brief Bind an input buffer port to an existing GraphBuffer token.
      */
-    IOMap& bindInputBuffer(std::string portName, GraphBuffer buf) {
+    IOMap& bindInput(std::string portName, GraphBuffer buf) {
         if (!buf.valid()) {
-            throw std::invalid_argument("bindInputBuffer: invalid (default-constructed) GraphBuffer");
+            throw std::invalid_argument("bindInput: invalid (default-constructed) GraphBuffer");
         }
-        if (inputBuffers_.count(portName)) {
-            throw std::invalid_argument("bindInputBuffer: port '" + portName + "' already bound");
+        if (inputs_.count(portName)) {
+            throw std::invalid_argument("bindInput: port '" + portName + "' already bound");
         }
-        inputBuffers_.emplace(std::move(portName), std::move(buf));
+        inputs_.emplace(std::move(portName), std::move(buf));
         return *this;
     }
 
@@ -84,40 +95,40 @@ class IOMap {
      * The caller must capture @p out before using it as an input to subsequent nodes.
      * The token's name is auto-generated; use the returned IOMap& for chaining.
      *
-     * @param portName  Port name matching an outputBuffers entry in the IOTypeMap.
+     * @param portName  Port name matching an outputs entry in the IOTypeMap.
      * @param type      Element type of the produced buffer.
      * @param out       Receives the newly created GraphBuffer token.
      * @param scopeId   Graph-region namespace for the produced token.
      */
-    IOMap& bindOutputBuffer(std::string portName, BufferType type, GraphBuffer& out,
-                            uint64_t scopeId = 0) {
-        if (outputBuffers_.count(portName)) {
-            throw std::invalid_argument("bindOutputBuffer: port '" + portName + "' already bound");
+    IOMap& bindOutput(std::string portName, BufferType type, GraphBuffer& out,
+                      uint64_t scopeId = 0) {
+        if (outputs_.count(portName)) {
+            throw std::invalid_argument("bindOutput: port '" + portName + "' already bound");
         }
         std::string tokenName = nextTokenName(portName);
         out = GraphBuffer::make(type, tokenName, scopeId);
-        outputBuffers_.emplace(std::move(portName), out);
+        outputs_.emplace(std::move(portName), out);
         return *this;
     }
 
     /**
      * @brief Bind an output buffer port to a pre-declared token.
      *
-     * Unlike bindOutputBuffer(), this does not mint a new token: the caller
+     * Unlike bindOutput(), this does not mint a new token: the caller
      * supplies the already-declared output token (e.g. from Graph::buffer()).
      * This is the binding path used by the struct-literal authoring API where
      * outputs bind to named tokens declared up front.
      */
-    IOMap& bindExistingOutputBuffer(std::string portName, GraphBuffer out) {
+    IOMap& bindExistingOutput(std::string portName, GraphBuffer out) {
         if (!out.valid()) {
             throw std::invalid_argument(
-                "bindExistingOutputBuffer: invalid (default-constructed) GraphBuffer");
+                "bindExistingOutput: invalid (default-constructed) GraphBuffer");
         }
-        if (outputBuffers_.count(portName)) {
+        if (outputs_.count(portName)) {
             throw std::invalid_argument(
-                "bindExistingOutputBuffer: port '" + portName + "' already bound");
+                "bindExistingOutput: port '" + portName + "' already bound");
         }
-        outputBuffers_.emplace(std::move(portName), std::move(out));
+        outputs_.emplace(std::move(portName), std::move(out));
         return *this;
     }
 
@@ -127,27 +138,27 @@ class IOMap {
      * Consumes @p in and produces @p out, both supplied by the caller (no
      * minting). @p out must match @p in's element type.
      */
-    IOMap& bindExistingRWBuffer(std::string inPortName, std::string outPortName,
-                                GraphBuffer in, GraphBuffer out) {
+    IOMap& bindExistingInout(std::string inPortName, std::string outPortName,
+                             GraphBuffer in, GraphBuffer out) {
         if (!in.valid() || !out.valid()) {
             throw std::invalid_argument(
-                "bindExistingRWBuffer: invalid (default-constructed) GraphBuffer");
+                "bindExistingInout: invalid (default-constructed) GraphBuffer");
         }
         if (in.type() != out.type()) {
             throw std::invalid_argument(
-                "bindExistingRWBuffer: in/out element types differ");
+                "bindExistingInout: in/out element types differ");
         }
-        for (const auto& existing : rwBuffers_) {
+        for (const auto& existing : inouts_) {
             if (existing.inPort == inPortName) {
                 throw std::invalid_argument(
-                    "bindExistingRWBuffer: input port '" + inPortName + "' already bound");
+                    "bindExistingInout: input port '" + inPortName + "' already bound");
             }
             if (existing.outPort == outPortName) {
                 throw std::invalid_argument(
-                    "bindExistingRWBuffer: output port '" + outPortName + "' already bound");
+                    "bindExistingInout: output port '" + outPortName + "' already bound");
             }
         }
-        rwBuffers_.emplace_back(RWBinding{std::move(inPortName), std::move(outPortName),
+        inouts_.emplace_back(InoutBinding{std::move(inPortName), std::move(outPortName),
                                           std::move(in), std::move(out)});
         return *this;
     }
@@ -165,39 +176,45 @@ class IOMap {
      * @param out          Receives the newly created output token.
      * @param scopeId      Graph-region namespace for the produced token.
      */
-    IOMap& bindRWBuffer(std::string inPortName, std::string outPortName,
-                        GraphBuffer in, GraphBuffer& out, uint64_t scopeId = 0) {
+    IOMap& bindInout(std::string inPortName, std::string outPortName,
+                     GraphBuffer in, GraphBuffer& out, uint64_t scopeId = 0) {
         if (!in.valid()) {
-            throw std::invalid_argument("bindRWBuffer: invalid (default-constructed) input GraphBuffer");
+            throw std::invalid_argument("bindInout: invalid (default-constructed) input GraphBuffer");
         }
-        for (const auto& existing : rwBuffers_) {
+        for (const auto& existing : inouts_) {
             if (existing.inPort == inPortName) {
-                throw std::invalid_argument("bindRWBuffer: input port '" + inPortName + "' already bound");
+                throw std::invalid_argument("bindInout: input port '" + inPortName + "' already bound");
             }
             if (existing.outPort == outPortName) {
-                throw std::invalid_argument("bindRWBuffer: output port '" + outPortName + "' already bound");
+                throw std::invalid_argument("bindInout: output port '" + outPortName + "' already bound");
             }
         }
         std::string tokenName = nextTokenName(outPortName);
         out = GraphBuffer::make(in.type(), tokenName, scopeId);
-        rwBuffers_.emplace_back(RWBinding{std::move(inPortName), std::move(outPortName),
+        inouts_.emplace_back(InoutBinding{std::move(inPortName), std::move(outPortName),
                                           std::move(in), out});
         return *this;
     }
 
     // --- Accessors used by GraphCompiler (not part of the public user API) ---
 
-    const std::map<std::string, GraphScalar>&  scalars()       const { return scalars_; }
-    const std::map<std::string, GraphBuffer>&  inputBuffers()  const { return inputBuffers_; }
-    const std::map<std::string, GraphBuffer>&  outputBuffers() const { return outputBuffers_; }
+    const std::map<std::string, GraphScalar>& inputScalars() const { return inputScalars_; }
+    const std::map<std::string, GraphScalar>& outputScalars() const { return outputScalars_; }
+    std::map<std::string, GraphScalar> scalarBindings() const {
+        std::map<std::string, GraphScalar> merged = inputScalars_;
+        merged.insert(outputScalars_.begin(), outputScalars_.end());
+        return merged;
+    }
+    const std::map<std::string, GraphBuffer>& inputs() const { return inputs_; }
+    const std::map<std::string, GraphBuffer>& outputs() const { return outputs_; }
 
-    struct RWBinding {
+    struct InoutBinding {
         std::string inPort;
         std::string outPort;
         GraphBuffer in;
         GraphBuffer out;
     };
-    const std::vector<RWBinding>& rwBuffers() const { return rwBuffers_; }
+    const std::vector<InoutBinding>& inouts() const { return inouts_; }
 
    private:
     std::string nextTokenName(const std::string& portName) {
@@ -205,10 +222,11 @@ class IOMap {
         return portName + "_buf_" + std::to_string(globalCounter++);
     }
 
-    std::map<std::string, GraphScalar> scalars_;
-    std::map<std::string, GraphBuffer> inputBuffers_;
-    std::map<std::string, GraphBuffer> outputBuffers_;
-    std::vector<RWBinding>             rwBuffers_;
+    std::map<std::string, GraphScalar> inputScalars_;
+    std::map<std::string, GraphScalar> outputScalars_;
+    std::map<std::string, GraphBuffer> inputs_;
+    std::map<std::string, GraphBuffer> outputs_;
+    std::vector<InoutBinding>          inouts_;
 };
 
 }  // namespace vrt::graph

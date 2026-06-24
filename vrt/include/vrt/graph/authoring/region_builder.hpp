@@ -100,12 +100,12 @@ class RegionBuilder {
         KernelDescriptor desc{spec.kernel.name, spec.kernel.type, spec.kernel.image,
                               spec.kernel.ioType};
         IOMap io;
-        for (const auto& s : spec.scalarInputs) io.bindScalar(s.port, s.scalar);
-        for (const auto& s : spec.scalarOutputs) io.bindScalar(s.port, s.scalar);
-        for (const auto& b : spec.inputs) io.bindInputBuffer(b.port, b.buffer);
-        for (const auto& b : spec.outputs) io.bindExistingOutputBuffer(b.port, b.buffer);
-        for (const auto& rw : spec.inout) {
-            io.bindExistingRWBuffer(rw.port, rw.port, rw.in, rw.out);
+        for (const auto& s : spec.inputScalars) io.bindInputScalar(s.port, s.scalar);
+        for (const auto& s : spec.outputScalars) io.bindOutputScalar(s.port, s.scalar);
+        for (const auto& b : spec.inputs) io.bindInput(b.port, b.buffer);
+        for (const auto& b : spec.outputs) io.bindExistingOutput(b.port, b.buffer);
+        for (const auto& rw : spec.inouts) {
+            io.bindExistingInout(rw.port, rw.port, rw.in, rw.out);
         }
         std::string id = region_->addKernel(std::move(desc), std::move(io),
                                              spec.kernel.deviceId, idsOf(spec.after));

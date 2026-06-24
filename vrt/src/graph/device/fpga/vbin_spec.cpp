@@ -99,11 +99,11 @@ IOTypeMap ioTypeMapFromFunctionalArgs(const std::vector<FunctionalArg>& args) {
             // buffers as RW and otherwise use the write flag as "kernel
             // consumes this pointer" to match HLS AXI-Lite address args.
             if (arg.readable && !arg.writable) {
-                ioType.outputBuffers.push_back(port);
+                ioType.outputs.push_back(port);
             } else if (arg.readable && arg.writable) {
-                ioType.rwBuffers.push_back(RWBufferPort{port, BufferPort{arg.name + "_out", port.type}});
+                ioType.inouts.push_back(RWBufferPort{port, BufferPort{arg.name + "_out", port.type}});
             } else {
-                ioType.inputBuffers.push_back(port);
+                ioType.inputs.push_back(port);
             }
             continue;
         }
