@@ -325,8 +325,110 @@ class FpgaDevicePlan : public IDevicePlan {
         try { wait(); } catch (...) { /* swallow */ }
     }
 
+    static void dumpImage(const fpga::Rp1GraphImage& image) {
+        auto opName = [](std::uint16_t op) -> const char* {
+            switch (op) {
+                case RP1_OP_WAIT:            return "WAIT";
+                case RP1_OP_SIGNAL:          return "SIGNAL";
+                case RP1_OP_SCALAR_READ:     return "SCALAR_READ";
+                case RP1_OP_SCALAR_COPY:     return "SCALAR_COPY";
+                case RP1_OP_KERNEL_DISPATCH: return "KERNEL_DISPATCH";
+                case RP1_OP_DMA_COPY:        return "DMA_COPY";
+                case RP1_OP_PDI_LOAD:        return "PDI_LOAD";
+                case RP1_OP_LOOP:            return "LOOP";
+                case RP1_OP_COND:            return "COND";
+                case RP1_OP_RERUN:           return "RERUN";
+                default:                     return "?";
+            }
+        };
+        std::cerr << "[rp1-dump] " << image.nodes.size() << " nodes\n";
+        for (std::size_t i = 0; i < image.nodes.size(); ++i) {
+            const rp1_node_t& n = image.nodes[i];
+            std::cerr << "[rp1-dump] #" << i << " " << opName(n.opcode)
+                      << " await(b" << int(n.barrier_await_bucket) << ":0x"
+                      << std::hex << n.barrier_await_mask << std::dec << ")"
+                      << " set(b" << int(n.barrier_set_bucket) << ":0x"
+                      << std::hex << n.barrier_set_mask << std::dec << ")";
+            if (n.opcode == RP1_OP_WAIT) {
+                std::cerr << " wait[sig=" << n.payload.wait.condition_signal
+                          << " op=" << n.payload.wait.condition_op
+                          << " val=" << n.payload.wait.condition_value << "]";
+            } else if (n.opcode == RP1_OP_SIGNAL) {
+                std::cerr << " sig[slot=" << n.payload.signal.target_slot
+                          << " op=" << n.payload.signal.operation
+                          << " val=" << n.payload.signal.value << "]";
+            } else if (n.opcode == RP1_OP_LOOP) {
+                std::cerr << " loop[body=" << n.payload.loop.body_start << ".."
+                          << n.payload.loop.body_end
+                          << " maxIter=" << n.payload.loop.max_iterations
+                          << " condSig=" << n.payload.loop.condition_signal
+                          << " condVal=" << n.payload.loop.condition_value
+                          << " condOp=" << n.payload.loop.condition_op
+                          << " clearB=" << int(n.payload.loop.bucket_clear_start) << ".."
+                          << int(n.payload.loop.bucket_clear_end) << "]";
+            } else if (n.opcode == RP1_OP_PDI_LOAD) {
+                std::cerr << " pdi[img=" << n.payload.pdi_load.image_id << "]";
+            } else if (n.opcode == RP1_OP_KERNEL_DISPATCH) {
+                std::cerr << " kd[img=" << n.payload.kernel_dispatch.expected_image_id << "]";
+            } else if (n.opcode == RP1_OP_SCALAR_COPY) {
+                std::cerr << " scopy[srcSlot=" << n.payload.scalar_copy.source_slot << "]";
+            } else if (n.opcode == RP1_OP_SCALAR_READ) {
+                std::cerr << " sread[slot=" << n.payload.scalar_read.target_slot << "]";
+            }
+            std::cerr << "\n";
+        }
+        std::cerr << std::flush;
+    }
+
+    // Every rendezvous / broadcast handshake slot must start at 0 on each
+    // submission.  The depth-1 SIGNAL/WAIT protocol (and the Follower's
+    // broadcast-decision LOOP predicate) assumes a fresh slot, but the device
+    // is not reset between graphs, so a stale value from a prior run would make
+    // a WAIT mis-fire and desync the two queues.  Clear every slot touched by a
+    // SIGNAL / WAIT / LOOP-predicate, but preserve SCALAR_COPY source slots --
+    // those carry a live loop-carried scalar whose initial value the host has
+    // already staged.
+    static void clearHandshakeSlots(fpga::Rp1GraphImage& image) {
+        // Carried-scalar slots hold a live initial value the host already
+        // staged -- never clear those.
+        std::set<std::uint32_t> carried;
+        for (const rp1_node_t& n : image.nodes) {
+            if (n.opcode == RP1_OP_SCALAR_COPY) {
+                carried.insert(n.payload.scalar_copy.source_slot);
+            }
+        }
+        // Only loop-internal handshakes need pre-zeroing: the per-iteration body
+        // rendezvous and the broadcast/while predicate the LOOP polls.  Top-level
+        // one-shot bridge slots are managed live by the host (the CPU may raise
+        // them around submission time), so leave those untouched.
+        std::set<std::uint32_t> toClear;
+        for (const rp1_node_t& n : image.nodes) {
+            if (n.opcode != RP1_OP_LOOP) continue;
+            toClear.insert(n.payload.loop.condition_signal);
+            const std::uint32_t bs = n.payload.loop.body_start;
+            const std::uint32_t be = n.payload.loop.body_end;
+            for (std::uint32_t i = bs; i <= be && i < image.nodes.size(); ++i) {
+                const rp1_node_t& b = image.nodes[i];
+                if (b.opcode == RP1_OP_SIGNAL) {
+                    toClear.insert(b.payload.signal.target_slot);
+                } else if (b.opcode == RP1_OP_WAIT) {
+                    toClear.insert(b.payload.wait.condition_signal);
+                }
+            }
+        }
+        for (std::uint32_t s : toClear) {
+            if (carried.count(s)) continue;
+            if (std::find(image.clear_signal_slots.begin(),
+                          image.clear_signal_slots.end(), s) ==
+                image.clear_signal_slots.end()) {
+                image.clear_signal_slots.push_back(s);
+            }
+        }
+    }
+
     void launch() override {
         wait();
+        if (std::getenv("VRT_RP1_DUMP")) dumpImage(image_);
         workerEx_ = nullptr;
         worker_ = std::thread([this] {
             try {
@@ -338,6 +440,15 @@ class FpgaDevicePlan : public IDevicePlan {
                 applyImageSideEffects();
             } catch (...) {
                 workerEx_ = std::current_exception();
+                try {
+                    std::rethrow_exception(workerEx_);
+                } catch (const std::exception& e) {
+                    std::cerr << "[FpgaDevicePlan] worker exception: " << e.what()
+                              << std::endl;
+                } catch (...) {
+                    std::cerr << "[FpgaDevicePlan] worker exception: (non-std)"
+                              << std::endl;
+                }
             }
         });
     }
@@ -628,6 +739,46 @@ class FpgaDevicePlan : public IDevicePlan {
                 }
             }
         }
+        // Topologically order the body nodes by their intra-body dependencies.
+        // The FPGA lowering derives each node's await mask from the bits of
+        // already-emitted body nodes, so a producer must precede its consumer in
+        // this list.  convertBridgesToRendezvous appends the rendezvous
+        // SIGNAL/WAIT nodes after the kernels, yet a consumer kernel depends on
+        // its waitReady -- a backward edge unless we sort here.  Stable Kahn
+        // keeps the original order among ready nodes.
+        {
+            std::unordered_map<std::string, std::size_t> idxById;
+            for (std::size_t i = 0; i < mids.size(); ++i) {
+                idxById[compiledNodeId(*mids[i])] = i;
+            }
+            std::vector<int> indeg(mids.size(), 0);
+            std::vector<std::vector<std::size_t>> succ(mids.size());
+            for (std::size_t i = 0; i < mids.size(); ++i) {
+                for (const std::string& d : compiledNodeDependsOn(*mids[i])) {
+                    auto it = idxById.find(d);
+                    if (it != idxById.end()) {
+                        succ[it->second].push_back(i);
+                        ++indeg[i];
+                    }
+                }
+            }
+            std::set<std::size_t> ready;
+            for (std::size_t i = 0; i < mids.size(); ++i) {
+                if (indeg[i] == 0) ready.insert(i);
+            }
+            std::vector<const CompiledNode*> sorted;
+            sorted.reserve(mids.size());
+            while (!ready.empty()) {
+                const std::size_t i = *ready.begin();
+                ready.erase(ready.begin());
+                sorted.push_back(mids[i]);
+                for (std::size_t s : succ[i]) {
+                    if (--indeg[s] == 0) ready.insert(s);
+                }
+            }
+            if (sorted.size() == mids.size()) mids = std::move(sorted);
+        }
+
         std::vector<const CompiledNode*> out;
         out.reserve(starts.size() + mids.size() + ends.size());
         out.insert(out.end(), starts.begin(), starts.end());
@@ -856,6 +1007,7 @@ class FpgaDevicePlan : public IDevicePlan {
         sentinel.payload.signal.operation = RP1_SIGOP_SET;
         image.nodes.push_back(sentinel);
         image.clear_signal_slots.push_back(sentinelSlot_);
+        clearHandshakeSlots(image);
 
         if (image.nodes.size() > RP1_MAX_NODES) {
             throw std::logic_error("FpgaDevice: main-line image exceeds RP1_MAX_NODES");
@@ -1018,6 +1170,7 @@ class FpgaDevicePlan : public IDevicePlan {
         sentinel.payload.signal.operation   = RP1_SIGOP_SET;
         image.nodes.push_back(sentinel);
         image.clear_signal_slots.push_back(sentinelSlot_);
+        clearHandshakeSlots(image);
 
         if (image.nodes.size() > RP1_MAX_NODES) {
             throw std::logic_error("FpgaDevice: control-flow image exceeds RP1_MAX_NODES");
@@ -1190,6 +1343,9 @@ class FpgaDevicePlan : public IDevicePlan {
                 for (const ScalarPort& ip : k->kernel.ioType.inputScalars) {
                     auto bindIt = k->ioMap.scalars().find(ip.name);
                     if (bindIt == k->ioMap.scalars().end()) continue;
+                    // A constant-bound input is a normal dispatch arg, never a
+                    // loop-carried scalar -- skip it (and don't call varName()).
+                    if (bindIt->second.isConstant()) continue;
                     const std::string localKey = scopedScalarKey(
                         bindIt->second.scopeId(), bindIt->second.varName());
                     auto impIt = scalarImport.find(localKey);
@@ -1226,7 +1382,7 @@ class FpgaDevicePlan : public IDevicePlan {
                     auto bindIt = k->ioMap.scalars().find(sp.name);
                     std::uint32_t slot;
                     std::string   localKey;
-                    if (bindIt != k->ioMap.scalars().end()) {
+                    if (bindIt != k->ioMap.scalars().end() && !bindIt->second.isConstant()) {
                         localKey = scopedScalarKey(bindIt->second.scopeId(),
                                                    bindIt->second.varName());
                     }

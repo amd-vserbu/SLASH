@@ -2766,6 +2766,14 @@ class RegionCompiler {
         std::map<DGraph*, std::set<std::string>> removeIds;
         std::map<DGraph*, std::vector<CompiledNode>> appendNodes;
         std::map<std::string, std::string> depRewrite;  // bridge half id -> data-ready node id
+        // Consumer kernel id -> extra dependency that gates it on its input
+        // being delivered (the rendezvous waitReady / pull-xfer).  depRewrite
+        // only rewrites *existing* deps, but a consumer kernel may carry an
+        // explicit `.after` (e.g. a reprogram) and never list the removed
+        // consumer-bridge half in its deps, so the data-ready ordering must be
+        // added outright -- otherwise the kernel runs before its input arrives
+        // and the cross-device body pipeline deadlocks.
+        std::map<std::string, std::vector<std::string>> kernelExtraDeps;
 
         for (auto& [op, hs] : byOp) {
             (void)op;
@@ -2860,6 +2868,13 @@ class RegionCompiler {
             // on the staged data instead of the removed consumer bridge.
             depRewrite[cons->id] = dataReadyId;
             depRewrite[prod->id] = tag + "ready_set";
+            // Gate the consumer kernel itself on the data being ready, so it
+            // runs only after waitReady (push) / the pull-xfer (pull).  Without
+            // this the kernel (which may only carry an explicit `.after`
+            // reprogram dep) runs before its rendezvous input arrives.
+            if (!cons->pairedKernelId.empty()) {
+                kernelExtraDeps[cons->pairedKernelId].push_back(dataReadyId);
+            }
         }
 
         // Apply removals, dependsOn rewrites, and appends to each slice.
@@ -2874,6 +2889,14 @@ class RegionCompiler {
                 for (std::string& d : deps) {
                     auto rw = depRewrite.find(d);
                     if (rw != depRewrite.end()) d = rw->second;
+                }
+                if (auto exIt = kernelExtraDeps.find(compiledNodeId(n));
+                    exIt != kernelExtraDeps.end()) {
+                    for (const std::string& extra : exIt->second) {
+                        if (std::find(deps.begin(), deps.end(), extra) == deps.end()) {
+                            deps.push_back(extra);
+                        }
+                    }
                 }
                 kept.push_back(std::move(n));
             }
@@ -3105,13 +3128,19 @@ class RegionCompiler {
                 } else if (auto parts = splitLoopParticipants(rc, *loop)) {
                     rc.splitLoopDevices[id] = *parts;
                     rc.nodeDevice[id] = splitPrimaryDevice(*parts);
-                    if (loop->kind == LoopKind::WhileCondition) {
-                        // Data-dependent split: reserve the broadcast handshake
-                        // slots shared by the Authority (CPU) and Follower (FPGA).
-                        rc.splitLoopBroadcast[id] = {rendezvousSlots_.alloc(),
-                                                     rendezvousSlots_.alloc(),
-                                                     rendezvousSlots_.alloc()};
-                    }
+                    // Every cross-device split loop -- fixed-count *and*
+                    // data-dependent -- needs the per-iteration broadcast
+                    // handshake to keep the CPU Authority and the FPGA Follower
+                    // in lockstep.  The body SIGNAL/WAIT rendezvous alone does
+                    // not gate the Follower's RP1 LOOP re-arm, so an autonomous
+                    // fixed-count Follower laps the CPU body slice (observed on
+                    // hardware: RP1 reaches the post-loop node while the CPU is
+                    // still waiting on body bridges).  Reserve {decision, ready,
+                    // ack} for both kinds; the Authority uses its trip count or
+                    // predicate to drive the decision.
+                    rc.splitLoopBroadcast[id] = {rendezvousSlots_.alloc(),
+                                                 rendezvousSlots_.alloc(),
+                                                 rendezvousSlots_.alloc()};
                 } else if (rc.cpuDevice) {
                     rc.nodeDevice[id] = rc.cpuDevice->id();
                 } else {
