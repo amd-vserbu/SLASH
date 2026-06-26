@@ -220,6 +220,9 @@ class CompiledGraph {
      */
     void launch() {
         for (auto& plan : plans_) {
+            plan->prepareLaunch();
+        }
+        for (auto& plan : plans_) {
             plan->launch();
         }
     }

@@ -44,6 +44,9 @@ class IDevicePlan {
    public:
     virtual ~IDevicePlan() = default;
 
+    /** @brief Optional synchronous pre-launch preparation before any device starts. */
+    virtual void prepareLaunch() {}
+
     /** @brief Start asynchronous execution of the compiled plan. */
     virtual void launch() = 0;
 

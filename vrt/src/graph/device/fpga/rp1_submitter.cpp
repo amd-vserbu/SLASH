@@ -205,6 +205,20 @@ void Rp1Submitter::submitAndWait(const Rp1GraphImage& image,
     }
 }
 
+void Rp1Submitter::clearSignalSlots(const std::vector<std::uint32_t>& slots) {
+    if (!ready_) {
+        ensureReady(kDefaultReadyTimeout);
+    }
+    for (std::uint32_t slot : slots) {
+        if (slot >= RP1_MAX_SIGNALS) {
+            throw std::logic_error(
+                "Rp1Submitter: signal slot " + std::to_string(slot) +
+                " exceeds RP1_MAX_SIGNALS (" + std::to_string(RP1_MAX_SIGNALS) + ")");
+        }
+        window_->clearSignal(slot);
+    }
+}
+
 std::vector<rp1_cq_entry_t> Rp1Submitter::drainCq() {
     const std::uint32_t end = window_->readCqWriteIdx();
     if (end < last_cq_start_) {

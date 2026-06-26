@@ -127,6 +127,15 @@ class Rp1Submitter {
     void ensureReady(std::chrono::milliseconds timeout = kDefaultReadyTimeout);
 
     /**
+     * @brief Clear signal slots before graph launch.
+     *
+     * Used by graph orchestration to zero rendezvous slots synchronously before
+     * any peer queue starts producing signals. submitAndWait() still clears the
+     * image slots for direct/standalone callers that do not use prepareLaunch().
+     */
+    void clearSignalSlots(const std::vector<std::uint32_t>& slots);
+
+    /**
      * @brief Submit @p image and block until graph_done_seq catches up.
      *
      * Calls @c ensureReady() if it hasn't been called yet.

@@ -476,6 +476,12 @@ class FpgaDevicePlan : public IDevicePlan {
         }
     }
 
+    void prepareLaunch() override {
+        wait();
+        submitter_->clearSignalSlots(image_.clear_signal_slots);
+        signalsPrepared_ = true;
+    }
+
     void launch() override {
         wait();
         if (std::getenv("VRT_RP1_DUMP")) dumpImage(image_);
@@ -486,7 +492,11 @@ class FpgaDevicePlan : public IDevicePlan {
                 resolveDeferredScalars();
                 resolveDeferredLoopTripCounts();
                 stageDeferredPdis();
-                submitter_->submitAndWait(image_, timeout_);
+                const bool signalsPrepared = signalsPrepared_;
+                signalsPrepared_ = false;
+                fpga::Rp1GraphImage submitImage = image_;
+                if (signalsPrepared) submitImage.clear_signal_slots.clear();
+                submitter_->submitAndWait(submitImage, timeout_);
                 lastCq_ = submitter_->drainCq();
                 applyImageSideEffects();
             } catch (...) {
@@ -1837,6 +1847,7 @@ class FpgaDevicePlan : public IDevicePlan {
     std::thread                                                worker_;
     std::exception_ptr                                         workerEx_;
     std::vector<rp1_cq_entry_t>                                lastCq_;
+    bool                                                       signalsPrepared_ = false;
     // Output scalars captured into RP1 signal slots by SCALAR_READ during
     // control-image lowering, keyed by the bound scalar's scoped name so a
     // downstream condition (Phase F) can locate the slot to evaluate.
