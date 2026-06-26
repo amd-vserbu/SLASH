@@ -189,17 +189,17 @@ int main(int argc, char** argv) try {
     iot.inputScalars.push_back({"size", vrt::graph::ScalarType::U32});
     iot.inputScalars.push_back({"in_ptr", vrt::graph::ScalarType::U64});
 
-    auto bindArgs = [] {
-        IOMap io;
-        io.bindInputScalar("size",
-                           vrt::graph::GraphScalar::constant<std::uint32_t>(kSharedArg0));
-        io.bindInputScalar("in_ptr",
-                           vrt::graph::GraphScalar::constant<std::uint64_t>(kSharedAddr));
-        return io;
-    };
-
     Graph g = Graph::withDefaults();
     g.registerDevice(fpga);
+    GraphScalar sharedSize = g.scalarInput<std::uint32_t>("shared_size");
+    GraphScalar sharedAddr = g.scalarInput<std::uint64_t>("shared_addr");
+
+    auto bindArgs = [&] {
+        IOMap io;
+        io.bindInputScalar("size", sharedSize);
+        io.bindInputScalar("in_ptr", sharedAddr);
+        return io;
+    };
     const std::string idA = g.addNode(KernelDescriptor{"bringup_kernel_0",
                                                        vrt::graph::DeviceType::FPGA,
                                                        std::nullopt, iot},
@@ -217,6 +217,8 @@ int main(int argc, char** argv) try {
               bindArgs(), "fpga:0", {idB, idC});
 
     auto exec = g.compile();
+    exec.setScalar(sharedSize, kSharedArg0);
+    exec.setScalar(sharedAddr, kSharedAddr);
     std::cout << "[rp1_bringup_vrt] compiled diamond ("
               << "A=0x" << std::hex << kKernelA_R5
               << " B=0x" << kKernelB_R5

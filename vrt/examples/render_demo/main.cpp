@@ -391,11 +391,12 @@ int main(int argc, char** argv) {
     loopBody->addKernel(kd("loop_refine_remote", DeviceType::MOCK_CPU),
                         std::move(loopRemoteIo), "mock_a");
 
+    GraphScalar renderLoopCount = g.scalarInput<int32_t>("render_loop_count");
     LoopSpec loopSpec;
     loopSpec.ioType = io1out();
     loopSpec.ioMap.bindOutput("out", BufferType::U8, bLoop,
                                     g.rootRegion().scopeId());
-    loopSpec.tripCount = LoopTripCount::constant<int32_t>(2);
+    loopSpec.tripCount = LoopTripCount::scalar(renderLoopCount);
     loopSpec.body = loopBody;
     loopSpec.outputPlacement.buffers["out"] = "cpu";
     loopSpec.afterOps = {nFinalize};
@@ -457,9 +458,10 @@ int main(int argc, char** argv) {
     // --- Run the pipeline (so the renderer can show the populated DGraphs) ---
 
     std::vector<uint8_t> data(64, 0xAA);
-    cpu->setInputBuffer("raw", data.data(), data.size());
-    g.setScalar<int32_t>("render_branch_flag", 1);
     auto exec = g.compile();
+    exec.write(raw, data);
+    exec.setScalar(renderBranchFlag, 1);
+    exec.setScalar(renderLoopCount, 2);
     exec.run();
 
     // --- Verify the executed pipeline ---

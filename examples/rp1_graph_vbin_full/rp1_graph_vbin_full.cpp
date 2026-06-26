@@ -301,7 +301,8 @@ int main(int argc, char** argv) try {
 
     // 3. Author the graph.
     GraphBuffer raw = graph.input<int32_t>("raw", cli.elementCount);
-    GraphScalar elementCount = graph.scalarInput<uint64_t>("elementCount", cli.elementCount);
+    GraphScalar elementCount = graph.scalarInput<uint64_t>("elementCount");
+    GraphScalar loopIterations = graph.scalarInput<std::uint32_t>("loopIterations");
 
     GraphBuffer pre = graph.buffer<int32_t>("pre", cli.elementCount);
     graph.addKernelCall({
@@ -313,7 +314,7 @@ int main(int argc, char** argv) try {
     GraphBuffer post = graph.buffer<int32_t>("post", cli.elementCount);
     {
         auto loop = graph.addLoop({
-            .count   = cli.iterations,
+            .count   = loopIterations,
             .inputs  = {{"state", pre}},
             .outputs = {{"state", post}},
         });
@@ -404,24 +405,26 @@ int main(int argc, char** argv) try {
         });
     }
 
-    // 4. Provide input, compile, run, read back -- all keyed by token.
+    // 4. Compile, bind dispatch inputs, run, read back -- all keyed by token.
     std::vector<std::int32_t> input(cli.elementCount);
     for (std::uint32_t i = 0; i < cli.elementCount; ++i) {
         input[i] = static_cast<std::int32_t>(i);
     }
-    graph.write(raw, input);
 
     std::cout << "[rp1_graph_vbin_full] compiling graph with "
               << cli.iterations << " loop iteration(s), "
               << cli.elementCount << " element(s)" << std::endl;
     auto exec = graph.compile();
+    exec.setScalar(elementCount, cli.elementCount);
+    exec.setScalar(loopIterations, cli.iterations);
+    exec.write(raw, input);
 
     std::cout << "[rp1_graph_vbin_full] running graph..." << std::endl;
     exec.run();
     std::cout << "[rp1_graph_vbin_full] graph run complete; checking output..." << std::endl;
 
     std::vector<std::int32_t> output(cli.elementCount, 0);
-    graph.read(out, output);
+    exec.read(out, output);
     const auto expected = expectedOutput(cli.elementCount, cli.iterations);
 
     std::cout << "[rp1_graph_vbin_full] output:";
