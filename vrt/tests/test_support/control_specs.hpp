@@ -29,9 +29,11 @@
 #ifndef VRT_TESTS_TEST_SUPPORT_CONTROL_SPECS_HPP
 #define VRT_TESTS_TEST_SUPPORT_CONTROL_SPECS_HPP
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -44,6 +46,24 @@
 #include <vrt/graph/node/kernel_descriptor.hpp>
 
 namespace vrt::graph::test_support {
+
+namespace detail {
+inline std::string nextTripCountName() {
+    static std::atomic<std::uint64_t> counter{0};
+    return "__trip_count_" + std::to_string(counter++);
+}
+}  // namespace detail
+
+inline GraphScalar tripCountScalar(GraphRegion& region,
+                                   ScalarType type = ScalarType::I32,
+                                   std::string name = {}) {
+    if (name.empty()) name = detail::nextTripCountName();
+    return region.scalar(type, std::move(name));
+}
+
+inline LoopTripCount tripCount(GraphScalar scalar) {
+    return LoopTripCount::scalar(scalar);
+}
 
 inline KernelDescriptor cpuKernel(std::string name, IOTypeMap ioType = {}) {
     return KernelDescriptor{std::move(name), DeviceType::CPU, std::nullopt,

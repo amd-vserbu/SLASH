@@ -168,7 +168,7 @@ TEST(RenderDotTest, GraphRendersAuthoredLoopRegion) {
     auto body = graph.rootRegion().createChild();
     std::string bodyKernelId = body->addKernel(cpuKernel("loopBody"), IOMap{}, "cpu");
     std::string loopId = graph.addLoop(
-        fixedLoopSpec(LoopTripCount::constant<int32_t>(3), body));
+        fixedLoopSpec(tripCount(tripCountScalar(graph.rootRegion())), body));
 
     auto dot = render::renderToDot(graph);
     dumpSection("Graph DOT (authored loop)", dot);
@@ -211,7 +211,7 @@ TEST(RenderDotTest, GraphRendersAuthoredBoundaryNodes) {
     GraphScalar localCounter = body->scalar(ScalarType::I32, "counter");
     std::string startId = body->importFromParent({{parentCounter, localCounter}});
     std::string endId = body->exportToParent({{localCounter, parentCounter}}, {startId});
-    graph.addLoop(fixedLoopSpec(LoopTripCount::constant<int32_t>(1), body));
+    graph.addLoop(fixedLoopSpec(tripCount(tripCountScalar(graph.rootRegion())), body));
 
     auto dot = render::renderToDot(graph);
     dumpSection("Graph DOT (authored boundaries)", dot);
@@ -229,6 +229,155 @@ TEST(RenderDotTest, GraphRendersAuthoredBoundaryNodes) {
     EXPECT_TRUE(contains(dot,
                          "\"" + scopePrefix + startId + "\" -> \"" +
                              scopePrefix + endId + "\""));
+}
+
+TEST(RenderDotTest, GraphRendersLoopOutputsThroughLoopNodeAtParentScope) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
+
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw");
+    IOMap produceIo;
+    GraphBuffer beforeLoop;
+    produceIo.bindInput("in", raw)
+             .bindOutput("out", BufferType::I32, beforeLoop);
+    std::string producerId =
+        graph.addNode(cpuKernel("produce"), std::move(produceIo), "cpu");
+
+    auto body = graph.rootRegion().createChild();
+    GraphBuffer localIn = body->inputBuffer(BufferType::I32, "state");
+    body->importFromParent(std::vector<BufferBoundaryMapping>{{beforeLoop, localIn}});
+    IOMap bodyIo;
+    GraphBuffer localOut;
+    bodyIo.bindInput("in", localIn)
+          .bindOutput("out", BufferType::I32, localOut, body->scopeId());
+    std::string bodyId = body->addKernel(cpuKernel("body"), std::move(bodyIo), "cpu");
+    GraphBuffer afterLoop = GraphBuffer::make(BufferType::I32, "after_loop");
+    body->exportToParent(std::vector<BufferBoundaryMapping>{{localOut, afterLoop}},
+                         {bodyId});
+    std::string loopId = graph.addLoop(
+        fixedLoopSpec(tripCount(tripCountScalar(graph.rootRegion())), body));
+
+    IOMap consumeIo;
+    GraphBuffer finalOut;
+    consumeIo.bindInput("in", afterLoop)
+             .bindOutput("out", BufferType::I32, finalOut);
+    std::string consumerId =
+        graph.addNode(cpuKernel("consume"), std::move(consumeIo), "cpu", {loopId});
+
+    auto dot = render::renderToDot(graph);
+    EXPECT_TRUE(contains(dot, "\"" + producerId + "\" -> \"" + loopId + "\""));
+    EXPECT_TRUE(contains(dot, "\"" + loopId + "\" -> \"" + consumerId + "\""));
+    EXPECT_FALSE(contains(dot, "subgraph_end_1\" -> \"" + consumerId + "\""));
+}
+
+TEST(RenderDotTest, GraphRendersConditionalOutputsThroughConditionalNodeAtParentScope) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
+
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw");
+    auto thenRegion = graph.rootRegion().createChild();
+    auto elseRegion = graph.rootRegion().createChild();
+
+    auto buildBranch = [&](const std::shared_ptr<GraphRegion>& region,
+                           const std::string& kernelName) {
+        GraphBuffer localIn = region->inputBuffer(BufferType::I32, "in");
+        region->importFromParent(std::vector<BufferBoundaryMapping>{{raw, localIn}});
+        IOMap io;
+        GraphBuffer localOut;
+        io.bindInput("in", localIn)
+          .bindOutput("out", BufferType::I32, localOut, region->scopeId());
+        std::string kid = region->addKernel(cpuKernel(kernelName), std::move(io), "cpu");
+        return std::pair<GraphBuffer, std::string>{localOut, kid};
+    };
+
+    auto [thenOut, thenId] = buildBranch(thenRegion, "then");
+    auto [elseOut, elseId] = buildBranch(elseRegion, "else");
+    GraphBuffer condOut = GraphBuffer::make(BufferType::I32, "cond_out");
+    thenRegion->exportToParent(std::vector<BufferBoundaryMapping>{{thenOut, condOut}},
+                               {thenId});
+    elseRegion->exportToParent(std::vector<BufferBoundaryMapping>{{elseOut, condOut}},
+                               {elseId});
+
+    std::string condId = graph.addConditional(
+        ifElseSpec(Condition::alwaysTrue(), thenRegion, elseRegion));
+
+    IOMap consumeIo;
+    GraphBuffer finalOut;
+    consumeIo.bindInput("in", condOut)
+             .bindOutput("out", BufferType::I32, finalOut);
+    std::string consumerId =
+        graph.addNode(cpuKernel("consume"), std::move(consumeIo), "cpu", {condId});
+
+    auto dot = render::renderToDot(graph);
+    EXPECT_TRUE(contains(dot, "\"subgraph_start_"));
+    EXPECT_TRUE(contains(dot, "\"" + condId + "\" -> \"" + consumerId + "\""));
+    EXPECT_FALSE(contains(dot, "subgraph_end_1\" -> \"" + consumerId + "\""));
+}
+
+TEST(RenderDotTest, GraphRendersScalarConditionEdgeToConditionalNode) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
+
+    IOTypeMap predType;
+    predType.outputScalars.push_back({"out", ScalarType::I32});
+    GraphScalar flag = graph.globalScalar(ScalarType::I32, "flag");
+    IOMap predIo;
+    predIo.bindOutputScalar("out", flag);
+    std::string predId = graph.addNode(
+        KernelDescriptor{"pred", DeviceType::CPU, std::nullopt, predType},
+        std::move(predIo), "cpu");
+
+    auto thenRegion = graph.rootRegion().createChild();
+    auto elseRegion = graph.rootRegion().createChild();
+    std::string condId = graph.addConditional(ifElseSpec(
+        Condition::compare(CompareOp::EQ,
+                           ConditionOperand::scalar(ScalarType::I32, flag.varName(),
+                                                    flag.scopeId()),
+                           ConditionOperand::constant<int32_t>(1)),
+        thenRegion, elseRegion, {predId}));
+
+    auto dot = render::renderToDot(graph);
+    EXPECT_TRUE(contains(dot, "\"" + predId + "\" -> \"" + condId + "\""));
+    EXPECT_TRUE(contains(dot, "scalar: flag"));
+}
+
+TEST(RenderDotTest, GraphRendersScalarTripCountEdgeToLoopNode) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
+
+    IOTypeMap predType;
+    predType.outputScalars.push_back({"out", ScalarType::I32});
+    GraphScalar count = graph.globalScalar(ScalarType::I32, "trip_count");
+    IOMap predIo;
+    predIo.bindOutputScalar("out", count);
+    std::string predId = graph.addNode(
+        KernelDescriptor{"count_producer", DeviceType::CPU, std::nullopt, predType},
+        std::move(predIo), "cpu");
+
+    auto body = graph.rootRegion().createChild();
+    LoopSpec loop;
+    loop.tripCount = LoopTripCount::scalar(count.type(), count.varName(), count.scopeId());
+    loop.body = body;
+    loop.afterOps = {predId};
+    std::string loopId = graph.addLoop(std::move(loop));
+
+    auto dot = render::renderToDot(graph);
+    EXPECT_TRUE(contains(dot, "\"" + predId + "\" -> \"" + loopId + "\""));
+    EXPECT_TRUE(contains(dot, "scalar: trip_count"));
+}
+
+TEST(RenderDotTest, GraphRendersUnproducedScalarTripCountAsInputNode) {
+    Graph graph;
+    graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
+
+    GraphScalar count = graph.scalarInput<std::uint32_t>("dispatch_count");
+    auto body = graph.rootRegion().createChild();
+    std::string loopId = graph.addLoop(fixedLoopSpec(LoopTripCount::scalar(count), body));
+
+    auto dot = render::renderToDot(graph);
+    EXPECT_TRUE(contains(dot, "scalar input\\ndispatch_count"));
+    EXPECT_TRUE(contains(dot, "\"__scalar_input_0_dispatch_count\" -> \"" + loopId + "\""));
+    EXPECT_TRUE(contains(dot, "scalar: dispatch_count"));
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +449,7 @@ TEST(RenderDotTest, DGraphIncludesCompiledFixedLoopMetadata) {
     loop.id = "loop_0";
     loop.deviceId = "cpu";
     loop.loopKind = CompiledLoopKind::FixedCount;
-    loop.tripCount = LoopTripCount::constant<int32_t>(3);
+    loop.tripCount = LoopTripCount::scalar(ScalarType::I32, "trip_count");
     loop.outputBufferPlacements["out"] = "cpu";
     loop.outputScalarPlacements["count"] = "cpu";
 
@@ -324,7 +473,7 @@ TEST(RenderDotTest, DGraphIncludesCompiledFixedLoopMetadata) {
     EXPECT_TRUE(contains(dot, "loop_0"));
     EXPECT_TRUE(contains(dot, "[Loop]"));
     EXPECT_TRUE(contains(dot, "(FixedCount)"));
-    EXPECT_TRUE(contains(dot, "trip: const"));
+    EXPECT_TRUE(contains(dot, "trip: scalar trip_count"));
     EXPECT_TRUE(contains(dot, "outputs: 1 buffer, 1 scalar"));
     EXPECT_TRUE(contains(dot, "placements: 1 buffer, 1 scalar"));
 }

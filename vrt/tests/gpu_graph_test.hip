@@ -159,6 +159,7 @@ TEST(GpuGraphTest, SingleGpuKernel) {
 
     Graph g;
     g.registerDevice(gpu);
+    GraphScalar n = g.scalarInput<uint64_t>("n");
 
     GraphBuffer bufA = g.inputBuffer(BufferType::F32, "a");
     GraphBuffer bufB = g.inputBuffer(BufferType::F32, "b");
@@ -168,7 +169,7 @@ TEST(GpuGraphTest, SingleGpuKernel) {
     io.bindInput("a", bufA)
       .bindInput("b", bufB)
       .bindOutput("c", BufferType::F32, bufC)
-      .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+      .bindInputScalar("n", n);
     g.addNode(gpuKernel("vadd"), std::move(io), "gpu:0");
 
     // Provide input data
@@ -177,7 +178,9 @@ TEST(GpuGraphTest, SingleGpuKernel) {
     gpu->setInputBuffer("a", a.data(), a.size() * sizeof(float));
     gpu->setInputBuffer("b", b.data(), b.size() * sizeof(float));
 
-    g.compile().run();
+    auto exec = g.compile();
+    exec.setScalar(n, 4ull);
+    exec.run();
 
     // Read output
     std::vector<float> c(4);
@@ -208,6 +211,7 @@ TEST(GpuGraphTest, GpuPipeline) {
 
     Graph g;
     g.registerDevice(gpu);
+    GraphScalar n = g.scalarInput<uint64_t>("n");
 
     GraphBuffer bufA = g.inputBuffer(BufferType::F32, "a");
     GraphBuffer bufB = g.inputBuffer(BufferType::F32, "b");
@@ -218,7 +222,7 @@ TEST(GpuGraphTest, GpuPipeline) {
     io1.bindInput("a", bufA)
        .bindInput("b", bufB)
        .bindOutput("c", BufferType::F32, afterAdd)
-       .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+       .bindInputScalar("n", n);
     g.addNode(gpuKernel("vadd"), std::move(io1), "gpu:0");
 
     // Node 2: double
@@ -226,7 +230,7 @@ TEST(GpuGraphTest, GpuPipeline) {
     GraphBuffer afterDbl;
     io2.bindInput("in", afterAdd)
        .bindOutput("out", BufferType::F32, afterDbl)
-       .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+       .bindInputScalar("n", n);
     g.addNode(gpuKernel("dbl"), std::move(io2), "gpu:0");
 
     // Node 3: negate
@@ -234,7 +238,7 @@ TEST(GpuGraphTest, GpuPipeline) {
     GraphBuffer afterNeg;
     io3.bindInput("in", afterDbl)
        .bindOutput("out", BufferType::F32, afterNeg)
-       .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+       .bindInputScalar("n", n);
     g.addNode(gpuKernel("neg"), std::move(io3), "gpu:0");
 
     // Input data
@@ -243,7 +247,9 @@ TEST(GpuGraphTest, GpuPipeline) {
     gpu->setInputBuffer("a", a.data(), a.size() * sizeof(float));
     gpu->setInputBuffer("b", b.data(), b.size() * sizeof(float));
 
-    g.compile().run();
+    auto exec = g.compile();
+    exec.setScalar(n, 4ull);
+    exec.run();
 
     // Expected: -((a + b) * 2) = {-22, -44, -66, -88}
     std::vector<float> result(4);
@@ -274,6 +280,7 @@ TEST(GpuGraphTest, CpuToGpuCrossDevice) {
     Graph g;
     g.registerDevice(cpu);
     g.registerDevice(gpu);
+    GraphScalar n = g.scalarInput<uint64_t>("n");
     g.registerBridgeFactory(DeviceType::CPU, DeviceType::GPU, CpuGpuBridgeFactory());
     g.registerBridgeFactory(DeviceType::GPU, DeviceType::CPU, CpuGpuBridgeFactory());
 
@@ -291,14 +298,16 @@ TEST(GpuGraphTest, CpuToGpuCrossDevice) {
     GraphBuffer afterGpu;
     io2.bindInput("in", afterCpu)
        .bindOutput("out", BufferType::F32, afterGpu)
-       .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+       .bindInputScalar("n", n);
     g.addNode(gpuKernel("gpu_dbl"), std::move(io2), "gpu:0");
 
     // Input data
     std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f};
     cpu->setInputBuffer("input", data.data(), data.size() * sizeof(float));
 
-    g.compile().run();
+    auto exec = g.compile();
+    exec.setScalar(n, 4ull);
+    exec.run();
 
     // Expected: (x + 10) * 2 = {22, 24, 26, 28}
     std::vector<float> result(4);
@@ -332,6 +341,7 @@ TEST(GpuGraphTest, GpuDiamondDag) {
 
     Graph g;
     g.registerDevice(gpu);
+    GraphScalar n = g.scalarInput<uint64_t>("n");
 
     GraphBuffer input = g.inputBuffer(BufferType::F32, "input");
 
@@ -341,7 +351,7 @@ TEST(GpuGraphTest, GpuDiamondDag) {
     ioA.bindInput("in", input)
        .bindOutput("left", BufferType::F32, bufLeft)
        .bindOutput("right", BufferType::F32, bufRight)
-       .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+       .bindInputScalar("n", n);
     g.addNode(gpuKernel("split"), std::move(ioA), "gpu:0");
 
     // Node B: double(left)
@@ -349,7 +359,7 @@ TEST(GpuGraphTest, GpuDiamondDag) {
     GraphBuffer afterDbl;
     ioB.bindInput("in", bufLeft)
        .bindOutput("out", BufferType::F32, afterDbl)
-       .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+       .bindInputScalar("n", n);
     g.addNode(gpuKernel("dbl"), std::move(ioB), "gpu:0");
 
     // Node C: negate(right)
@@ -357,7 +367,7 @@ TEST(GpuGraphTest, GpuDiamondDag) {
     GraphBuffer afterNeg;
     ioC.bindInput("in", bufRight)
        .bindOutput("out", BufferType::F32, afterNeg)
-       .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+       .bindInputScalar("n", n);
     g.addNode(gpuKernel("neg"), std::move(ioC), "gpu:0");
 
     // Node D: merge(afterDbl, afterNeg)
@@ -366,14 +376,16 @@ TEST(GpuGraphTest, GpuDiamondDag) {
     ioD.bindInput("left", afterDbl)
        .bindInput("right", afterNeg)
        .bindOutput("out", BufferType::F32, output)
-       .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+       .bindInputScalar("n", n);
     g.addNode(gpuKernel("merge"), std::move(ioD), "gpu:0");
 
     // Input: {1, 2, 3, 4}
     std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f};
     gpu->setInputBuffer("input", data.data(), data.size() * sizeof(float));
 
-    g.compile().run();
+    auto exec = g.compile();
+    exec.setScalar(n, 4ull);
+    exec.run();
 
     // split:  left = x+1 = {2,3,4,5},  right = x*10 = {10,20,30,40}
     // dbl:    left*2 = {4,6,8,10}
@@ -399,17 +411,18 @@ TEST(GpuGraphTest, MissingKernelThrows) {
 
     Graph g;
     g.registerDevice(gpu);
+    GraphScalar n = g.scalarInput<uint64_t>("n");
 
     GraphBuffer input = g.inputBuffer(BufferType::F32, "input");
     IOMap io;
     GraphBuffer output;
     io.bindInput("in", input)
       .bindOutput("out", BufferType::F32, output)
-      .bindInputScalar("n", GraphScalar::constant(ScalarType::U64, 4));
+      .bindInputScalar("n", n);
     g.addNode(gpuKernel("nonexistent"), std::move(io), "gpu:0");
 
     std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f};
     gpu->setInputBuffer("input", data.data(), data.size() * sizeof(float));
 
-    EXPECT_THROW(g.compile(), std::runtime_error);
+    EXPECT_THROW((void)g.compile(), std::runtime_error);
 }

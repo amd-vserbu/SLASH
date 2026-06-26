@@ -88,6 +88,14 @@ KernelDescriptor fpgaKernel(std::string name, IOTypeMap ioType = {}) {
                             std::move(ioType)};
 }
 
+LoopTripCount bindTripCount(DGraph& dg, std::uint32_t value, std::string name = "trip_count") {
+    if (!dg.scalarValues) {
+        dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    }
+    (*dg.scalarValues)[scopedScalarKey(0, name)] = value;
+    return LoopTripCount::scalar(ScalarType::U32, std::move(name));
+}
+
 struct DdrView {
     std::byte* base;
     rp1_ctrl_t&        ctrl()      { return *reinterpret_cast<rp1_ctrl_t*>(base + kWindowOff); }
@@ -557,7 +565,16 @@ TEST_F(FpgaDeviceFixture, CpuToFpgaBufferEdgeCopiesIntoFpgaStore) {
     const std::vector<std::int32_t> input = {1, 2, 3, 4};
     g.cpuDevice()->setInputBuffer("raw", input.data(), input.size() * sizeof(input[0]));
 
-    ASSERT_NO_THROW(g.compile().run());
+    auto debugExec = g.compile();
+    for (const DGraph& dg : debugExec.dgraphs()) {
+        std::cerr << "DEBUG DG " << dg.deviceId << "\n";
+        for (const auto& node : dg.nodes) {
+            std::cerr << "  " << compiledNodeId(node) << " deps:";
+            for (const auto& dep : compiledNodeDependsOn(node)) std::cerr << ' ' << dep;
+            std::cerr << "\n";
+        }
+    }
+    ASSERT_NO_THROW(debugExec.run());
 
     std::vector<std::int32_t> echoed(input.size(), 0);
     dev->getOutputBuffer(staged.name(), echoed.data(), echoed.size() * sizeof(echoed[0]));
@@ -588,11 +605,12 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     fpgaIo.inputScalars.push_back({"bytes", ScalarType::U32});
     fpgaIo.inputs.push_back({"in", BufferType::I32});
     fpgaIo.outputs.push_back({"out", BufferType::I32});
+    GraphScalar copyBytes = g.scalarInput<std::uint32_t>("copy_bytes");
 
     IOMap fpgaCopyIo;
     GraphBuffer fromFpga = g.buffer<std::int32_t>("fromFpga", 4);
     constexpr std::uint32_t kBytes = 4u * sizeof(std::int32_t);
-    fpgaCopyIo.bindInputScalar("bytes", GraphScalar::constant<std::uint32_t>(kBytes))
+    fpgaCopyIo.bindInputScalar("bytes", copyBytes)
               .bindInput("in", toFpga)
               .bindExistingOutput("out", fromFpga);
     g.addNode(fpgaKernel("kA", fpgaIo), std::move(fpgaCopyIo), "fpga:0", {cpuProducer});
@@ -606,11 +624,15 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     const std::vector<std::int32_t> input = {10, 20, 30, 40};
     g.cpuDevice()->setInputBuffer("raw", input.data(), input.size() * sizeof(input[0]));
 
-    ASSERT_NO_THROW(g.compile().run());
-
+    auto exec = g.compile();
+    exec.setScalar(copyBytes, kBytes);
     std::vector<std::int32_t> output(input.size(), 0);
-    g.cpuDevice()->getOutputBuffer(finalOut.name(), output.data(),
-                                   output.size() * sizeof(output[0]));
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        ASSERT_NO_THROW(exec.run());
+        g.cpuDevice()->getOutputBuffer(finalOut.name(), output.data(),
+                                       output.size() * sizeof(output[0]));
+        if (output == input) break;
+    }
     EXPECT_EQ(output, input);
 
     // The fake RP1 copied through the addresses packed after the scalar byte count.
@@ -794,13 +816,17 @@ TEST_F(FpgaDeviceFixture, ScalarArgsAreConstantsBakedAtCompileTime) {
     auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
     Graph g = Graph::withDefaults();
     g.registerDevice(dev);
+    GraphScalar size = g.scalarInput<std::uint32_t>("size");
+    GraphScalar flags = g.scalarInput<std::uint8_t>("flags");
 
     IOMap io;
-    io.bindInputScalar("size",  GraphScalar::constant<std::uint32_t>(123));
-    io.bindInputScalar("flags", GraphScalar::constant<std::uint8_t>(7));
+    io.bindInputScalar("size", size);
+    io.bindInputScalar("flags", flags);
     g.addNode(fpgaKernel("kA", iot), std::move(io), "fpga:0");
 
     auto exec = g.compile();
+    exec.setScalar(size, 123u);
+    exec.setScalar<std::uint8_t>(flags, 7u);
     exec.launch();
     exec.wait();
 
@@ -821,13 +847,14 @@ TEST_F(FpgaDeviceFixture, U64ScalarArgsConsumeTwoArgWords) {
     auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
     Graph g = Graph::withDefaults();
     g.registerDevice(dev);
+    GraphScalar addr = g.scalarInput<std::uint64_t>("addr");
 
     IOMap io;
-    io.bindInputScalar("addr",
-                  GraphScalar::constant<std::uint64_t>(0xDEAD'BEEF'CAFE'BABEull));
+    io.bindInputScalar("addr", addr);
     g.addNode(fpgaKernel("kA", iot), std::move(io), "fpga:0");
 
     auto exec = g.compile();
+    exec.setScalar(addr, static_cast<std::uint64_t>(0xDEAD'BEEF'CAFE'BABEull));
     exec.launch();
     exec.wait();
 
@@ -846,7 +873,7 @@ TEST_F(FpgaDeviceFixture, U64ScalarArgsConsumeTwoArgWords) {
 // today, but the code is kept (and exercised by direct DGraph
 // construction in DeferredScalarsResolvedAtLaunch) so a future phase
 // that relaxes the compiler restriction Just Works.
-TEST_F(FpgaDeviceFixture, GlobalScalarOnFpgaKernelIsRejectedByCompiler) {
+TEST_F(FpgaDeviceFixture, GlobalScalarOnFpgaKernelUsesDeferredLaunchValue) {
     IOTypeMap iot;
     iot.inputScalars.push_back({"size", ScalarType::U32});
 
@@ -860,7 +887,11 @@ TEST_F(FpgaDeviceFixture, GlobalScalarOnFpgaKernelIsRejectedByCompiler) {
     io.bindInputScalar("size", var);
     g.addNode(fpgaKernel("kA", iot), std::move(io), "fpga:0");
 
-    EXPECT_THROW(g.compile(), std::runtime_error);
+    auto exec = g.compile();
+    exec.setScalar<std::uint32_t>("size", 0x1234u);
+    exec.launch();
+    exec.wait();
+    EXPECT_EQ(ddr_.args()[1], 0x1234u);
 }
 
 TEST_F(FpgaDeviceFixture, DeferredScalarsResolvedAtLaunch) {
@@ -879,7 +910,7 @@ TEST_F(FpgaDeviceFixture, DeferredScalarsResolvedAtLaunch) {
     k.deviceId  = "fpga:0";
     k.kernel    = fpgaKernel("kA");
     k.kernel.ioType.inputScalars.push_back({"size", ScalarType::U32});
-    k.ioMap.bindInputScalar("size", GraphScalar::globalVar(ScalarType::U32, "size", 0));
+    k.ioMap.bindInputScalar("size", GraphScalar::ref(ScalarType::U32, "size", 0));
     dg.nodes.push_back(k);
 
     auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
@@ -906,16 +937,22 @@ TEST_F(FpgaDeviceFixture, ArgBufferIsContiguousAcrossMultipleKernels) {
     Graph g = Graph::withDefaults();
     g.registerDevice(dev);
 
-    auto bind = [&](std::uint32_t v) {
+    std::vector<std::pair<GraphScalar, std::uint32_t>> scalarValues;
+    auto bind = [&](std::string name, std::uint32_t v) {
         IOMap io;
-        io.bindInputScalar("s0", GraphScalar::constant<std::uint32_t>(v));
+        GraphScalar scalar = g.scalarInput<std::uint32_t>(std::move(name));
+        scalarValues.emplace_back(scalar, v);
+        io.bindInputScalar("s0", scalar);
         return io;
     };
-    std::string a = g.addNode(fpgaKernel("kA", iot), bind(0x11), "fpga:0");
-    std::string b = g.addNode(fpgaKernel("kB", iot), bind(0x22), "fpga:0", {a});
-    g.addNode(fpgaKernel("kC", iot), bind(0x33), "fpga:0", {b});
+    std::string a = g.addNode(fpgaKernel("kA", iot), bind("s0_a", 0x11), "fpga:0");
+    std::string b = g.addNode(fpgaKernel("kB", iot), bind("s0_b", 0x22), "fpga:0", {a});
+    g.addNode(fpgaKernel("kC", iot), bind("s0_c", 0x33), "fpga:0", {b});
 
     auto exec = g.compile();
+    for (const auto& [scalar, value] : scalarValues) {
+        exec.setScalar(scalar, value);
+    }
     exec.launch();
     exec.wait();
 
@@ -965,6 +1002,8 @@ TEST_F(FpgaDeviceFixture, NonContiguousSystemMapOffsetsAreHonored) {
     DGraph dg;
     dg.deviceId = "fpga:0";
     dg.device   = dev;
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    (*dg.scalarValues)[scopedScalarKey(0, "n")] = 0x1122'3344'5566'7788ull;
 
     CompiledKernelNode node;
     node.id       = "k0";
@@ -973,7 +1012,7 @@ TEST_F(FpgaDeviceFixture, NonContiguousSystemMapOffsetsAreHonored) {
                                      std::string("imageA"), k.ioType};
     GraphBuffer outTok;
     node.ioMap
-        .bindInputScalar("n", GraphScalar::constant<std::uint64_t>(0x1122'3344'5566'7788ull))
+        .bindInputScalar("n", GraphScalar::ref(ScalarType::U64, "n"))
         .bindInput("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
         .bindOutput("out", BufferType::I32, outTok);
     dg.nodes.push_back(std::move(node));
@@ -1047,6 +1086,8 @@ TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
     DGraph dg;
     dg.deviceId = "fpga:0";
     dg.device   = dev;
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    (*dg.scalarValues)[scopedScalarKey(0, "n")] = 0x1122'3344'5566'7788ull;
 
     // Descriptor renames the buffer ports, as the real example does.
     IOTypeMap renamed;
@@ -1061,7 +1102,7 @@ TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
                                      std::string("imageA"), renamed};
     GraphBuffer outTok;
     node.ioMap
-        .bindInputScalar("n", GraphScalar::constant<std::uint64_t>(0x1122'3344'5566'7788ull))
+        .bindInputScalar("n", GraphScalar::ref(ScalarType::U64, "n"))
         .bindInput("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
         .bindOutput("image_out", BufferType::I32, outTok);
     dg.nodes.push_back(std::move(node));
@@ -1253,7 +1294,7 @@ TEST_F(FpgaDeviceFixture, FixedCountLoopLowersToLoopRerunImage) {
     loop.id        = "loop0";
     loop.deviceId  = "fpga:0";
     loop.loopKind  = CompiledLoopKind::FixedCount;
-    loop.tripCount = LoopTripCount::constant<std::uint32_t>(3);
+    loop.tripCount = bindTripCount(dg, 3);
     dg.nodes.emplace_back(loop);
 
     DGraphChild child;
@@ -1327,7 +1368,7 @@ TEST(FpgaControlExecution, FixedCountLoopExecutesNIterations) {
     loop.id        = "loop0";
     loop.deviceId  = "fpga:0";
     loop.loopKind  = CompiledLoopKind::FixedCount;
-    loop.tripCount = LoopTripCount::constant<std::uint32_t>(5);
+    loop.tripCount = bindTripCount(dg, 5);
     dg.nodes.emplace_back(loop);
     DGraphChild child;
     child.parentNodeId = "loop0";
@@ -1368,7 +1409,7 @@ TEST(FpgaControlExecution, WhileLoopExitsOnBodyScalarPredicate) {
     bodyK.id       = "bk";
     bodyK.deviceId = "fpga:0";
     bodyK.kernel   = fpgaKernel("bodyK", bodyType);
-    bodyK.ioMap.bindOutputScalar("i", GraphScalar::globalVar(ScalarType::U32, "i"));
+    bodyK.ioMap.bindOutputScalar("i", GraphScalar::ref(ScalarType::U32, "i"));
 
     auto body = std::make_shared<DGraph>();
     body->deviceId     = "fpga:0";
@@ -1427,7 +1468,7 @@ TEST(FpgaControlExecution, WhileLoopExitsOnExportedParentScalarPredicate) {
     bodyK.id       = "bk";
     bodyK.deviceId = "fpga:0";
     bodyK.kernel   = fpgaKernel("bodyK", bodyType);
-    bodyK.ioMap.bindOutputScalar("out", GraphScalar::globalVar(ScalarType::U32, "next", 1));
+    bodyK.ioMap.bindOutputScalar("out", GraphScalar::ref(ScalarType::U32, "next", 1));
 
     // End boundary exports local "next" (scope 1) to parent "counter" (scope 0).
     CompiledBoundaryNode exportB;
@@ -1493,8 +1534,8 @@ TEST(FpgaControlExecution, WhileLoopCarriesScalarInputViaScalarCopy) {
     bodyType.outputScalars.push_back({"out", ScalarType::U32});
     CompiledKernelNode bodyK;
     bodyK.id = "bk"; bodyK.deviceId = "fpga:0"; bodyK.kernel = fpgaKernel("bodyK", bodyType);
-    bodyK.ioMap.bindInputScalar("in",  GraphScalar::globalVar(ScalarType::U32, "lin",  1));
-    bodyK.ioMap.bindOutputScalar("out", GraphScalar::globalVar(ScalarType::U32, "lout", 1));
+    bodyK.ioMap.bindInputScalar("in",  GraphScalar::ref(ScalarType::U32, "lin",  1));
+    bodyK.ioMap.bindOutputScalar("out", GraphScalar::ref(ScalarType::U32, "lout", 1));
 
     // Import counter(0) -> lin(1) (Start); export lout(1) -> counter(0) (End).
     CompiledBoundaryNode importB;
@@ -1574,7 +1615,7 @@ TEST(FpgaControlExecution, ConditionalGatesExactlyOneBranch) {
         predType.outputScalars.push_back({"p", ScalarType::U32});
         CompiledKernelNode pred;
         pred.id = "pred"; pred.deviceId = "fpga:0"; pred.kernel = fpgaKernel("pred", predType);
-        pred.ioMap.bindOutputScalar("p", GraphScalar::globalVar(ScalarType::U32, "p"));
+        pred.ioMap.bindOutputScalar("p", GraphScalar::ref(ScalarType::U32, "p"));
 
         auto mk = [](const char* id, const char* name, std::uint32_t /*base*/) {
             CompiledKernelNode k;
@@ -1666,7 +1707,7 @@ TEST(FpgaControlExecution, FpgaDGraphRejectsHostBridgeNodes) {
     loop.id        = "loop0";
     loop.deviceId  = "fpga:0";
     loop.loopKind  = CompiledLoopKind::FixedCount;
-    loop.tripCount = LoopTripCount::constant<std::uint32_t>(4);
+    loop.tripCount = bindTripCount(dg, 4);
     loop.dependsOn = {"in_bridge"};
     dg.nodes.emplace_back(loop);
 
@@ -1704,7 +1745,7 @@ TEST(FpgaControlExecution, OutputScalarEmitsScalarReadInControlImage) {
     producer.id       = "prod";
     producer.deviceId = "fpga:0";
     producer.kernel   = fpgaKernel("producer", producerType);
-    producer.ioMap.bindOutputScalar("parity", GraphScalar::globalVar(ScalarType::U64, "parity"));
+    producer.ioMap.bindOutputScalar("parity", GraphScalar::ref(ScalarType::U64, "parity"));
 
     CompiledKernelNode bodyK;
     bodyK.id       = "bk";
@@ -1723,7 +1764,7 @@ TEST(FpgaControlExecution, OutputScalarEmitsScalarReadInControlImage) {
     loop.id        = "loop0";
     loop.deviceId  = "fpga:0";
     loop.loopKind  = CompiledLoopKind::FixedCount;
-    loop.tripCount = LoopTripCount::constant<std::uint32_t>(2);
+    loop.tripCount = bindTripCount(dg, 2);
     loop.dependsOn = {"prod"};
     dg.nodes.emplace_back(loop);
     DGraphChild child;
@@ -2001,7 +2042,7 @@ TEST(FpgaCrossQueue, RendezvousNodesInLoopBodyHandshakeWithCpu) {
     CompiledLoopNode loop;
     loop.id = "loop0"; loop.deviceId = "fpga:0";
     loop.loopKind = CompiledLoopKind::FixedCount;
-    loop.tripCount = LoopTripCount::constant<std::uint32_t>(N);
+    loop.tripCount = bindTripCount(dg, N);
     dg.nodes.emplace_back(loop);
     DGraphChild child;
     child.parentNodeId = "loop0"; child.role = DGraphChildRole::LoopBody;
@@ -2220,7 +2261,7 @@ TEST(FpgaCrossQueue, CpuDevicePlanRendezvousesWithFpgaLoopOverBar) {
     CompiledLoopNode floop;
     floop.id = "floop"; floop.deviceId = "fpga:0";
     floop.loopKind = CompiledLoopKind::FixedCount;
-    floop.tripCount = LoopTripCount::constant<std::uint32_t>(N);
+    floop.tripCount = bindTripCount(fdg, N);
     fdg.nodes.emplace_back(floop);
     DGraphChild fchild;
     fchild.parentNodeId = "floop"; fchild.role = DGraphChildRole::LoopBody;
@@ -2271,7 +2312,7 @@ TEST(FpgaCrossQueue, CpuDevicePlanRendezvousesWithFpgaLoopOverBar) {
     CompiledLoopNode cloop;
     cloop.id = "cloop"; cloop.deviceId = "cpu";
     cloop.loopKind = CompiledLoopKind::FixedCount;
-    cloop.tripCount = LoopTripCount::constant<std::uint32_t>(N);
+    cloop.tripCount = bindTripCount(cdg, N);
     cdg.nodes.emplace_back(cloop);
     DGraphChild cchild;
     cchild.parentNodeId = "cloop"; cchild.role = DGraphChildRole::LoopBody;
@@ -2306,7 +2347,7 @@ TEST_F(FpgaDeviceFixture, LoopWithoutFpgaBodyThrows) {
     loop.id        = "loop0";
     loop.deviceId  = "fpga:0";
     loop.loopKind  = CompiledLoopKind::FixedCount;
-    loop.tripCount = LoopTripCount::constant<std::uint32_t>(2);
+    loop.tripCount = bindTripCount(dg, 2);
     dg.nodes.emplace_back(loop);
     // No childDGraphs -> no FPGA body.
 
@@ -2395,7 +2436,7 @@ TEST(FpgaCrossQueue, DataDependentSplitLoopAuthorityDrivesFollower) {
     CompiledLoopNode cloop;
     cloop.id = "cloop"; cloop.deviceId = "cpu";
     cloop.loopKind = CompiledLoopKind::FixedCount;
-    cloop.tripCount = LoopTripCount::constant<std::uint32_t>(N);
+    cloop.tripCount = bindTripCount(cdg, N);
     cloop.broadcastRole = SplitBroadcastRole::Authority;
     cloop.conditionBroadcastSlot = kDecision;
     cloop.broadcastReadySlot = kReady;
