@@ -440,7 +440,8 @@ typedef struct {
     uint32_t set_mask;
     uint32_t timeout_remaining;
     uint8_t  infinite;         /* Non-zero: INFINITE flag set        */
-    uint8_t  _reserved[3];
+    uint8_t  settle_polls;     /* Ignore stale ap_done for N polls   */
+    uint8_t  _reserved[2];
 } rp1_inflight_t;
 
 /* =========================================================================

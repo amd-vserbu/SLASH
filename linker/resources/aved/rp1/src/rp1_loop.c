@@ -92,6 +92,12 @@ static void add_inflight(const rp1_node_t *node, uint32_t node_index)
     if (slot->timeout_remaining == 0)
         slot->timeout_remaining = 10000000; /* default 10M cycles */
     slot->infinite = (node->flags & RP1_FLAG_INFINITE) ? 1 : 0;
+    /* HLS ap_done is sticky, and immediately after ap_start the control
+     * register may still expose the previous invocation's done bit for one or
+     * more scanner passes.  Read/ignore a couple of polls before treating
+     * ap_done as this launch's completion; the reads also clear the stale bit.
+     */
+    slot->settle_polls = 2;
 }
 
 static void remove_inflight(uint32_t idx)
@@ -219,6 +225,13 @@ static int check_inflight(void)
     while (i < g_inflight_count) {
         rp1_inflight_t *k = &g_inflight[i];
         uint32_t ctrl = axi_read32(k->base_addr + 0x00);
+
+        if (k->settle_polls) {
+            k->settle_polls--;
+            i++;
+            made_progress = 1;
+            continue;
+        }
 
         if (ctrl & 0x2) { /* ap_done */
             if (!k->infinite) {
