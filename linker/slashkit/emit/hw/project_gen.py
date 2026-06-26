@@ -139,6 +139,36 @@ def _generate_top_wrapper_pdi_with_bootgen(impl_dir: Path) -> Path:
     return output_pdi
 
 
+def _rp1_source_dir() -> Path:
+    # The RP1 firmware source lives next to the slashkit package, not as
+    # package data.  Locate it relative to this module so editable/source-tree
+    # installs work both locally and inside package builds.
+    pkg_root = Path(__file__).resolve()
+    while pkg_root.name != "slashkit" and pkg_root != pkg_root.parent:
+        pkg_root = pkg_root.parent
+    return pkg_root.parent / "resources" / "aved" / "rp1"
+
+
+def _copy_rp1_sources_to_aved(aved_dir: Path) -> None:
+    rp1_src_dir = _rp1_source_dir()
+    rp1_dest_dir = aved_dir / "fw" / "RP1"
+    if rp1_src_dir.is_dir():
+        if rp1_dest_dir.exists():
+            shutil.rmtree(rp1_dest_dir)
+        shutil.copytree(rp1_src_dir, rp1_dest_dir, dirs_exist_ok=True)
+    else:
+        logger.warning("RP1 firmware source dir not found at %s; "
+                       "shell will use the prebuilt RP1 image", rp1_src_dir)
+
+
+def _add_init_files(path: Path):
+    (path / "__init__.py").touch()
+    for sub_path in path.iterdir():
+        if not sub_path.is_dir():
+            continue
+        _add_init_files(sub_path)
+
+
 def _environment_with_udev_ld_preload() -> Dict[str, str]:
     """
     Create a dictionary of environment variables (based on the current one),
@@ -182,21 +212,7 @@ def generate_base_pdi_with_aved(config: CommandConfiguration) -> Path:
         with resources.path("slashkit.resources.aved", file_name) as in_path:
             _copy_checked(in_path, target_dir / file_name)
 
-    # Copy RP1 firmware sources into the AVED build tree.  The firmware lives in
-    # the repo's linker/resources/aved/rp1 (a sibling of the slashkit package),
-    # not as bundled package data; the static-shell build runs from the source
-    # tree, so locate it relative to the slashkit package root rather than a
-    # (non-existent) config attribute.
-    _pkg_root = Path(__file__).resolve()
-    while _pkg_root.name != "slashkit" and _pkg_root != _pkg_root.parent:
-        _pkg_root = _pkg_root.parent
-    rp1_src_dir = _pkg_root.parent / "resources" / "aved" / "rp1"
-    rp1_dest_dir = aved_dir / "fw" / "RP1"
-    if rp1_src_dir.is_dir():
-        shutil.copytree(rp1_src_dir, rp1_dest_dir, dirs_exist_ok=True)
-    else:
-        logger.warning("RP1 firmware source dir not found at %s; "
-                       "shell will use the prebuilt RP1 image", rp1_src_dir)
+    _copy_rp1_sources_to_aved(aved_dir)
 
     logger.info("Running AVED build script in %s", aved_hw_dir)
     subprocess.run(
@@ -359,19 +375,20 @@ def build_slash_rm(config: LinkerConfiguration) -> None:
     _run_rm_build(config, RM_KIND.SLASH_PROJECT)
 
 
-def install_static_shell(config: InstallerConfiguration) -> None:
-    static_shell_dir = config.out_dir / "static_shell"
+def _install_static_shell_base(config: InstallerConfiguration, static_shell_dir: Path) -> None:
     static_shell_dir.mkdir(parents=True, exist_ok=True)
 
-    # Cloning the AVED repository into the build directory
-    # We're doing this early so that errors are caught *before* the 10-hour Vivado run!
-    subprocess.run([
-        "git", "clone",
-        "--recurse-submodules",
-        "-b", config.aved_ref,
-        config.aved_repo,
-        config.build_dir / "AVED"
-    ], check=True)
+    aved_dir = config.build_dir / "AVED"
+    if not aved_dir.exists():
+        # Clone AVED early so that errors are caught before the multi-hour
+        # implementation run.
+        subprocess.run([
+            "git", "clone",
+            "--recurse-submodules",
+            "-b", config.aved_ref,
+            config.aved_repo,
+            aved_dir
+        ], check=True)
 
     create_build_project(config)
 
@@ -394,19 +411,103 @@ def install_static_shell(config: InstallerConfiguration) -> None:
                 f"Expected install BD directory not found: {src_dir}")
         _copy_tree(src_dir, static_shell_dir)
 
+
+def _install_static_shell_firmware(config: InstallerConfiguration, static_shell_dir: Path) -> None:
+    static_shell_dir.mkdir(parents=True, exist_ok=True)
+    if not (config.build_dir / "AVED").is_dir():
+        raise FileNotFoundError(
+            f"Expected AVED checkout not found in build directory: {config.build_dir / 'AVED'}")
+
     aved_pdi_path = generate_base_pdi_with_aved(config)
     if not aved_pdi_path.exists():
         raise FileNotFoundError(
             f"Expected AVED PDI not found in results/base: {aved_pdi_path}")
     _copy_files([aved_pdi_path], static_shell_dir)
 
-    def add_init_files(path: Path):
-        (path / "__init__.py").touch()
-        for sub_path in path.iterdir():
-            if not sub_path.is_dir():
-                continue
-            add_init_files(sub_path)
-    add_init_files(static_shell_dir)
+    _add_init_files(static_shell_dir)
+
+
+def _install_static_shell_rp1_firmware(config: InstallerConfiguration,
+                                       static_shell_dir: Path) -> None:
+    static_shell_dir.mkdir(parents=True, exist_ok=True)
+
+    aved_dir = config.build_dir / "AVED"
+    aved_hw_dir = aved_dir / "hw" / AVED_DESIGN_NAME
+    aved_build_dir = aved_hw_dir / "build"
+    aved_fpt_dir = aved_hw_dir / "fpt"
+    aved_fw_dir = aved_dir / "fw"
+
+    required = (
+        aved_build_dir / "top_wrapper.pdi",
+        aved_build_dir / "amc.elf",
+        aved_build_dir / "fpt.bin",
+        aved_fpt_dir / "pdi_combine.bif",
+    )
+    for path in required:
+        if not path.exists():
+            raise FileNotFoundError(
+                f"RP1-only firmware repack requires existing artifact: {path}")
+
+    _copy_rp1_sources_to_aved(aved_dir)
+
+    rp1_dir = aved_fw_dir / "RP1"
+    logger.info("Rebuilding RP1 firmware in %s", rp1_dir)
+    subprocess.run(
+        ["bash", "build_rp1.sh"],
+        cwd=str(rp1_dir),
+        env=_clean_cross_build_env(),
+        check=True,
+    )
+    _copy_checked(rp1_dir / "build" / "rp1.elf", aved_build_dir / "rp1.elf")
+
+    nofpt_pdi = aved_build_dir / f"{AVED_DESIGN_NAME}_nofpt.pdi"
+    logger.info(
+        "Repacking %s with existing AMC/FPT and rebuilt RP1", nofpt_pdi.name)
+    subprocess.run(
+        [
+            "bootgen",
+            "-arch",
+            "versal",
+            "-image",
+            str(aved_fpt_dir / "pdi_combine.bif"),
+            "-w",
+            "-o",
+            str(nofpt_pdi),
+        ],
+        cwd=str(aved_hw_dir),
+        env=_clean_cross_build_env(),
+        check=True,
+    )
+
+    aved_pdi = aved_hw_dir / f"{AVED_DESIGN_NAME}.pdi"
+    subprocess.run(
+        [
+            str(aved_fpt_dir / "fpt_pdi_gen.py"),
+            "--fpt",
+            str(aved_build_dir / "fpt.bin"),
+            "--pdi",
+            str(nofpt_pdi),
+            "--output",
+            str(aved_pdi),
+        ],
+        cwd=str(aved_hw_dir),
+        env=_clean_cross_build_env(),
+        check=True,
+    )
+    if not aved_pdi.exists():
+        raise FileNotFoundError(f"Expected AVED PDI not found: {aved_pdi}")
+    _copy_files([aved_pdi], static_shell_dir)
+    _add_init_files(static_shell_dir)
+
+
+def install_static_shell(config: InstallerConfiguration) -> None:
+    static_shell_dir = config.out_dir / "static_shell"
+    if config.stage in ("all", "base-shell"):
+        _install_static_shell_base(config, static_shell_dir)
+    if config.stage in ("all", "firmware"):
+        _install_static_shell_firmware(config, static_shell_dir)
+    if config.stage == "rp1-firmware":
+        _install_static_shell_rp1_firmware(config, static_shell_dir)
 
 
 def generate_util_report(config: CommandConfiguration) -> None:
