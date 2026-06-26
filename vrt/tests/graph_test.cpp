@@ -626,6 +626,78 @@ TEST(GraphTest, Rp1FullGraphShapeRunsWithMockCpuInsteadOfFpga) {
     EXPECT_EQ(output, expectedOutput(elementCount, iterations));
 }
 
+TEST(GraphTest, HighLevelLoopBodyCanCaptureRootScalarInput) {
+    Graph g = Graph::withDefaults();
+    auto cpu = g.cpuDevice();
+    ASSERT_NE(cpu, nullptr);
+
+    IOTypeMap addOffsetType = IOTypeMap{}.in<int32_t>("in")
+                                         .out<int32_t>("out")
+                                         .scalarIn<int32_t>("offset");
+    cpu->registerKernel(makeCpuKernel("loop_add_offset", [](const CpuKernelArgs& args) {
+        auto in = args.in<int32_t>("in");
+        auto out = args.out<int32_t>("out");
+        const auto offset = static_cast<int32_t>(args.scalar("offset"));
+        for (std::size_t i = 0; i < in.size(); ++i) out[i] = in[i] + offset;
+    }, addOffsetType));
+
+    GraphBuffer raw = g.input<int32_t>("capture_raw", 3);
+    GraphBuffer out = g.buffer<int32_t>("capture_out", 3);
+    GraphScalar iterations = g.scalarInput<std::uint32_t>("capture_iterations");
+    GraphScalar offset = g.scalarInput<int32_t>("capture_offset");
+
+    auto loop = g.addLoop({
+        .count = iterations,
+        .inputs = {{"state", raw}},
+        .outputs = {{"state", out}},
+    });
+    loop.addKernelCall({
+        .kernel = {"loop_add_offset", DeviceType::CPU, std::nullopt, addOffsetType, "cpu"},
+        .inputScalars = {{"offset", offset}},
+        .inputs = {{"in", loop.input("state")}},
+        .outputs = {{"out", loop.output("state")}},
+    });
+
+    auto exec = g.compile();
+    std::vector<int32_t> input = {1, 2, 3};
+    exec.write(raw, input);
+    exec.setScalar(iterations, 1u);
+    exec.setScalar(offset, 7);
+    ASSERT_NO_THROW(exec.run());
+
+    std::vector<int32_t> output(input.size(), 0);
+    exec.read(out, output);
+    EXPECT_EQ(output, (std::vector<int32_t>{8, 9, 10}));
+}
+
+TEST(GraphTest, CrossDeviceProducedRootScalarStillRequiresBoundaryMapping) {
+    Graph g = Graph::withDefaults();
+    auto cpu = g.cpuDevice();
+    ASSERT_NE(cpu, nullptr);
+    auto mock = std::make_shared<MockCpuDevice>("mock_fpga:0");
+    g.registerDevice(mock);
+    registerCpuLikeFactory<CpuMockCpuBridge>(g, DeviceType::CPU, DeviceType::MOCK_CPU);
+
+    IOTypeMap producerType = IOTypeMap{}.scalarOut<int32_t>("out");
+    IOTypeMap consumerType = IOTypeMap{}.scalarIn<int32_t>("in");
+
+    GraphScalar produced = g.scalar<int32_t>("cross_device_produced_scalar");
+    g.addKernelCall({
+        .kernel = {"produce_scalar", DeviceType::CPU, std::nullopt, producerType, "cpu"},
+        .outputScalars = {{"out", produced}},
+    });
+
+    GraphScalar iterations = g.scalarInput<std::uint32_t>("cross_device_produced_iterations");
+    auto loop = g.addLoop({.count = iterations});
+    loop.addKernelCall({
+        .kernel = {"consume_scalar", DeviceType::MOCK_CPU, std::nullopt,
+                   consumerType, "mock_fpga:0"},
+        .inputScalars = {{"in", produced}},
+    });
+
+    EXPECT_THROW(g.compile(), std::runtime_error);
+}
+
 // ---------------------------------------------------------------------------
 // 3-node pipeline: add → double → negate
 // ---------------------------------------------------------------------------

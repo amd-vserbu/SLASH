@@ -49,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -123,7 +124,8 @@ class GraphCompiler {
         const std::shared_ptr<std::map<std::string, uint64_t>>& scalarValues);
 
    private:
-    void validateRegionScopes(const GraphRegion& region) const;
+    void validateRegionScopes(const GraphRegion& region,
+                              const std::set<std::string>& rootProducedScalars = {}) const;
 };
 
 }  // namespace vrt::graph

@@ -140,8 +140,24 @@ void requireAllowedScope(const std::string& opId,
 void validateIoMapScopes(const std::string& opId,
                          const IOMap& ioMap,
                          uint64_t regionScope,
-                         const std::set<uint64_t>& allowedScopes) {
-    for (const auto& [port, scalar] : ioMap.scalarBindings()) {
+                         const std::set<uint64_t>& allowedScopes,
+                         const std::set<std::string>& rootProducedScalars = {}) {
+    for (const auto& [port, scalar] : ioMap.inputScalars()) {
+        (void)port;
+        const std::string scalarKey = scopedScalarKey(scalar.scopeId(), scalar.varName());
+        if (regionScope != 0 && scalar.scopeId() == 0 &&
+            rootProducedScalars.count(scalarKey)) {
+            throw std::runtime_error(
+                "GraphCompiler: op '" + opId + "' uses produced root scalar '" +
+                scalar.varName() + "' inside a nested region; import it through a boundary "
+                "mapping before using it inside the region");
+        }
+        std::set<uint64_t> scalarInputScopes = allowedScopes;
+        scalarInputScopes.insert(0);
+        requireAllowedScope(opId, "scalar", scalar.varName(), scalar.scopeId(),
+                            regionScope, scalarInputScopes);
+    }
+    for (const auto& [port, scalar] : ioMap.outputScalars()) {
         (void)port;
         requireAllowedScope(opId, "scalar", scalar.varName(), scalar.scopeId(),
                             regionScope, allowedScopes);
@@ -3789,7 +3805,9 @@ class RegionCompiler {
 // validateRegionScopes
 // ---------------------------------------------------------------------------
 
-void GraphCompiler::validateRegionScopes(const GraphRegion& region) const {
+void GraphCompiler::validateRegionScopes(
+    const GraphRegion& region,
+    const std::set<std::string>& rootProducedScalars) const {
     const uint64_t regionScope = region.scopeId();
     const std::set<uint64_t> localScope{regionScope};
 
@@ -3798,14 +3816,17 @@ void GraphCompiler::validateRegionScopes(const GraphRegion& region) const {
             [&](const auto& concrete) {
                 using T = std::decay_t<decltype(concrete)>;
                 if constexpr (std::is_same_v<T, KernelOp>) {
-                    validateIoMapScopes(concrete.id, concrete.ioMap, regionScope, localScope);
+                    validateIoMapScopes(concrete.id, concrete.ioMap, regionScope,
+                                        localScope, rootProducedScalars);
                 } else if constexpr (std::is_same_v<T, SubgraphBoundaryOp>) {
                     validateIoMapScopes(concrete.id, concrete.ioMap, regionScope,
-                                        {concrete.parentScopeId, concrete.localScopeId});
+                                        {concrete.parentScopeId, concrete.localScopeId},
+                                        rootProducedScalars);
                     validateScalarBoundaryMappings(concrete);
                     validateBufferBoundaryMappings(concrete);
                 } else if constexpr (std::is_same_v<T, LoopOp>) {
-                    validateIoMapScopes(concrete.id, concrete.ioMap, regionScope, localScope);
+                    validateIoMapScopes(concrete.id, concrete.ioMap, regionScope,
+                                        localScope, rootProducedScalars);
                     if (concrete.tripCount) {
                         validateTripCountScope(concrete.id, *concrete.tripCount, regionScope);
                     }
@@ -3813,14 +3834,15 @@ void GraphCompiler::validateRegionScopes(const GraphRegion& region) const {
                         validateConditionScopes(concrete.id, *concrete.condition, regionScope);
                     }
                     validateChildRegion(concrete.id, concrete.body, regionScope);
-                    validateRegionScopes(*concrete.body);
+                    validateRegionScopes(*concrete.body, rootProducedScalars);
                 } else if constexpr (std::is_same_v<T, ConditionalOp>) {
-                    validateIoMapScopes(concrete.id, concrete.ioMap, regionScope, localScope);
+                    validateIoMapScopes(concrete.id, concrete.ioMap, regionScope,
+                                        localScope, rootProducedScalars);
                     validateConditionScopes(concrete.id, concrete.condition, regionScope);
                     validateChildRegion(concrete.id, concrete.thenRegion, regionScope);
                     validateChildRegion(concrete.id, concrete.elseRegion, regionScope);
-                    validateRegionScopes(*concrete.thenRegion);
-                    validateRegionScopes(*concrete.elseRegion);
+                    validateRegionScopes(*concrete.thenRegion, rootProducedScalars);
+                    validateRegionScopes(*concrete.elseRegion, rootProducedScalars);
                 }
             },
             op);
@@ -3840,7 +3862,13 @@ std::vector<DGraph> GraphCompiler::compile(
         throw std::runtime_error("GraphCompiler::compile: no devices registered");
     }
     validateBridgeFactories(devices, bridgeFactories);
-    validateRegionScopes(rootRegion);
+    std::set<std::string> rootProducedScalars;
+    for (const RegionOp& op : rootRegion.ops()) {
+        for (const std::string& key : producedScalarKeys(op)) {
+            rootProducedScalars.insert(key);
+        }
+    }
+    validateRegionScopes(rootRegion, rootProducedScalars);
     validateRootScopeScalarReferences(rootRegion);
     validateRootScopeBufferReferences(rootRegion);
     RegionCompiler compiler(devices, bridgeFor, scalarValues);
