@@ -92,12 +92,7 @@ static void add_inflight(const rp1_node_t *node, uint32_t node_index)
     if (slot->timeout_remaining == 0)
         slot->timeout_remaining = 10000000; /* default 10M cycles */
     slot->infinite = (node->flags & RP1_FLAG_INFINITE) ? 1 : 0;
-    /* HLS ap_done is sticky, and immediately after ap_start the control
-     * register may still expose the previous invocation's done bit for one or
-     * more scanner passes.  Read/ignore a couple of polls before treating
-     * ap_done as this launch's completion; the reads also clear the stale bit.
-     */
-    slot->settle_polls = 2;
+    slot->settle_polls = 0;
 }
 
 static void remove_inflight(uint32_t idx)
@@ -119,6 +114,12 @@ static void launch_kernel(const rp1_node_t *node)
      * non-contiguous HLS s_axilite register map is honoured exactly. */
     const rp1_kernel_arg_t *args =
         (const rp1_kernel_arg_t *)(g_arg_buf + kd->arg_buffer_offset / 4);
+
+    /* HLS ap_done is sticky/clear-on-read. Clear any stale completion from a
+     * previous invocation before writing arguments and pulsing ap_start.
+     */
+    (void)axi_read32(kd->kernel_base_addr + 0x00);
+    dsb();
 
     for (uint16_t i = 0; i < kd->arg_count; i++)
         axi_write32(kd->kernel_base_addr + args[i].reg_offset, args[i].value);
@@ -225,13 +226,6 @@ static int check_inflight(void)
     while (i < g_inflight_count) {
         rp1_inflight_t *k = &g_inflight[i];
         uint32_t ctrl = axi_read32(k->base_addr + 0x00);
-
-        if (k->settle_polls) {
-            k->settle_polls--;
-            i++;
-            made_progress = 1;
-            continue;
-        }
 
         if (ctrl & 0x2) { /* ap_done */
             if (!k->infinite) {
