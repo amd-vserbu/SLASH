@@ -63,8 +63,14 @@ class GpuDevicePlan : public IDevicePlan {
 
    private:
     struct KernelParamStore {
+        struct ScalarParam {
+            std::size_t index;
+            GraphScalar scalar;
+            std::string portName;
+        };
         std::vector<void*> argPtrs;
         std::vector<uint64_t> scalarVals;
+        std::vector<ScalarParam> scalarParams;
         std::vector<void*> devicePtrVals;
     };
 
@@ -86,6 +92,10 @@ class GpuDevicePlan : public IDevicePlan {
     std::map<std::string, hipGraphNode_t> hipNodeById_;
     std::vector<std::unique_ptr<KernelParamStore>> paramStores_;
     std::vector<std::unique_ptr<HostCallbackData>> callbackDatas_;
+    std::shared_ptr<std::map<std::string, uint64_t>> scalarValues_;
+
+    uint64_t scalarBits(const GraphScalar& scalar, const std::string& diagnostic) const;
+    void refreshScalarParams();
 };
 
 // ---------------------------------------------------------------------------
@@ -364,11 +374,24 @@ hipGraphNode_t GpuDevicePlan::addKernelNode(const CompiledKernelNode& node,
         }
     }
     for (const auto& [portName, gs] : node.ioMap.inputScalars()) {
-        scalarVals[portName] = gs.isConstant() ? gs.constantBits() : 0;
+        if (!scalarValues_) {
+            throw std::runtime_error(
+                "GpuDevicePlan: scalar input '" + portName + "' requires a scalar value map");
+        }
+        auto sit = scalarValues_->find(scopedScalarKey(gs.scopeId(), gs.varName()));
+        if (sit == scalarValues_->end() && gs.scopeId() == 0) {
+            sit = scalarValues_->find(gs.varName());
+        }
+        if (sit == scalarValues_->end()) {
+            throw std::runtime_error(
+                "GpuDevicePlan: scalar '" + gs.varName() + "' not set before compile");
+        }
+        scalarVals[portName] = sit->second;
     }
 
     // Pack params in the order specified by the binding
     store->argPtrs.resize(binding.paramOrder.size());
+    store->scalarVals.reserve(binding.paramOrder.size());
     for (size_t i = 0; i < binding.paramOrder.size(); ++i) {
         const std::string& paramName = binding.paramOrder[i];
 
@@ -382,8 +405,16 @@ hipGraphNode_t GpuDevicePlan::addKernelNode(const CompiledKernelNode& node,
 
         auto scIt = scalarVals.find(paramName);
         if (scIt != scalarVals.end()) {
+            const auto scalarBinding = node.ioMap.inputScalars().find(paramName);
+            if (scalarBinding == node.ioMap.inputScalars().end()) {
+                throw std::logic_error(
+                    "GpuDevice: scalar param '" + paramName + "' lacks an input scalar binding");
+            }
+            const std::size_t scalarIndex = store->scalarVals.size();
             store->scalarVals.push_back(scIt->second);
-            store->argPtrs[i] = &store->scalarVals.back();
+            store->scalarParams.push_back(
+                KernelParamStore::ScalarParam{scalarIndex, scalarBinding->second, paramName});
+            store->argPtrs[i] = &store->scalarVals[scalarIndex];
             continue;
         }
 
@@ -416,12 +447,37 @@ hipGraphNode_t GpuDevicePlan::addKernelNode(const CompiledKernelNode& node,
     return graphNode;
 }
 
+uint64_t GpuDevicePlan::scalarBits(const GraphScalar& scalar,
+                                   const std::string& diagnostic) const {
+    if (!scalarValues_) {
+        throw std::runtime_error(
+            "GpuDevicePlan: scalar input '" + diagnostic + "' requires a scalar value map");
+    }
+    auto sit = scalarValues_->find(scopedScalarKey(scalar.scopeId(), scalar.varName()));
+    if (sit == scalarValues_->end() && scalar.scopeId() == 0) {
+        sit = scalarValues_->find(scalar.varName());
+    }
+    if (sit == scalarValues_->end()) {
+        throw std::runtime_error(
+            "GpuDevicePlan: scalar '" + scalar.varName() + "' not set before launch");
+    }
+    return sit->second;
+}
+
+void GpuDevicePlan::refreshScalarParams() {
+    for (auto& store : paramStores_) {
+        for (const auto& param : store->scalarParams) {
+            store->scalarVals[param.index] = scalarBits(param.scalar, param.portName);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // compile
 // ---------------------------------------------------------------------------
 
 GpuDevicePlan::GpuDevicePlan(GpuDevice& device, const DGraph& dg)
-    : device_(device) {
+    : device_(device), scalarValues_(dg.scalarValues) {
     hipCheck(hipSetDevice(device_.hipDeviceIdx_), "hipSetDevice in compilePlan");
 
     // --- Pre-allocate device buffers based on IOMap analysis (kernels only) ---
@@ -560,6 +616,7 @@ GpuDevicePlan::GpuDevicePlan(GpuDevice& device, const DGraph& dg)
 
 void GpuDevicePlan::launch() {
     hipCheck(hipSetDevice(device_.hipDeviceIdx_), "hipSetDevice in launch");
+    refreshScalarParams();
     hipCheck(hipGraphLaunch(hipExec_, device_.stream_), "hipGraphLaunch");
 }
 

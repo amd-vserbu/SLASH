@@ -97,12 +97,14 @@
  *         .bindOutput("out", BufferType::F32, bodyOut, body->scopeId());
  *   body->addKernel(bodyKernel, std::move(bodyIo), "fpga:0");
  *
+ *   GraphScalar iterations = g.scalarInput<int32_t>("iterations");
  *   LoopSpec loop;
- *   loop.tripCount = LoopTripCount::constant<int32_t>(4);
+ *   loop.tripCount = LoopTripCount::scalar(iterations);
  *   loop.body = body;
  *   g.addLoop(std::move(loop));
  *
  *   CompiledGraph exec = g.compile();
+ *   exec.setScalar(iterations, 4);
  *   exec.run();
  * @endcode
  */
@@ -385,81 +387,12 @@ class Graph {
      *
      * Delegates fully to the root region: the type is recorded on
      * `rootRegion()` (via `GraphRegion::scalar()`) and the runtime value is
-     * initialised to zero in the staging scalar store. `globalScalar()` and a
-     * direct `rootRegion().scalar()` call are therefore interchangeable, and
-     * both populate the type table queried by the typed accessors below.
-     *
-     * Graph::setScalar / Graph::getScalar / Graph::setScalarBits /
-     * Graph::scalarBits stage initial values for future CompiledGraph snapshots
-     * and address the **root scope only**. After compile(), runtime scalar
-     * updates and outputs live on the returned CompiledGraph.
+     * `globalScalar()` and a direct `rootRegion().scalar()` call are therefore
+     * interchangeable. Runtime values are supplied to the returned
+     * CompiledGraph, not to Graph.
      */
     GraphScalar globalScalar(ScalarType type, std::string name) {
-        GraphScalar token = rootRegion_->scalar(type, name);
-        const std::string key = scopedScalarKey(rootRegion_->scopeId(), name);
-        (*scalarValues_)[key] = 0;
-        return token;
-    }
-
-    /**
-     * @brief Set a declared graph-global scalar from raw bits.
-     */
-    void setScalarBits(const std::string& name, uint64_t bits) {
-        if (!rootRegion_->scalarType(name)) {
-            throw std::out_of_range("Graph::setScalarBits: unknown scalar '" + name + "'");
-        }
-        const std::string key = scopedScalarKey(rootRegion_->scopeId(), name);
-        (*scalarValues_)[key] = bits;
-    }
-
-    /**
-     * @brief Read a declared graph-global scalar as raw bits.
-     */
-    uint64_t scalarBits(const std::string& name) const {
-        if (!rootRegion_->scalarType(name)) {
-            throw std::out_of_range("Graph::scalarBits: unknown scalar '" + name + "'");
-        }
-        const std::string key = scopedScalarKey(rootRegion_->scopeId(), name);
-        auto valueIt = scalarValues_->find(key);
-        if (valueIt == scalarValues_->end()) {
-            throw std::out_of_range("Graph::scalarBits: scalar '" + name + "' has no value");
-        }
-        return valueIt->second;
-    }
-
-    template <class T>
-    void setScalar(const std::string& name, T value) {
-        static_assert(std::is_arithmetic_v<T>, "Graph::setScalar only supports arithmetic types");
-        auto declaredType = rootRegion_->scalarType(name);
-        if (!declaredType) {
-            throw std::out_of_range("Graph::setScalar: unknown scalar '" + name + "'");
-        }
-        if (*declaredType != typeToScalarType<T>()) {
-            throw std::invalid_argument(
-                "Graph::setScalar: type mismatch for scalar '" + name + "'");
-        }
-        setScalarBits(name, detail::valueToBits(value));
-    }
-
-    template <class T>
-    T getScalar() const = delete;
-
-    template <class T>
-    T getScalar(const std::string& name) const {
-        static_assert(std::is_arithmetic_v<T>, "Graph::getScalar only supports arithmetic types");
-        auto declaredType = rootRegion_->scalarType(name);
-        if (!declaredType) {
-            throw std::out_of_range("Graph::getScalar: unknown scalar '" + name + "'");
-        }
-        if (*declaredType != typeToScalarType<T>()) {
-            throw std::invalid_argument(
-                "Graph::getScalar: type mismatch for scalar '" + name + "'");
-        }
-
-        uint64_t bits = scalarBits(name);
-        T value{};
-        std::memcpy(&value, &bits, sizeof(T));
-        return value;
+        return rootRegion_->scalar(type, std::move(name));
     }
 
     /**
@@ -553,11 +486,11 @@ class Graph {
     }
 
     /**
-     * @brief A named constant scalar input (buffer-symmetric constant form).
+     * @brief Declare a graph-level scalar input token.
      */
     template <class T>
-    GraphScalar scalarInput(std::string /*name*/, T value) {
-        return GraphScalar::constant<T>(value);
+    GraphScalar scalarInput(std::string name) {
+        return globalScalar(typeToScalarType<T>(), std::move(name));
     }
 
     /**
@@ -592,43 +525,6 @@ class Graph {
         return branches;
     }
 
-    /**
-     * @brief Provide host data for a graph-level input buffer token.
-     */
-    template <class T>
-    void write(const GraphBuffer& token, const std::vector<T>& data) {
-        auto cpu = cpuDevice();
-        if (!cpu) {
-            throw std::runtime_error("Graph::write: no CPU device registered");
-        }
-        cpu->setInputBuffer(scopedBufferKey(token.scopeId(), token.name()),
-                            data.data(), data.size() * sizeof(T));
-    }
-
-    /**
-     * @brief Read back a buffer token after run(), resolving its placement.
-     */
-    template <class T>
-    void read(const GraphBuffer& token, std::vector<T>& out) {
-        const std::string key = scopedBufferKey(token.scopeId(), token.name());
-        const std::size_t bytes = out.size() * sizeof(T);
-        if (auto cpu = cpuDevice(); cpu && cpu->bufferSize(key) > 0) {
-            cpu->getOutputBuffer(key, out.data(), bytes);
-            return;
-        }
-        for (const auto& [id, device] : devices_) {
-            (void)id;
-            if (auto fpga = std::dynamic_pointer_cast<FpgaDevice>(device);
-                fpga && fpga->bufferSize(key) > 0) {
-                fpga->getOutputBuffer(key, out.data(), bytes);
-                return;
-            }
-        }
-        throw std::runtime_error(
-            "Graph::read: token '" + token.name() + "' has no readable storage; "
-            "did the graph run and produce it?");
-    }
-
     // --- Compilation ---
 
     /**
@@ -649,7 +545,7 @@ class Graph {
     [[nodiscard]] CompiledGraph compile() {
         GraphCompiler compiler;
         auto snapshotScalars =
-            std::make_shared<std::map<std::string, uint64_t>>(*scalarValues_);
+            std::make_shared<std::map<std::string, uint64_t>>();
         std::map<std::pair<std::string, std::string>, std::shared_ptr<IBridge>> bridgePins;
         auto lookup = [this, &bridgePins](const std::string& s,
                                           const std::string& d) -> IBridge* {
@@ -735,8 +631,6 @@ class Graph {
     std::map<std::pair<DeviceType, DeviceType>, BridgeFactory> bridgeFactories_;
     std::map<std::pair<std::string, std::string>,
              std::shared_ptr<IBridge>>                        bridgeInstances_;
-    std::shared_ptr<std::map<std::string, uint64_t>>          scalarValues_ =
-        std::make_shared<std::map<std::string, uint64_t>>();
 
 };
 

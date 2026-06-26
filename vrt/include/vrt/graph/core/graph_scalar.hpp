@@ -20,15 +20,11 @@
 
 /**
  * @file graph_scalar.hpp
- * @brief GraphScalar — a typed scalar value used in IOMap bindings.
+ * @brief GraphScalar — a typed reference to a scalar value slot.
  *
- * A GraphScalar is either:
- *  - A compile-time constant (created via GraphScalar::constant()), or
- *  - A reference to a named scalar variable in a graph-region scope
- *    (created via GraphScalar::globalVar()).
- *
- * Values are stored as raw uint64_t bits; ScalarType governs their interpretation.
- * No templates are used to avoid metaprogramming complexity.
+ * Scalar values live in the graph / compiled-graph scalar store keyed by
+ * scope and name. Constants are represented by scalar slots with initial
+ * values, not by a separate token kind.
  */
 
 #ifndef VRT_GRAPH_CORE_GRAPH_SCALAR_HPP
@@ -69,36 +65,13 @@ inline uint64_t valueToBits(T value) {
 class GraphScalar {
    public:
     /**
-     * @brief Creates a compile-time constant scalar.
-     *
-     * @param type   Element type governing bit interpretation.
-     * @param bits   Raw bit pattern of the value (e.g. reinterpret_cast a float to uint32_t).
+     * @brief Creates a reference to a named scalar value slot.
      */
-    static GraphScalar constantFromBits(ScalarType type, uint64_t bits) {
-        return GraphScalar(type, bits, "", 0);
-    }
-
-    template<class T>
-    static GraphScalar constant(T value) {
-        static_assert(std::is_arithmetic_v<T>, "GraphScalar::constant only supports arithmetic types");
-        return constantFromBits(typeToScalarType<T>(), detail::valueToBits(value));
-    }
-
-    /**
-     * @brief Creates a reference to a named global variable.
-     *
-     * Used primarily for output scalars whose value is written by a kernel and
-     * consumed by another node or read back by the host.
-     *
-     * @param type      Element type.
-     * @param varName   Name of the scalar variable (must be unique within its scope).
-     * @param scopeId   Graph-region namespace that owns this scalar variable.
-     */
-    static GraphScalar globalVar(ScalarType type, std::string varName, uint64_t scopeId = 0) {
+    static GraphScalar ref(ScalarType type, std::string varName, uint64_t scopeId = 0) {
         if (varName.empty()) {
-            throw std::invalid_argument("GraphScalar::globalVar: varName must not be empty");
+            throw std::invalid_argument("GraphScalar::ref: varName must not be empty");
         }
-        return GraphScalar(type, 0, std::move(varName), scopeId);
+        return GraphScalar(type, std::move(varName), scopeId);
     }
 
     /**
@@ -107,43 +80,21 @@ class GraphScalar {
     ScalarType type() const { return type_; }
 
     /**
-     * @brief Returns true if this scalar is a compile-time constant.
+     * @brief Returns the scalar value slot name.
      */
-    bool isConstant() const { return varName_.empty(); }
-
-    /**
-     * @brief Returns the raw bit pattern.  Only valid when isConstant() == true.
-     */
-    uint64_t constantBits() const {
-        if (!isConstant()) {
-            throw std::logic_error("GraphScalar::constantBits() called on a globalVar scalar");
-        }
-        return bits_;
-    }
-
-    /**
-     * @brief Returns the global variable name.  Only valid when isConstant() == false.
-     */
-    const std::string& varName() const {
-        if (isConstant()) {
-            throw std::logic_error("GraphScalar::varName() called on a constant scalar");
-        }
-        return varName_;
-    }
+    const std::string& varName() const { return varName_; }
 
     /**
      * @brief Returns the graph-region namespace that owns this scalar.
      *
-     * Constants are scope-independent and return 0.
      */
     uint64_t scopeId() const { return scopeId_; }
 
    private:
-    GraphScalar(ScalarType type, uint64_t bits, std::string varName, uint64_t scopeId)
-        : type_(type), bits_(bits), varName_(std::move(varName)), scopeId_(scopeId) {}
+    GraphScalar(ScalarType type, std::string varName, uint64_t scopeId)
+        : type_(type), varName_(std::move(varName)), scopeId_(scopeId) {}
 
     ScalarType  type_;
-    uint64_t    bits_;
     std::string varName_;
     uint64_t    scopeId_ = 0;
 };

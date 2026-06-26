@@ -21,6 +21,7 @@
 #include <vrt/graph/device/fpga/rp1_bar_window.hpp>
 
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -48,28 +49,33 @@ class BarFileBackend final : public Backend {
 
     void readBytes(std::uint32_t abs_off, void* dst, std::size_t n) override {
         if (n == 0) return;
+        std::lock_guard<std::mutex> lk(mtx_);
         auto p = barFile_.getPtr<std::uint8_t>(vrtd::BarFile::Direction::Read, abs_off);
         std::memcpy(dst, const_cast<const std::uint8_t*>(p.get()), n);
     }
 
     void writeBytes(std::uint32_t abs_off, const void* src, std::size_t n) override {
         if (n == 0) return;
+        std::lock_guard<std::mutex> lk(mtx_);
         auto p = barFile_.getPtr<std::uint8_t>(vrtd::BarFile::Direction::Write, abs_off);
         std::memcpy(const_cast<std::uint8_t*>(p.get()), src, n);
     }
 
     std::uint32_t readU32(std::uint32_t abs_off) override {
+        std::lock_guard<std::mutex> lk(mtx_);
         auto p = barFile_.getPtr<std::uint32_t>(vrtd::BarFile::Direction::Read, abs_off);
         return *p;
     }
 
     void writeU32(std::uint32_t abs_off, std::uint32_t v) override {
+        std::lock_guard<std::mutex> lk(mtx_);
         auto p = barFile_.getPtr<std::uint32_t>(vrtd::BarFile::Direction::Write, abs_off);
         *p = v;
     }
 
    private:
     vrtd::BarFile barFile_;
+    std::mutex    mtx_;
 };
 
 class RawBufferBackend final : public Backend {

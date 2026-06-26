@@ -214,21 +214,7 @@ class Condition {
 
 class LoopTripCount {
    public:
-    enum class Kind { Constant, Scalar };
-
-    template <class T>
-    static LoopTripCount constant(T value) {
-        static_assert(std::is_integral_v<T>,
-                      "LoopTripCount::constant only supports integer types");
-        if constexpr (std::is_signed_v<T>) {
-            if (value < 0) {
-                throw std::invalid_argument(
-                    "LoopTripCount::constant: trip count must be non-negative");
-            }
-        }
-        return LoopTripCount(Kind::Constant, typeToScalarType<T>(), "",
-                             detail::valueToBits(value), 0);
-    }
+    enum class Kind { Scalar };
 
     static LoopTripCount scalar(ScalarType type, std::string name, uint64_t scopeId = 0) {
         if (!isIntegerScalarType(type)) {
@@ -237,27 +223,28 @@ class LoopTripCount {
         if (name.empty()) {
             throw std::invalid_argument("LoopTripCount::scalar: name must not be empty");
         }
-        return LoopTripCount(Kind::Scalar, type, std::move(name), 0, scopeId);
+        return LoopTripCount(type, std::move(name), scopeId);
     }
 
-    Kind kind() const { return kind_; }
+    static LoopTripCount scalar(const GraphScalar& scalar) {
+        return LoopTripCount::scalar(scalar.type(), scalar.varName(), scalar.scopeId());
+    }
+
+    Kind kind() const { return Kind::Scalar; }
     ScalarType type() const { return type_; }
     const std::string& name() const { return name_; }
-    uint64_t constantBits() const { return bits_; }
     uint64_t scopeId() const { return scopeId_; }
 
    private:
-    LoopTripCount(Kind kind, ScalarType type, std::string name, uint64_t bits, uint64_t scopeId)
-        : kind_(kind), type_(type), name_(std::move(name)), bits_(bits), scopeId_(scopeId) {
+    LoopTripCount(ScalarType type, std::string name, uint64_t scopeId)
+        : type_(type), name_(std::move(name)), scopeId_(scopeId) {
         if (!isIntegerScalarType(type_)) {
             throw std::invalid_argument("LoopTripCount: type must be an integer scalar type");
         }
     }
 
-    Kind        kind_ = Kind::Constant;
     ScalarType  type_ = ScalarType::U64;
     std::string name_;
-    uint64_t    bits_ = 0;
     uint64_t    scopeId_ = 0;
 };
 
@@ -270,9 +257,6 @@ class LoopTripCount {
 // scalar's element type so Condition::validate()'s exact-type rule is met.
 
 inline ConditionOperand conditionOperandOf(const GraphScalar& scalar) {
-    if (scalar.isConstant()) {
-        return ConditionOperand::constantFromBits(scalar.type(), scalar.constantBits());
-    }
     return ConditionOperand::scalar(scalar.type(), scalar.varName(), scalar.scopeId());
 }
 

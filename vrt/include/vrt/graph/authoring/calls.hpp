@@ -105,11 +105,7 @@ struct InoutArg {
 };
 
 /**
- * @brief Binds a scalar port to a value.
- *
- * Accepts either a pre-declared `GraphScalar` (named constant / output var) or
- * an inline arithmetic literal (coerced to a constant), so both
- * `{"n", count}` and `{"n", 16u}` are valid.
+ * @brief Binds a scalar port to a scalar token.
  */
 struct ScalarArg {
     std::string port;
@@ -117,28 +113,16 @@ struct ScalarArg {
 
     ScalarArg(std::string portName, GraphScalar value)
         : port(std::move(portName)), scalar(std::move(value)) {}
-
-    template <class T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
-    ScalarArg(std::string portName, T value)
-        : port(std::move(portName)), scalar(GraphScalar::constant(value)) {}
 };
 
 /**
- * @brief A loop trip count: an integer literal or a data-dependent scalar.
- *
- * Implicitly constructible so `.count = iterations` and `.count = someScalar`
- * both work in a designated initializer.
+ * @brief A loop trip count scalar reference.
  */
 struct TripCount {
-    LoopTripCount value = LoopTripCount::constant<uint32_t>(0);
-
-    TripCount() = default;
-
-    template <class T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
-    TripCount(T count) : value(LoopTripCount::constant(count)) {}
+    LoopTripCount value;
 
     TripCount(const GraphScalar& scalar)
-        : value(LoopTripCount::scalar(scalar.type(), scalar.varName(), scalar.scopeId())) {}
+        : value(LoopTripCount::scalar(scalar)) {}
 };
 
 /**

@@ -42,8 +42,13 @@
 
 #include <vrt/graph/core/graph_scalar.hpp>
 #include <vrt/graph/crossdevice/bridge.hpp>
+#include <vrt/graph/device/cpu_device.hpp>
 #include <vrt/graph/device/device.hpp>
 #include <vrt/graph/device/dgraph.hpp>
+#include <vrt/graph/device/fpga_device.hpp>
+#if defined(VRT_HAS_GPU) && (VRT_HAS_GPU == 1)
+#include <vrt/graph/device/gpu_device.hpp>
+#endif
 
 namespace vrt::graph {
 
@@ -66,6 +71,9 @@ class CompiledGraph {
           bridgePins_(std::move(bridgePins)) {
         if (!scalarValues_) {
             scalarValues_ = std::make_shared<std::map<std::string, uint64_t>>();
+        }
+        for (const auto& [name, type] : scalarTypes_) {
+            scopedScalarTypes_[scopedScalarKey(rootScopeId_, name)] = type;
         }
         plans_.reserve(dgraphs_.size());
         for (const auto& dg : dgraphs_) {
@@ -92,6 +100,11 @@ class CompiledGraph {
         (*scalarValues_)[scopedScalarKey(rootScopeId_, name)] = bits;
     }
 
+    void setScalarBits(const GraphScalar& scalar, uint64_t bits) {
+        requireScalar(scalar, "CompiledGraph::setScalarBits");
+        (*scalarValues_)[scopedScalarKey(scalar.scopeId(), scalar.varName())] = bits;
+    }
+
     /**
      * @brief Read a root-scope scalar in this compiled snapshot as raw bits.
      */
@@ -106,12 +119,31 @@ class CompiledGraph {
         return valueIt->second;
     }
 
+    uint64_t scalarBits(const GraphScalar& scalar) const {
+        requireScalar(scalar, "CompiledGraph::scalarBits");
+        const std::string key = scopedScalarKey(scalar.scopeId(), scalar.varName());
+        auto valueIt = scalarValues_->find(key);
+        if (valueIt == scalarValues_->end()) {
+            throw std::out_of_range(
+                "CompiledGraph::scalarBits: scalar '" + scalar.varName() + "' has no value");
+        }
+        return valueIt->second;
+    }
+
     template <class T>
     void setScalar(const std::string& name, T value) {
         static_assert(std::is_arithmetic_v<T>,
                       "CompiledGraph::setScalar only supports arithmetic types");
         requireScalarType<T>(name, "CompiledGraph::setScalar");
         setScalarBits(name, detail::valueToBits(value));
+    }
+
+    template <class T>
+    void setScalar(const GraphScalar& scalar, T value) {
+        static_assert(std::is_arithmetic_v<T>,
+                      "CompiledGraph::setScalar only supports arithmetic types");
+        requireScalarType<T>(scalar, "CompiledGraph::setScalar");
+        setScalarBits(scalar, detail::valueToBits(value));
     }
 
     template <class T>
@@ -126,6 +158,61 @@ class CompiledGraph {
         T value{};
         std::memcpy(&value, &bits, sizeof(T));
         return value;
+    }
+
+    template <class T>
+    T getScalar(const GraphScalar& scalar) const {
+        static_assert(std::is_arithmetic_v<T>,
+                      "CompiledGraph::getScalar only supports arithmetic types");
+        requireScalarType<T>(scalar, "CompiledGraph::getScalar");
+        uint64_t bits = scalarBits(scalar);
+        T value{};
+        std::memcpy(&value, &bits, sizeof(T));
+        return value;
+    }
+
+    void write(const GraphBuffer& token, const void* data, std::size_t bytes) {
+        if (bytes > 0 && data == nullptr) {
+            throw std::invalid_argument("CompiledGraph::write: data must not be null");
+        }
+        const std::string key = scopedBufferKey(token.scopeId(), token.name());
+        bool wrote = false;
+        for (const auto& dg : dgraphs_) {
+            if (deviceUsesInput(dg, token)) {
+                writeToDevice(*dg.device, key, data, bytes);
+                wrote = true;
+            }
+        }
+        if (!wrote) {
+            throw std::runtime_error(
+                "CompiledGraph::write: token '" + token.name() +
+                "' is not consumed by this compiled graph");
+        }
+    }
+
+    template <class T>
+    void write(const GraphBuffer& token, const std::vector<T>& data) {
+        write(token, data.data(), data.size() * sizeof(T));
+    }
+
+    void read(const GraphBuffer& token, void* data, std::size_t bytes) const {
+        if (bytes > 0 && data == nullptr) {
+            throw std::invalid_argument("CompiledGraph::read: data must not be null");
+        }
+        const std::string key = scopedBufferKey(token.scopeId(), token.name());
+        for (const auto& dg : dgraphs_) {
+            if (readFromDevice(*dg.device, key, data, bytes)) {
+                return;
+            }
+        }
+        throw std::runtime_error(
+            "CompiledGraph::read: token '" + token.name() +
+            "' has no readable storage; did the graph run and produce it?");
+    }
+
+    template <class T>
+    void read(const GraphBuffer& token, std::vector<T>& out) const {
+        read(token, out.data(), out.size() * sizeof(T));
     }
 
     /**
@@ -162,6 +249,14 @@ class CompiledGraph {
         }
     }
 
+    void requireScalar(const GraphScalar& scalar, const char* method) const {
+        auto scopeIt = scopedScalarTypes_.find(scopedScalarKey(scalar.scopeId(), scalar.varName()));
+        if (scopeIt == scopedScalarTypes_.end()) {
+            throw std::out_of_range(
+                std::string(method) + ": unknown scalar '" + scalar.varName() + "'");
+        }
+    }
+
     template <class T>
     void requireScalarType(const std::string& name, const char* method) const {
         auto declaredType = scalarTypes_.find(name);
@@ -175,11 +270,106 @@ class CompiledGraph {
         }
     }
 
+    template <class T>
+    void requireScalarType(const GraphScalar& scalar, const char* method) const {
+        auto declaredType = scopedScalarTypes_.find(scopedScalarKey(scalar.scopeId(), scalar.varName()));
+        if (declaredType == scopedScalarTypes_.end()) {
+            throw std::out_of_range(
+                std::string(method) + ": unknown scalar '" + scalar.varName() + "'");
+        }
+        if (declaredType->second != typeToScalarType<T>()) {
+            throw std::invalid_argument(
+                std::string(method) + ": type mismatch for scalar '" + scalar.varName() + "'");
+        }
+    }
+
+    static bool nodeConsumesBuffer(const CompiledNode& node, const std::string& key) {
+        if (const auto* kernel = std::get_if<CompiledKernelNode>(&node)) {
+            for (const auto& [port, buffer] : kernel->ioMap.inputs()) {
+                (void)port;
+                if (scopedBufferKey(buffer.scopeId(), buffer.name()) == key) return true;
+            }
+            for (const auto& inout : kernel->ioMap.inouts()) {
+                if (scopedBufferKey(inout.in.scopeId(), inout.in.name()) == key) return true;
+            }
+        }
+        if (const auto* boundary = std::get_if<CompiledBoundaryNode>(&node)) {
+            if (boundary->side == CompiledBoundaryNode::Side::Start) {
+                for (const auto& copy : boundary->bufferCopies) {
+                    if (scopedBufferKey(copy.sourceScopeId, copy.sourceName) == key) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    static bool childConsumesBuffer(const DGraph& dg, const std::string& key) {
+        for (const auto& child : dg.childDGraphs) {
+            for (const auto& childDg : child.dgraphs) {
+                if (childDg && deviceUsesInput(*childDg, key)) return true;
+            }
+        }
+        return false;
+    }
+
+    static bool deviceUsesInput(const DGraph& dg, const GraphBuffer& token) {
+        return deviceUsesInput(dg, scopedBufferKey(token.scopeId(), token.name()));
+    }
+
+    static bool deviceUsesInput(const DGraph& dg, const std::string& key) {
+        for (const auto& node : dg.nodes) {
+            if (nodeConsumesBuffer(node, key)) return true;
+        }
+        return childConsumesBuffer(dg, key);
+    }
+
+    static void writeToDevice(IDevice& device, const std::string& key,
+                              const void* data, std::size_t bytes) {
+        if (auto* cpu = dynamic_cast<CpuDevice*>(&device)) {
+            cpu->setInputBuffer(key, data, bytes);
+            return;
+        }
+        if (auto* fpga = dynamic_cast<FpgaDevice*>(&device)) {
+            fpga->setInputBuffer(key, data, bytes);
+            return;
+        }
+#if defined(VRT_HAS_GPU) && (VRT_HAS_GPU == 1)
+        if (auto* gpu = dynamic_cast<GpuDevice*>(&device)) {
+            gpu->setInputBuffer(key, data, bytes);
+            return;
+        }
+#endif
+        throw std::runtime_error("CompiledGraph::write: unsupported device '" + device.id() + "'");
+    }
+
+    static bool readFromDevice(IDevice& device, const std::string& key,
+                               void* data, std::size_t bytes) {
+        if (auto* cpu = dynamic_cast<CpuDevice*>(&device)) {
+            if (cpu->bufferSize(key) == 0) return false;
+            cpu->getOutputBuffer(key, data, bytes);
+            return true;
+        }
+        if (auto* fpga = dynamic_cast<FpgaDevice*>(&device)) {
+            if (fpga->bufferSize(key) == 0) return false;
+            fpga->getOutputBuffer(key, data, bytes);
+            return true;
+        }
+#if defined(VRT_HAS_GPU) && (VRT_HAS_GPU == 1)
+        if (auto* gpu = dynamic_cast<GpuDevice*>(&device)) {
+            if (gpu->bufferSize(key) == 0) return false;
+            gpu->getOutputBuffer(key, data, bytes);
+            return true;
+        }
+#endif
+        return false;
+    }
+
     static constexpr uint64_t rootScopeId_ = 0;
 
     std::vector<DGraph>                       dgraphs_;
     std::shared_ptr<std::map<std::string, uint64_t>> scalarValues_;
     std::map<std::string, ScalarType>         scalarTypes_;
+    std::map<std::string, ScalarType>         scopedScalarTypes_;
     std::vector<std::shared_ptr<IBridge>>     bridgePins_;
     std::vector<std::unique_ptr<IDevicePlan>> plans_;
 };

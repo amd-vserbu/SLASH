@@ -143,7 +143,6 @@ void validateIoMapScopes(const std::string& opId,
                          const std::set<uint64_t>& allowedScopes) {
     for (const auto& [port, scalar] : ioMap.scalarBindings()) {
         (void)port;
-        if (scalar.isConstant()) continue;
         requireAllowedScope(opId, "scalar", scalar.varName(), scalar.scopeId(),
                             regionScope, allowedScopes);
     }
@@ -185,23 +184,12 @@ void validateConditionScopes(const std::string& opId,
 void validateTripCountScope(const std::string& opId,
                             const LoopTripCount& tripCount,
                             uint64_t regionScope) {
-    if (tripCount.kind() != LoopTripCount::Kind::Scalar) return;
     requireAllowedScope(opId, "trip-count scalar", tripCount.name(), tripCount.scopeId(),
                         regionScope, {regionScope});
 }
 
 void validateScalarBoundaryMappings(const SubgraphBoundaryOp& boundary) {
     for (const auto& mapping : boundary.scalarMappings) {
-        if (mapping.source.isConstant()) {
-            throw std::runtime_error(
-                "GraphCompiler: boundary op '" + boundary.id +
-                "' scalar source must be a scoped scalar variable");
-        }
-        if (mapping.target.isConstant()) {
-            throw std::runtime_error(
-                "GraphCompiler: boundary op '" + boundary.id +
-                "' scalar target must be a scoped scalar variable");
-        }
         if (mapping.source.type() != mapping.target.type()) {
             throw std::runtime_error(
                 "GraphCompiler: boundary op '" + boundary.id +
@@ -360,7 +348,6 @@ void validateRootScopeScalarReferences(const GraphRegion& rootRegion) {
     };
 
     auto checkScalar = [&](const GraphScalar& scalar) {
-        if (scalar.isConstant()) return;
         requireDeclared(scalar.varName(), scalar.scopeId());
     };
 
@@ -376,7 +363,6 @@ void validateRootScopeScalarReferences(const GraphRegion& rootRegion) {
     };
 
     auto checkTripCount = [&](const LoopTripCount& tripCount) {
-        if (tripCount.kind() != LoopTripCount::Kind::Scalar) return;
         requireDeclared(tripCount.name(), tripCount.scopeId());
     };
 
@@ -623,11 +609,6 @@ void validateDeclaredRegionPorts(const RegionOp& op,
                 "' type mismatch: declared " + scalarTypeName(expected.type) +
                 ", bound " + scalarTypeName(it->second.type()));
         }
-        if (it->second.isConstant()) {
-            throw std::runtime_error(
-                "GraphCompiler: op '" + opId + "' output scalar '" + expected.name +
-                "' must be bound to GraphScalar::globalVar()");
-        }
     }
 
     for (const auto& expected : ioType.inputs) {
@@ -712,11 +693,6 @@ void validateDeclaredRegionPorts(const RegionOp& op,
                 "GraphCompiler: op '" + opId + "' output scalar '" + name +
                 "' type mismatch: declared " + scalarTypeName(output->type) +
                 ", bound " + scalarTypeName(scalar.type()));
-        }
-        if (scalar.isConstant()) {
-            throw std::runtime_error(
-                "GraphCompiler: op '" + opId + "' output scalar '" + name +
-                "' must be bound to GraphScalar::globalVar()");
         }
     }
 
@@ -836,16 +812,14 @@ std::set<std::string> loopCarriedScalarKeys(const LoopOp& loop) {
         if (!boundary) continue;
         if (boundary->side == BoundarySide::Start) {
             for (const auto& mapping : boundary->scalarMappings) {
-                if (!mapping.source.isConstant() &&
-                    mapping.source.scopeId() == boundary->parentScopeId) {
+                if (mapping.source.scopeId() == boundary->parentScopeId) {
                     imports.insert(scopedScalarKey(mapping.source.scopeId(),
                                                    mapping.source.varName()));
                 }
             }
         } else {
             for (const auto& mapping : boundary->scalarMappings) {
-                if (!mapping.target.isConstant() &&
-                    mapping.target.scopeId() == boundary->parentScopeId) {
+                if (mapping.target.scopeId() == boundary->parentScopeId) {
                     exports.insert(scopedScalarKey(mapping.target.scopeId(),
                                                    mapping.target.varName()));
                 }
@@ -1224,6 +1198,11 @@ struct RegionExitProducers {
     std::map<std::string, OutputScalarProducer> scalarsByPort;
 };
 
+struct BoundaryExportDevices {
+    std::map<std::string, std::string> buffers;
+    std::map<std::string, std::string> scalars;
+};
+
 struct ControlBufferMaterialization {
     DGraphChildRole role = DGraphChildRole::LoopBody;
     size_t publicationIndex = 0;
@@ -1304,7 +1283,7 @@ RegionOutputBindings collectOutputBindings(const IOTypeMap& ioType,
 
     for (const auto& port : ioType.outputScalars) {
         auto bindingIt = ioMap.outputScalars().find(port.name);
-        if (bindingIt == ioMap.outputScalars().end() || bindingIt->second.isConstant()) {
+        if (bindingIt == ioMap.outputScalars().end()) {
             throw std::runtime_error(
                 "GraphCompiler: op '" + opId + "' missing output scalar binding for port '" +
                 port.name + "'");
@@ -1357,7 +1336,6 @@ void appendChildStartBoundaryScalarRefs(std::vector<ConsumedScalarRef>& refs,
         const auto* boundary = std::get_if<SubgraphBoundaryOp>(&childOp);
         if (!boundary || boundary->side != BoundarySide::Start) continue;
         for (const auto& mapping : boundary->scalarMappings) {
-            if (mapping.source.isConstant()) continue;
             if (mapping.source.scopeId() != parentScopeId) continue;
             appendConsumedScalar(refs, mapping.source.varName(), mapping.source.scopeId(), kind);
         }
@@ -1389,7 +1367,6 @@ void appendChildEndBoundaryScalarTargets(std::vector<std::string>& keys,
         const auto* boundary = std::get_if<SubgraphBoundaryOp>(&childOp);
         if (!boundary || boundary->side != BoundarySide::End) continue;
         for (const auto& mapping : boundary->scalarMappings) {
-            if (mapping.target.isConstant()) continue;
             if (mapping.target.scopeId() != parentScopeId) continue;
             keys.push_back(scopedScalarKey(mapping.target.scopeId(),
                                            mapping.target.varName()));
@@ -1492,18 +1469,17 @@ std::vector<ConsumedScalarRef> consumedScalarRefs(const RegionOp& op) {
     const IOMap& ioMap = regionOpIoMap(op);
     for (const auto& port : ioType.inputScalars) {
         auto scalarIt = ioMap.inputScalars().find(port.name);
-        if (scalarIt == ioMap.inputScalars().end() || scalarIt->second.isConstant()) continue;
+        if (scalarIt == ioMap.inputScalars().end()) continue;
         appendConsumedScalar(refs, scalarIt->second.varName(), scalarIt->second.scopeId(),
                              "input scalar");
     }
     if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
         for (const auto& mapping : boundary->scalarMappings) {
-            if (mapping.source.isConstant()) continue;
             appendConsumedScalar(refs, mapping.source.varName(), mapping.source.scopeId(),
                                  "boundary scalar source");
         }
     } else if (const auto* loop = std::get_if<LoopOp>(&op)) {
-        if (loop->tripCount && loop->tripCount->kind() == LoopTripCount::Kind::Scalar) {
+        if (loop->tripCount) {
             appendConsumedScalar(refs, loop->tripCount->name(), loop->tripCount->scopeId(),
                                  "trip-count scalar");
         }
@@ -1549,12 +1525,11 @@ std::vector<std::string> producedScalarKeys(const RegionOp& op) {
     const IOMap& ioMap = regionOpIoMap(op);
     for (const auto& port : ioType.outputScalars) {
         auto scalarIt = ioMap.outputScalars().find(port.name);
-        if (scalarIt == ioMap.outputScalars().end() || scalarIt->second.isConstant()) continue;
+        if (scalarIt == ioMap.outputScalars().end()) continue;
         keys.push_back(scopedScalarKey(scalarIt->second.scopeId(), scalarIt->second.varName()));
     }
     if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
         for (const auto& mapping : boundary->scalarMappings) {
-            if (mapping.target.isConstant()) continue;
             if (mapping.target.scopeId() != boundary->localScopeId) continue;
             keys.push_back(scopedScalarKey(mapping.target.scopeId(), mapping.target.varName()));
         }
@@ -1621,15 +1596,66 @@ RegionOutputBindings collectOutputBindings(const RegionOp& op) {
 const CompiledNode* findCompiledNodeInChildDGraphs(const DGraphChild& child,
                                                    const std::string& nodeId,
                                                    std::string& deviceId) {
+    const CompiledNode* firstMatch = nullptr;
+    std::string firstDeviceId;
     for (const auto& dgraph : child.dgraphs) {
         if (!dgraph) continue;
         for (const CompiledNode& node : dgraph->nodes) {
             if (compiledNodeId(node) != nodeId) continue;
-            deviceId = dgraph->deviceId;
-            return &node;
+            // Split bodies can replicate boundaries onto both slices.  Prefer
+            // the CPU boundary so CPU-delivered parent outputs are not later
+            // treated as FPGA-produced and bridged back over good host data.
+            if (std::holds_alternative<CompiledBoundaryNode>(node) && dgraph->device &&
+                dgraph->device->type() == DeviceType::CPU) {
+                deviceId = dgraph->deviceId;
+                return &node;
+            }
+            if (!firstMatch) {
+                firstMatch = &node;
+                firstDeviceId = dgraph->deviceId;
+            }
         }
     }
-    return nullptr;
+    if (firstMatch) deviceId = firstDeviceId;
+    return firstMatch;
+}
+
+BoundaryExportDevices collectBoundaryExportDevices(const GraphRegion& childRegion,
+                                                   const DGraphChild& childDGraphs,
+                                                   uint64_t parentScopeId) {
+    BoundaryExportDevices out;
+    auto record = [](auto& dst, const std::string& key, const std::string& deviceId) {
+        auto [it, inserted] = dst.emplace(key, deviceId);
+        if (!inserted && it->second != deviceId) {
+            // Ambiguous branch/slice placement; leave this token unresolved so
+            // explicit control-output placement logic can handle it.
+            dst.erase(it);
+        }
+    };
+
+    for (const RegionOp& childOp : childRegion.ops()) {
+        const auto* boundary = std::get_if<SubgraphBoundaryOp>(&childOp);
+        if (!boundary || boundary->side != BoundarySide::End) continue;
+
+        std::string boundaryDeviceId;
+        const CompiledNode* compiled =
+            findCompiledNodeInChildDGraphs(childDGraphs, boundary->id, boundaryDeviceId);
+        if (!compiled) continue;
+
+        for (const auto& mapping : boundary->bufferMappings) {
+            if (mapping.target.scopeId() != parentScopeId) continue;
+            record(out.buffers,
+                   scopedBufferKey(mapping.target.scopeId(), mapping.target.name()),
+                   boundaryDeviceId);
+        }
+        for (const auto& mapping : boundary->scalarMappings) {
+            if (mapping.target.scopeId() != parentScopeId) continue;
+            record(out.scalars,
+                   scopedScalarKey(mapping.target.scopeId(), mapping.target.varName()),
+                   boundaryDeviceId);
+        }
+    }
+    return out;
 }
 
 std::string compiledOutputBufferPlacement(const CompiledNode& node,
@@ -1923,19 +1949,6 @@ CompiledLoopOutputPlacement validateLoopOutputPlacements(
     CompiledLoopOutputPlacement result;
     RegionOutputBindings declaredOutputs = collectOutputBindings(loop.ioType, loop.ioMap, loop.id);
     if (declaredOutputs.buffers.empty() && declaredOutputs.scalars.empty()) return result;
-
-    // A constant trip count of zero would never enter the body, so the
-    // declared outputs would never be materialised. Reject this at compile
-    // time; scalar trip counts can still be zero at runtime and remain a
-    // dynamic check inside CpuDevice::executeLoop.
-    if (loop.kind == LoopKind::FixedCount && loop.tripCount &&
-        loop.tripCount->kind() == LoopTripCount::Kind::Constant &&
-        loop.tripCount->constantBits() == 0) {
-        throw std::runtime_error(
-            "GraphCompiler: loop '" + loop.id +
-            "' has a constant trip count of 0 but declares output ports; "
-            "zero-iteration loops cannot materialize outputs");
-    }
 
     RegionExitProducers bodyOutputs = collectRegionExitProducers(*loop.body, bodyChild);
     for (const auto& declared : declaredOutputs.buffers) {
@@ -2299,6 +2312,7 @@ class RegionCompiler {
         resolveControlOutputPlacements(rc);
         materializeControlOutputBridges(rc);
         assignDevices(rc);
+        populateProducerDevicePlacements(rc);
         buildPerDeviceCompiledNodes(rc);
         insertCrossDeviceBridges(rc);
         insertAfterOpsBarriers(rc);
@@ -2326,6 +2340,8 @@ class RegionCompiler {
         std::map<std::string, std::vector<DGraphChild>> childrenByControlId;
         std::map<std::string, std::string>              scalarProducerMap;
         std::map<std::string, std::string>              bufferProducerMap;
+        std::map<std::string, std::string>              scalarProducerDeviceByKey;
+        std::map<std::string, std::string>              bufferProducerDeviceByKey;
         std::map<std::pair<std::string, std::string>, std::string>
             loopCarriedInitialScalarProducers;
         std::map<std::pair<std::string, std::string>, std::string>
@@ -2393,18 +2409,6 @@ class RegionCompiler {
             const auto* kernel = std::get_if<KernelOp>(&op);
             if (!kernel) continue;
             if (kernel->kernel.type != DeviceType::CPU) {
-                // FPGA kernels may bind *output* scalars: the FpgaDevice captures
-                // them post-run via RP1_OP_SCALAR_READ into a signal slot (the
-                // value a downstream LOOP/COND predicate evaluates).  Non-constant
-                // *input* scalars on a non-CPU kernel are not yet supported (they
-                // would need a host/slot value written into the kernel register).
-                for (const auto& [portName, scalar] : kernel->ioMap.inputScalars()) {
-                    if (scalar.isConstant()) continue;
-                    throw std::runtime_error(
-                        "GraphCompiler: non-constant scalar bindings are currently supported "
-                        "only on CPU kernels (FPGA kernels may bind output scalars, captured "
-                        "via SCALAR_READ)");
-                }
                 if (kernel->kernel.type != DeviceType::FPGA &&
                     !kernel->ioMap.outputScalars().empty()) {
                     throw std::runtime_error(
@@ -2512,7 +2516,7 @@ class RegionCompiler {
         // device lowering captures via SCALAR_READ each iteration.
         std::optional<std::string> predKey;
         if (loop.kind == LoopKind::FixedCount) {
-            if (!loop.tripCount || loop.tripCount->kind() != LoopTripCount::Kind::Constant) {
+            if (!loop.tripCount) {
                 return std::nullopt;
             }
         } else if (loop.kind == LoopKind::WhileCondition) {
@@ -2678,7 +2682,7 @@ class RegionCompiler {
         // Follower each iteration (see splitLoopBroadcast wiring), so a while
         // loop is eligible too -- the CPU evaluates the (host) condition.
         if (loop.kind == LoopKind::FixedCount) {
-            if (!loop.tripCount || loop.tripCount->kind() != LoopTripCount::Kind::Constant) {
+            if (!loop.tripCount) {
                 return std::nullopt;
             }
         } else if (loop.kind == LoopKind::WhileCondition) {
@@ -2766,8 +2770,37 @@ class RegionCompiler {
         std::map<DGraph*, std::set<std::string>> removeIds;
         std::map<DGraph*, std::vector<CompiledNode>> appendNodes;
         std::map<std::string, std::string> depRewrite;  // bridge half id -> data-ready node id
+        // Consumer kernel id -> extra dependency that gates it on its input
+        // being delivered. depRewrite only rewrites existing deps; kernels with
+        // explicit `.after` deps may not mention the removed consumer bridge.
+        std::map<std::string, std::vector<std::string>> kernelExtraDeps;
+        // Bridge consumer-half id -> producer-side completion id, used to keep
+        // CPU pulls for an FPGA output after any same-iteration CPU push into
+        // that FPGA kernel.
+        std::map<std::string, std::string> bridgeConsumerDone;
 
-        for (auto& [op, hs] : byOp) {
+        std::vector<std::pair<const void*, std::vector<Half>>> orderedGroups(
+            byOp.begin(), byOp.end());
+        auto groupKey = [](const std::vector<Half>& hs) {
+            std::string k;
+            for (const auto& h : hs) {
+                if (k.empty() || h.node->id < k) k = h.node->id;
+            }
+            return k;
+        };
+        std::sort(orderedGroups.begin(), orderedGroups.end(),
+                  [&](const auto& a, const auto& b) {
+                      return groupKey(a.second) < groupKey(b.second);
+                  });
+        auto nodeDeps = [](DGraph* slice, const std::string& id) -> std::vector<std::string> {
+            if (!slice) return {};
+            for (const CompiledNode& n : slice->nodes) {
+                if (compiledNodeId(n) == id) return compiledNodeDependsOn(n);
+            }
+            return {};
+        };
+
+        for (auto& [op, hs] : orderedGroups) {
             (void)op;
             if (hs.size() != 2) continue;
             const CompiledBridgeOpNode* prod =
@@ -2812,6 +2845,7 @@ class RegionCompiler {
             doneClear.id = tag + "done_clear"; doneClear.deviceId = prodSlice->deviceId;
             doneClear.dependsOn = {waitDone.id};
             doneClear.slot = done; doneClear.value = 0; doneClear.operation = RP1_SIGOP_SET;
+            bridgeConsumerDone[cons->id] = doneClear.id;
 
             // Consumer slice: await READY, clear it, then (consume), raise DONE.
             CompiledWaitNode waitReady;
@@ -2831,11 +2865,19 @@ class RegionCompiler {
                 CompiledBridgeOpNode xfer;
                 xfer.id = tag + "xfer"; xfer.deviceId = prodSlice->deviceId; xfer.op = prod->op;
                 xfer.action = move; xfer.side = CompiledBridgeOpNode::Side::Consumer;
-                xfer.dependsOn = prod->dependsOn;        // after the producing kernel
+                xfer.dependsOn = prod->pairedKernelId.empty()
+                    ? prod->dependsOn
+                    : std::vector<std::string>{prod->pairedKernelId};  // after producer kernel
                 sigReady.dependsOn = {xfer.id};          // raise READY once data is staged to FPGA
                 appendNodes[prodSlice].emplace_back(std::move(xfer));
                 dataReadyId = waitReady.id;              // FPGA consumer: data already in its buffer
             } else {
+                for (const std::string& dep : nodeDeps(prodSlice, prod->pairedKernelId)) {
+                    auto doneIt = bridgeConsumerDone.find(dep);
+                    if (doneIt != bridgeConsumerDone.end()) {
+                        waitReady.dependsOn.push_back(doneIt->second);
+                    }
+                }
                 CompiledBridgeOpNode xfer;
                 xfer.id = tag + "xfer"; xfer.deviceId = consSlice->deviceId; xfer.op = prod->op;
                 xfer.action = move; xfer.side = CompiledBridgeOpNode::Side::Consumer;
@@ -2860,6 +2902,9 @@ class RegionCompiler {
             // on the staged data instead of the removed consumer bridge.
             depRewrite[cons->id] = dataReadyId;
             depRewrite[prod->id] = tag + "ready_set";
+            if (!cons->pairedKernelId.empty()) {
+                kernelExtraDeps[cons->pairedKernelId].push_back(dataReadyId);
+            }
         }
 
         // Apply removals, dependsOn rewrites, and appends to each slice.
@@ -2874,6 +2919,14 @@ class RegionCompiler {
                 for (std::string& d : deps) {
                     auto rw = depRewrite.find(d);
                     if (rw != depRewrite.end()) d = rw->second;
+                }
+                if (auto exIt = kernelExtraDeps.find(compiledNodeId(n));
+                    exIt != kernelExtraDeps.end()) {
+                    for (const std::string& extra : exIt->second) {
+                        if (std::find(deps.begin(), deps.end(), extra) == deps.end()) {
+                            deps.push_back(extra);
+                        }
+                    }
                 }
                 kept.push_back(std::move(n));
             }
@@ -3105,13 +3158,12 @@ class RegionCompiler {
                 } else if (auto parts = splitLoopParticipants(rc, *loop)) {
                     rc.splitLoopDevices[id] = *parts;
                     rc.nodeDevice[id] = splitPrimaryDevice(*parts);
-                    if (loop->kind == LoopKind::WhileCondition) {
-                        // Data-dependent split: reserve the broadcast handshake
-                        // slots shared by the Authority (CPU) and Follower (FPGA).
-                        rc.splitLoopBroadcast[id] = {rendezvousSlots_.alloc(),
-                                                     rendezvousSlots_.alloc(),
-                                                     rendezvousSlots_.alloc()};
-                    }
+                    // Every cross-device split loop needs the per-iteration
+                    // broadcast handshake so the CPU Authority and FPGA
+                    // Follower stay in lockstep.
+                    rc.splitLoopBroadcast[id] = {rendezvousSlots_.alloc(),
+                                                 rendezvousSlots_.alloc(),
+                                                 rendezvousSlots_.alloc()};
                 } else if (rc.cpuDevice) {
                     rc.nodeDevice[id] = rc.cpuDevice->id();
                 } else {
@@ -3142,6 +3194,87 @@ class RegionCompiler {
                     throw std::runtime_error(
                         "GraphCompiler: boundary op '" + id +
                         "' requires a CPU device but none is registered");
+                }
+            }
+        }
+    }
+
+    void populateProducerDevicePlacements(RegionCompilation& rc) const {
+        auto record = [](std::map<std::string, std::string>& dst,
+                         const std::string& key,
+                         const std::string& deviceId) {
+            if (!key.empty() && !deviceId.empty()) dst[key] = deviceId;
+        };
+
+        for (const RegionOp* opPtr : rc.ops) {
+            const RegionOp& op = *opPtr;
+            const std::string& opId = regionOpId(op);
+            auto devIt = rc.nodeDevice.find(opId);
+            if (devIt == rc.nodeDevice.end()) continue;
+            for (const std::string& key : producedBufferKeys(op)) {
+                record(rc.bufferProducerDeviceByKey, key, devIt->second);
+            }
+            for (const std::string& key : producedScalarKeys(op)) {
+                record(rc.scalarProducerDeviceByKey, key, devIt->second);
+            }
+        }
+
+        for (const auto& [controlId, placement] : rc.loopOutputPlacements) {
+            (void)controlId;
+            for (const auto& [key, dev] : placement.buffers) {
+                record(rc.bufferProducerDeviceByKey, key, dev);
+            }
+            for (const auto& [key, dev] : placement.scalars) {
+                record(rc.scalarProducerDeviceByKey, key, dev);
+            }
+        }
+        for (const auto& [controlId, placement] : rc.conditionalOutputPlacements) {
+            (void)controlId;
+            for (const auto& [key, dev] : placement.buffers) {
+                record(rc.bufferProducerDeviceByKey, key, dev);
+            }
+            for (const auto& [key, dev] : placement.scalars) {
+                record(rc.scalarProducerDeviceByKey, key, dev);
+            }
+        }
+
+        for (const RegionOp* opPtr : rc.ops) {
+            const RegionOp& op = *opPtr;
+            const std::string& opId = regionOpId(op);
+            auto childIt = rc.childrenByControlId.find(opId);
+            if (childIt == rc.childrenByControlId.end()) continue;
+
+            if (const auto* loop = std::get_if<LoopOp>(&op)) {
+                const DGraphChild& bodyChild =
+                    requireChildDGraphs(childIt->second, opId, DGraphChildRole::LoopBody);
+                BoundaryExportDevices devices = collectBoundaryExportDevices(
+                    *loop->body, bodyChild, loop->body->parentScopeId());
+                for (const auto& [key, dev] : devices.buffers) {
+                    record(rc.bufferProducerDeviceByKey, key, dev);
+                }
+                for (const auto& [key, dev] : devices.scalars) {
+                    record(rc.scalarProducerDeviceByKey, key, dev);
+                }
+            } else if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
+                const DGraphChild& thenChild = requireChildDGraphs(
+                    childIt->second, opId, DGraphChildRole::ConditionalThen);
+                const DGraphChild& elseChild = requireChildDGraphs(
+                    childIt->second, opId, DGraphChildRole::ConditionalElse);
+                BoundaryExportDevices thenDevices = collectBoundaryExportDevices(
+                    *cond->thenRegion, thenChild, cond->thenRegion->parentScopeId());
+                BoundaryExportDevices elseDevices = collectBoundaryExportDevices(
+                    *cond->elseRegion, elseChild, cond->elseRegion->parentScopeId());
+                for (const auto& [key, dev] : thenDevices.buffers) {
+                    auto eit = elseDevices.buffers.find(key);
+                    if (eit != elseDevices.buffers.end() && eit->second == dev) {
+                        record(rc.bufferProducerDeviceByKey, key, dev);
+                    }
+                }
+                for (const auto& [key, dev] : thenDevices.scalars) {
+                    auto eit = elseDevices.scalars.find(key);
+                    if (eit != elseDevices.scalars.end() && eit->second == dev) {
+                        record(rc.scalarProducerDeviceByKey, key, dev);
+                    }
                 }
             }
         }
@@ -3322,7 +3455,11 @@ class RegionCompiler {
                         producerNodeId = producerIt->second;
                     }
                     if (producerNodeId.empty()) continue;
-                    const std::string& producerDeviceId = rc.nodeDevice.at(producerNodeId);
+                    std::string producerDeviceId = rc.nodeDevice.at(producerNodeId);
+                    if (auto devIt = rc.scalarProducerDeviceByKey.find(scalarKey);
+                        devIt != rc.scalarProducerDeviceByKey.end()) {
+                        producerDeviceId = devIt->second;
+                    }
                     if (producerDeviceId != did) {
                         throw std::runtime_error(
                             "GraphCompiler: cross-device global scalar dependencies are not supported yet");
@@ -3490,7 +3627,11 @@ class RegionCompiler {
             producerNodeId = prodIt->second;
         }
         if (producerNodeId.empty()) return;
-        const std::string& producerDevId = rc.nodeDevice.at(producerNodeId);
+        std::string producerDevId = rc.nodeDevice.at(producerNodeId);
+        if (auto devIt = rc.bufferProducerDeviceByKey.find(bufKey);
+            devIt != rc.bufferProducerDeviceByKey.end()) {
+            producerDevId = devIt->second;
+        }
         if (producerDevId == consumerDevId) return;
 
         const RegionOp& producerOp = *rc.opById.at(producerNodeId);
@@ -3616,7 +3757,12 @@ class RegionCompiler {
             producerNodeId = pit->second;
         }
         if (producerNodeId.empty()) return;
-        if (rc.nodeDevice.at(producerNodeId) == did) {
+        std::string producerDevId = rc.nodeDevice.at(producerNodeId);
+        if (auto devIt = rc.bufferProducerDeviceByKey.find(ref.key);
+            devIt != rc.bufferProducerDeviceByKey.end()) {
+            producerDevId = devIt->second;
+        }
+        if (producerDevId == did) {
             addDep(node, seen, producerNodeId);
             return;
         }

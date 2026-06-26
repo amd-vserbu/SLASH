@@ -151,6 +151,60 @@ void writeU64ToArgWords(std::uint64_t value, std::uint32_t* dst) {
     dst[1] = static_cast<std::uint32_t>((value >> 32) & 0xFFFFFFFFu);
 }
 
+std::int64_t signedScalarValue(ScalarType type, std::uint64_t bits) {
+    switch (type) {
+        case ScalarType::I8: {
+            std::int8_t v;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        }
+        case ScalarType::I16: {
+            std::int16_t v;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        }
+        case ScalarType::I32: {
+            std::int32_t v;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        }
+        case ScalarType::I64: {
+            std::int64_t v;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        }
+        default:
+            return static_cast<std::int64_t>(bits);
+    }
+}
+
+std::uint64_t unsignedScalarValue(ScalarType type, std::uint64_t bits) {
+    switch (type) {
+        case ScalarType::U8: {
+            std::uint8_t v;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        }
+        case ScalarType::U16: {
+            std::uint16_t v;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        }
+        case ScalarType::U32: {
+            std::uint32_t v;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        }
+        case ScalarType::U64: {
+            std::uint64_t v;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        }
+        default:
+            return bits;
+    }
+}
+
 void ensureArgCapacity(std::uint32_t cursor_words,
                        std::uint32_t width,
                        const std::string& kernelName,
@@ -263,6 +317,15 @@ struct DeferredPdi {
     std::string  pdiPath;
 };
 
+struct DeferredLoopTripCount {
+    std::size_t nodeIndex = 0;
+    std::string scopedKey;
+    std::string fallbackKey;
+    bool hasFallback = false;
+    ScalarType type = ScalarType::U32;
+    std::string diagnostic;
+};
+
 const char* deviceTypeName(DeviceType t) {
     switch (t) {
         case DeviceType::CPU:      return "CPU";
@@ -325,19 +388,118 @@ class FpgaDevicePlan : public IDevicePlan {
         try { wait(); } catch (...) { /* swallow */ }
     }
 
+    static void dumpImage(const fpga::Rp1GraphImage& image) {
+        auto opName = [](std::uint16_t op) -> const char* {
+            switch (op) {
+                case RP1_OP_WAIT:            return "WAIT";
+                case RP1_OP_SIGNAL:          return "SIGNAL";
+                case RP1_OP_SCALAR_READ:     return "SCALAR_READ";
+                case RP1_OP_SCALAR_COPY:     return "SCALAR_COPY";
+                case RP1_OP_KERNEL_DISPATCH: return "KERNEL_DISPATCH";
+                case RP1_OP_DMA_COPY:        return "DMA_COPY";
+                case RP1_OP_PDI_LOAD:        return "PDI_LOAD";
+                case RP1_OP_LOOP:            return "LOOP";
+                case RP1_OP_COND:            return "COND";
+                case RP1_OP_RERUN:           return "RERUN";
+                default:                     return "?";
+            }
+        };
+        std::cerr << "[rp1-dump] " << image.nodes.size() << " nodes\n";
+        for (std::size_t i = 0; i < image.nodes.size(); ++i) {
+            const rp1_node_t& n = image.nodes[i];
+            std::cerr << "[rp1-dump] #" << i << " " << opName(n.opcode)
+                      << " await(b" << int(n.barrier_await_bucket) << ":0x"
+                      << std::hex << n.barrier_await_mask << std::dec << ")"
+                      << " set(b" << int(n.barrier_set_bucket) << ":0x"
+                      << std::hex << n.barrier_set_mask << std::dec << ")";
+            if (n.opcode == RP1_OP_WAIT) {
+                std::cerr << " wait[sig=" << n.payload.wait.condition_signal
+                          << " op=" << n.payload.wait.condition_op
+                          << " val=" << n.payload.wait.condition_value << "]";
+            } else if (n.opcode == RP1_OP_SIGNAL) {
+                std::cerr << " sig[slot=" << n.payload.signal.target_slot
+                          << " op=" << n.payload.signal.operation
+                          << " val=" << n.payload.signal.value << "]";
+            } else if (n.opcode == RP1_OP_LOOP) {
+                std::cerr << " loop[body=" << n.payload.loop.body_start << ".."
+                          << n.payload.loop.body_end
+                          << " maxIter=" << n.payload.loop.max_iterations
+                          << " condSig=" << n.payload.loop.condition_signal
+                          << " condVal=" << n.payload.loop.condition_value
+                          << " condOp=" << n.payload.loop.condition_op
+                          << " clearB=" << int(n.payload.loop.bucket_clear_start) << ".."
+                          << int(n.payload.loop.bucket_clear_end) << "]";
+            } else if (n.opcode == RP1_OP_PDI_LOAD) {
+                std::cerr << " pdi[img=" << n.payload.pdi_load.image_id << "]";
+            } else if (n.opcode == RP1_OP_KERNEL_DISPATCH) {
+                std::cerr << " kd[img=" << n.payload.kernel_dispatch.expected_image_id << "]";
+            } else if (n.opcode == RP1_OP_SCALAR_COPY) {
+                std::cerr << " scopy[srcSlot=" << n.payload.scalar_copy.source_slot << "]";
+            } else if (n.opcode == RP1_OP_SCALAR_READ) {
+                std::cerr << " sread[slot=" << n.payload.scalar_read.target_slot << "]";
+            }
+            std::cerr << "\n";
+        }
+        std::cerr << std::flush;
+    }
+
+    static void clearHandshakeSlots(fpga::Rp1GraphImage& image) {
+        std::set<std::uint32_t> carried;
+        for (const rp1_node_t& n : image.nodes) {
+            if (n.opcode == RP1_OP_SCALAR_COPY) {
+                carried.insert(n.payload.scalar_copy.source_slot);
+            }
+        }
+
+        std::set<std::uint32_t> toClear;
+        for (const rp1_node_t& n : image.nodes) {
+            if (n.opcode != RP1_OP_LOOP) continue;
+            toClear.insert(n.payload.loop.condition_signal);
+            const std::uint32_t bs = n.payload.loop.body_start;
+            const std::uint32_t be = n.payload.loop.body_end;
+            for (std::uint32_t i = bs; i <= be && i < image.nodes.size(); ++i) {
+                const rp1_node_t& b = image.nodes[i];
+                if (b.opcode == RP1_OP_SIGNAL) {
+                    toClear.insert(b.payload.signal.target_slot);
+                } else if (b.opcode == RP1_OP_WAIT) {
+                    toClear.insert(b.payload.wait.condition_signal);
+                }
+            }
+        }
+        for (std::uint32_t s : toClear) {
+            if (carried.count(s)) continue;
+            if (std::find(image.clear_signal_slots.begin(),
+                          image.clear_signal_slots.end(), s) ==
+                image.clear_signal_slots.end()) {
+                image.clear_signal_slots.push_back(s);
+            }
+        }
+    }
+
     void launch() override {
         wait();
+        if (std::getenv("VRT_RP1_DUMP")) dumpImage(image_);
         workerEx_ = nullptr;
         worker_ = std::thread([this] {
             try {
                 lastCq_.clear();
                 resolveDeferredScalars();
+                resolveDeferredLoopTripCounts();
                 stageDeferredPdis();
                 submitter_->submitAndWait(image_, timeout_);
                 lastCq_ = submitter_->drainCq();
                 applyImageSideEffects();
             } catch (...) {
                 workerEx_ = std::current_exception();
+                try {
+                    std::rethrow_exception(workerEx_);
+                } catch (const std::exception& e) {
+                    std::cerr << "[FpgaDevicePlan] worker exception: " << e.what()
+                              << std::endl;
+                } catch (...) {
+                    std::cerr << "[FpgaDevicePlan] worker exception: (non-std)"
+                              << std::endl;
+                }
             }
         });
     }
@@ -392,6 +554,47 @@ class FpgaDevicePlan : public IDevicePlan {
         }
     }
 
+    void resolveDeferredLoopTripCounts() {
+        if (deferredTripCounts_.empty()) return;
+        if (!scalarValues_) {
+            throw std::runtime_error(
+                "FpgaDevicePlan: deferred loop trip-count resolution requires a scalar map");
+        }
+        for (const DeferredLoopTripCount& d : deferredTripCounts_) {
+            auto it = scalarValues_->find(d.scopedKey);
+            if (it == scalarValues_->end() && d.hasFallback) {
+                it = scalarValues_->find(d.fallbackKey);
+            }
+            if (it == scalarValues_->end()) {
+                throw std::runtime_error(
+                    "FpgaDevicePlan: loop trip-count scalar '" + d.diagnostic +
+                    "' is not set in the graph scalar map (key='" + d.scopedKey + "')");
+            }
+            const std::uint64_t value =
+                isSignedIntegerScalarType(d.type)
+                    ? static_cast<std::uint64_t>(signedScalarValue(d.type, it->second))
+                    : unsignedScalarValue(d.type, it->second);
+            if (isSignedIntegerScalarType(d.type) &&
+                signedScalarValue(d.type, it->second) < 0) {
+                throw std::runtime_error(
+                    "FpgaDevicePlan: loop trip count '" + d.diagnostic +
+                    "' must be non-negative");
+            }
+            if (value == 0 || value > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    "FpgaDevicePlan: loop trip count '" + d.diagnostic +
+                    "' must be in the range 1..UINT32_MAX");
+            }
+            if (d.nodeIndex >= image_.nodes.size() ||
+                image_.nodes[d.nodeIndex].opcode != RP1_OP_LOOP) {
+                throw std::logic_error(
+                    "FpgaDevicePlan: deferred trip count points at a non-LOOP node");
+            }
+            image_.nodes[d.nodeIndex].payload.loop.max_iterations =
+                static_cast<std::uint32_t>(value);
+        }
+    }
+
     void stageDeferredPdis() {
         if (deferredPdis_.empty()) return;
         std::map<std::string, std::uint64_t> stagedByPath;
@@ -416,10 +619,9 @@ class FpgaDevicePlan : public IDevicePlan {
     }
 
     std::uint64_t scalarBits(const GraphScalar& gs, const std::string& diagnostic) const {
-        if (gs.isConstant()) return gs.constantBits();
         if (!scalarValues_) {
             throw std::runtime_error(
-                "FpgaDevicePlan: global scalar bound to port '" + diagnostic +
+                "FpgaDevicePlan: scalar bound to port '" + diagnostic +
                 "' requires a scalar map");
         }
         const std::string scopedKey = scopedScalarKey(gs.scopeId(), gs.varName());
@@ -495,24 +697,17 @@ class FpgaDevicePlan : public IDevicePlan {
             }
             const std::uint32_t width = scalarWidthInWords(port.type);
             std::uint32_t words[2] = {0u, 0u};
-            if (it->second.isConstant()) {
-                writeScalarToArgWords(port.type,
-                                      scalarBits(it->second, node.id + "." + port.name),
-                                      words);
-            }
             const std::uint32_t base = layout.take(port.name, width);
             const std::uint32_t firstValueWord =
                 appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, width,
                                       node.kernel.name, port.name);
-            if (!it->second.isConstant()) {
-                deferred_.push_back(DeferredScalar{
-                    scopedScalarKey(it->second.scopeId(), it->second.varName()),
-                    it->second.varName(),
-                    it->second.scopeId() == 0,
-                    port.type,
-                    firstValueWord,
-                    node.id + "." + port.name});
-            }
+            deferred_.push_back(DeferredScalar{
+                scopedScalarKey(it->second.scopeId(), it->second.varName()),
+                it->second.varName(),
+                it->second.scopeId() == 0,
+                port.type,
+                firstValueWord,
+                node.id + "." + port.name});
             arg_count += width;
         }
 
@@ -626,6 +821,38 @@ class FpgaDevicePlan : public IDevicePlan {
                     }
                 }
             }
+        }
+        {
+            std::unordered_map<std::string, std::size_t> idxById;
+            for (std::size_t i = 0; i < mids.size(); ++i) {
+                idxById[compiledNodeId(*mids[i])] = i;
+            }
+            std::vector<int> indeg(mids.size(), 0);
+            std::vector<std::vector<std::size_t>> succ(mids.size());
+            for (std::size_t i = 0; i < mids.size(); ++i) {
+                for (const std::string& d : compiledNodeDependsOn(*mids[i])) {
+                    auto it = idxById.find(d);
+                    if (it != idxById.end()) {
+                        succ[it->second].push_back(i);
+                        ++indeg[i];
+                    }
+                }
+            }
+            std::set<std::size_t> ready;
+            for (std::size_t i = 0; i < mids.size(); ++i) {
+                if (indeg[i] == 0) ready.insert(i);
+            }
+            std::vector<const CompiledNode*> sorted;
+            sorted.reserve(mids.size());
+            while (!ready.empty()) {
+                const std::size_t i = *ready.begin();
+                ready.erase(ready.begin());
+                sorted.push_back(mids[i]);
+                for (std::size_t s : succ[i]) {
+                    if (--indeg[s] == 0) ready.insert(s);
+                }
+            }
+            if (sorted.size() == mids.size()) mids = std::move(sorted);
         }
         std::vector<const CompiledNode*> out;
         out.reserve(starts.size() + mids.size() + ends.size());
@@ -855,6 +1082,7 @@ class FpgaDevicePlan : public IDevicePlan {
         sentinel.payload.signal.operation = RP1_SIGOP_SET;
         image.nodes.push_back(sentinel);
         image.clear_signal_slots.push_back(sentinelSlot_);
+        clearHandshakeSlots(image);
 
         if (image.nodes.size() > RP1_MAX_NODES) {
             throw std::logic_error("FpgaDevice: main-line image exceeds RP1_MAX_NODES");
@@ -868,7 +1096,7 @@ class FpgaDevicePlan : public IDevicePlan {
     // nodes' completion signals, the sentinel) occupy bucket 0; each loop body
     // gets its own bucket that the LOOP node clears per iteration.
     //
-    // Supported: constant fixed-count loops (termination via max_iterations),
+    // Supported: scalar fixed-count loops (termination via max_iterations),
     // data-dependent while-loops (termination via a signal-slot predicate fed
     // by a body output scalar's SCALAR_READ), and conditionals (COND-gated
     // then/else with an OR-join, predicate from a main-line output scalar).
@@ -1017,6 +1245,7 @@ class FpgaDevicePlan : public IDevicePlan {
         sentinel.payload.signal.operation   = RP1_SIGOP_SET;
         image.nodes.push_back(sentinel);
         image.clear_signal_slots.push_back(sentinelSlot_);
+        clearHandshakeSlots(image);
 
         if (image.nodes.size() > RP1_MAX_NODES) {
             throw std::logic_error("FpgaDevice: control-flow image exceeds RP1_MAX_NODES");
@@ -1024,7 +1253,7 @@ class FpgaDevicePlan : public IDevicePlan {
         return image;
     }
 
-    // Emit LOOP + flattened body + RERUN for a constant fixed-count loop or a
+    // Emit LOOP + flattened body + RERUN for a scalar fixed-count loop or a
     // data-dependent while-loop.  A while-loop's predicate is evaluated by RP1
     // against a signal slot that a body kernel's output scalar feeds each
     // iteration via SCALAR_READ; the loop exits when the while-continue
@@ -1039,7 +1268,7 @@ class FpgaDevicePlan : public IDevicePlan {
                    std::uint8_t& nextBodyBkt) {
         // A data-dependent split Follower reads the Authority's broadcast as its
         // exit predicate, so it neither evaluates the condition itself nor needs
-        // a constant trip count -- skip the while/fixed-count validation.
+        // a local trip count -- skip the while/fixed-count validation.
         const bool isFollower = loop.broadcastRole == SplitBroadcastRole::Follower;
         const bool isWhile = !isFollower && loop.loopKind == CompiledLoopKind::WhileCondition;
         if (isFollower) {
@@ -1054,20 +1283,10 @@ class FpgaDevicePlan : public IDevicePlan {
                     "FpgaDevice: while-loop '" + loop.id + "' condition is not RP1-evaluable "
                     "(needs one integer scalar compared against a constant)");
             }
-        } else if (loop.loopKind != CompiledLoopKind::FixedCount || !loop.tripCount ||
-                   loop.tripCount->kind() != LoopTripCount::Kind::Constant) {
+        } else if (loop.loopKind != CompiledLoopKind::FixedCount || !loop.tripCount) {
             throw std::logic_error(
-                "FpgaDevice: autonomous fixed-count loops support only constant "
-                "trip counts (loop '" + loop.id + "')");
-        }
-        std::uint64_t count = 0;
-        if (!isFollower && !isWhile) {
-            count = loop.tripCount->constantBits();
-            if (count == 0 || count > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::logic_error(
-                    "FpgaDevice: loop '" + loop.id + "' trip count " + std::to_string(count) +
-                    " is unsupported for autonomous execution (must be 1..UINT32_MAX)");
-            }
+                "FpgaDevice: autonomous fixed-count loop '" + loop.id +
+                "' is missing its scalar trip count");
         }
 
         const std::vector<const CompiledNode*> bodyNodes =
@@ -1095,6 +1314,15 @@ class FpgaDevicePlan : public IDevicePlan {
         loopPkt.barrier_set_mask     = exitBit;
         const std::size_t loopIdx = image.nodes.size();
         image.nodes.push_back(loopPkt);
+        if (!isFollower && !isWhile) {
+            deferredTripCounts_.push_back(DeferredLoopTripCount{
+                loopIdx,
+                scopedScalarKey(loop.tripCount->scopeId(), loop.tripCount->name()),
+                loop.tripCount->name(),
+                loop.tripCount->scopeId() == 0,
+                loop.tripCount->type(),
+                loop.id + "." + loop.tripCount->name()});
+        }
 
         // Flatten the body into bucket `bodyBkt`.
         std::unordered_map<std::string, std::uint32_t> bodyBit;
@@ -1414,7 +1642,7 @@ class FpgaDevicePlan : public IDevicePlan {
             lp.condition_value  = c.value;
             lp.condition_op     = fpga::invertRp1Op(c.op);
         } else {
-            lp.max_iterations     = static_cast<std::uint32_t>(count);
+            lp.max_iterations     = 1;
             lp.condition_signal   = 0;
             lp.condition_value    = fpga::kNeverValue;
             lp.condition_op       = fpga::kNeverOp;  // (sig & 0) != 0 -> never; max_iter governs
@@ -1600,6 +1828,7 @@ class FpgaDevicePlan : public IDevicePlan {
     std::shared_ptr<fpga::Rp1Submitter>                       submitter_;
     fpga::Rp1GraphImage                                        image_;
     std::vector<DeferredScalar>                                deferred_;
+    std::vector<DeferredLoopTripCount>                         deferredTripCounts_;
     std::vector<DeferredPdi>                                   deferredPdis_;
     std::shared_ptr<std::map<std::string, std::uint64_t>>      scalarValues_;
     std::uint32_t                                              sentinelSlot_;
@@ -1792,31 +2021,39 @@ void FpgaDevice::populateBufferRegions(const DGraph& dg) {
         bufferRegion_[key] = *region;
     };
 
-    for (const CompiledNode& node : dg.nodes) {
-        const auto* k = std::get_if<CompiledKernelNode>(&node);
-        if (!k) continue;
+    std::function<void(const DGraph&)> walk = [&](const DGraph& g) {
+        for (const CompiledNode& node : g.nodes) {
+            const auto* k = std::get_if<CompiledKernelNode>(&node);
+            if (!k) continue;
 
-        for (const BufferPort& port : k->kernel.ioType.inputs) {
-            auto it = k->ioMap.inputs().find(port.name);
-            if (it != k->ioMap.inputs().end()) {
-                record(k->kernel, port.name, it->second);
+            for (const BufferPort& port : k->kernel.ioType.inputs) {
+                auto it = k->ioMap.inputs().find(port.name);
+                if (it != k->ioMap.inputs().end()) {
+                    record(k->kernel, port.name, it->second);
+                }
             }
-        }
-        for (const BufferPort& port : k->kernel.ioType.outputs) {
-            auto it = k->ioMap.outputs().find(port.name);
-            if (it != k->ioMap.outputs().end()) {
-                record(k->kernel, port.name, it->second);
+            for (const BufferPort& port : k->kernel.ioType.outputs) {
+                auto it = k->ioMap.outputs().find(port.name);
+                if (it != k->ioMap.outputs().end()) {
+                    record(k->kernel, port.name, it->second);
+                }
             }
-        }
-        for (const RWBufferPort& port : k->kernel.ioType.inouts) {
-            for (const IOMap::InoutBinding& binding : k->ioMap.inouts()) {
-                if (binding.inPort == port.in.name && binding.outPort == port.out.name) {
-                    record(k->kernel, port.in.name, binding.in);
-                    record(k->kernel, port.out.name, binding.out);
+            for (const RWBufferPort& port : k->kernel.ioType.inouts) {
+                for (const IOMap::InoutBinding& binding : k->ioMap.inouts()) {
+                    if (binding.inPort == port.in.name && binding.outPort == port.out.name) {
+                        record(k->kernel, port.in.name, binding.in);
+                        record(k->kernel, port.out.name, binding.out);
+                    }
                 }
             }
         }
-    }
+        for (const DGraphChild& child : g.childDGraphs) {
+            for (const auto& slice : child.dgraphs) {
+                if (slice) walk(*slice);
+            }
+        }
+    };
+    walk(dg);
 }
 
 FpgaKernelLocation FpgaDevice::resolveKernelLocation(const KernelDescriptor& kernel) const {

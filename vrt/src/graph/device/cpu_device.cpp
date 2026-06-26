@@ -30,9 +30,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <iostream>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -266,8 +268,13 @@ class CpuDevicePlan : public IDevicePlan {
             if (unmetCounts[i] == 0) promote(i);
         }
 
+        static const bool kTrace = std::getenv("VRT_CPU_TRACE") != nullptr;
         auto runIndex = [&](size_t idx) {
             NodeRuntime& rt = runtime_[idx];
+            if (kTrace) {
+                std::cerr << "[cpu-trace] run kind=" << static_cast<int>(rt.kind)
+                          << " id=" << rt.id << std::endl;
+            }
             switch (rt.kind) {
                 case NodeKind::Kernel:
                     executeKernel(rt.kernel);
@@ -362,9 +369,7 @@ class CpuDevicePlan : public IDevicePlan {
     }
 
     uint64_t evaluateTripCount(const LoopTripCount& tripCount) const {
-        const uint64_t bits = (tripCount.kind() == LoopTripCount::Kind::Constant)
-                                  ? tripCount.constantBits()
-                                  : scalarBits(tripCount.name(), tripCount.scopeId());
+        const uint64_t bits = scalarBits(tripCount.name(), tripCount.scopeId());
         if (isSignedIntegerScalarType(tripCount.type())) {
             const int64_t value = signedScalarValue(tripCount.type(), bits);
             if (value < 0) {
@@ -583,6 +588,11 @@ class CpuDevicePlan : public IDevicePlan {
     }
 
     void publishConditionalOutputs(const CompiledConditionalNode& cond, bool thenBranch) {
+        if (std::getenv("VRT_CPU_TRACE")) {
+            std::cerr << "[cpu-trace] publishConditionalOutputs then=" << thenBranch
+                      << " bufPubs=" << cond.outputBufferPublications.size()
+                      << " scalarPubs=" << cond.outputScalarPublications.size() << std::endl;
+        }
         for (const auto& publication : cond.outputBufferPublications) {
             publishBuffer(cond, publication,
                           thenBranch ? publication.thenSourceTokenName
@@ -623,8 +633,13 @@ class CpuDevicePlan : public IDevicePlan {
         }
         bool completedIteration = false;
         uint64_t iteration = 0;
+        const bool kTrace = std::getenv("VRT_CPU_TRACE") != nullptr;
         for (;;) {
+            if (kTrace) std::cerr << "[cpu-trace] authority body iter=" << iteration
+                                  << " begin" << std::endl;
             runChildPlans(loop.id, DGraphChildRole::LoopBody);
+            if (kTrace) std::cerr << "[cpu-trace] authority body iter=" << iteration
+                                  << " done; broadcasting" << std::endl;
             completedIteration = true;
             ++iteration;
             // Decide whether to iterate again (do-while shape).
@@ -714,6 +729,10 @@ class CpuDevicePlan : public IDevicePlan {
             case RP1_SIGOP_AND: next = device_.signalRead_(rt.signalSlot) & rt.signalValue; break;
             default:
                 throw std::runtime_error("CpuDevice: unsupported SIGNAL operation");
+        }
+        if (std::getenv("VRT_CPU_TRACE")) {
+            std::cerr << "[cpu-trace] SIGNAL slot=" << rt.signalSlot << " <- " << next
+                      << " (" << rt.id << ")" << std::endl;
         }
         device_.signalWrite_(rt.signalSlot, next);
     }
@@ -807,6 +826,10 @@ inline std::string normalizeUserBufferKey(const std::string& bufferName) {
 void CpuDevice::setInputBuffer(const std::string& bufferName,
                                 const void*        data,
                                 size_t             sizeBytes) {
+    if (std::getenv("VRT_CPU_TRACE")) {
+        std::cerr << "[cpu-trace] setInputBuffer '" << normalizeUserBufferKey(bufferName)
+                  << "' size=" << sizeBytes << " data=" << (data != nullptr) << std::endl;
+    }
     auto& buf = buffers_[normalizeUserBufferKey(bufferName)];
     buf.resize(sizeBytes);
     if (data && sizeBytes > 0) {
@@ -889,29 +912,20 @@ void CpuDevicePlan::executeKernel(const CompiledKernelNode& node) {
     std::map<std::string, uint64_t> scalars;
     std::map<std::string, uint64_t*> writableScalars;
     for (const auto& [portName, gs] : node.ioMap.outputScalars()) {
-        if (gs.isConstant()) {
-            throw std::runtime_error(
-                "CpuDevice: output scalar port '" + portName +
-                "' cannot be bound to a constant");
-        }
         writableScalars[portName] =
             &(*scalarValues_)[scopedScalarKey(gs.scopeId(), gs.varName())];
     }
 
     for (const auto& [portName, gs] : node.ioMap.inputScalars()) {
-        if (gs.isConstant()) {
-            scalars[portName] = gs.constantBits();
-        } else {
-            auto sit = scalarValues_->find(scopedScalarKey(gs.scopeId(), gs.varName()));
-            if (sit == scalarValues_->end() && gs.scopeId() == 0) {
-                sit = scalarValues_->find(gs.varName());
-            }
-            if (sit == scalarValues_->end()) {
-                throw std::runtime_error(
-                    "CpuDevice: global scalar '" + gs.varName() + "' not set before launch");
-            }
-            scalars[portName] = sit->second;
+        auto sit = scalarValues_->find(scopedScalarKey(gs.scopeId(), gs.varName()));
+        if (sit == scalarValues_->end() && gs.scopeId() == 0) {
+            sit = scalarValues_->find(gs.varName());
         }
+        if (sit == scalarValues_->end()) {
+            throw std::runtime_error(
+                "CpuDevice: scalar '" + gs.varName() + "' not set before launch");
+        }
+        scalars[portName] = sit->second;
     }
 
     CpuKernelArgs args(std::move(bufViews), std::move(scalars), std::move(writableScalars));

@@ -203,13 +203,7 @@ std::string scopedName(uint64_t scopeId, const std::string& name) {
 }
 
 std::string tripCountSummary(const LoopTripCount& tripCount) {
-    switch (tripCount.kind()) {
-        case LoopTripCount::Kind::Constant:
-            return "trip: const";
-        case LoopTripCount::Kind::Scalar:
-            return "trip: scalar " + scopedName(tripCount.scopeId(), tripCount.name());
-    }
-    return "trip: ?";
+    return "trip: scalar " + scopedName(tripCount.scopeId(), tripCount.name());
 }
 
 std::string conditionSummary(const Condition& condition) {
@@ -288,6 +282,16 @@ void emitDataEdge(std::ostringstream& os,
        << " [label=\"" << escape(bufName) << "\"];\n";
 }
 
+void emitScalarEdge(std::ostringstream& os,
+                    const std::string&  from,
+                    const std::string&  to,
+                    const std::string&  scalarName,
+                    const std::string&  indent) {
+    os << indent << "\"" << escape(from) << "\" -> \"" << escape(to) << "\""
+       << " [style=dashed, color=purple, label=\"scalar: "
+       << escape(scalarName) << "\"];\n";
+}
+
 void emitAfterEdge(std::ostringstream& os,
                    const std::string&  from,
                    const std::string&  to,
@@ -342,7 +346,7 @@ void emitAuthoredControlNode(std::ostringstream& os, const ConditionalOp& condit
 }
 
 struct RenderEdge {
-    enum class Kind { Data, After };
+    enum class Kind { Data, Scalar, After };
     Kind kind = Kind::Data;
     std::string from;
     std::string to;
@@ -353,6 +357,7 @@ struct AuthoredRenderContext {
     const std::map<std::string, std::shared_ptr<IDevice>>& devices;
     int clusterIdx = 0;
     std::vector<RenderEdge> edges;
+    std::map<std::string, std::string> scalarInputs;
 };
 
 std::string nextClusterName(AuthoredRenderContext& ctx) {
@@ -379,6 +384,14 @@ std::string authoredBufferKey(const GraphBuffer& buffer) {
     return scopedBufferKey(buffer.scopeId(), buffer.name());
 }
 
+std::string authoredScalarKey(const GraphScalar& scalar) {
+    return scopedScalarKey(scalar.scopeId(), scalar.varName());
+}
+
+std::string scalarInputNodeId(const GraphScalar& scalar) {
+    return "__scalar_input_" + std::to_string(scalar.scopeId()) + "_" + scalar.varName();
+}
+
 std::vector<GraphBuffer> authoredConsumedBuffers(const RegionOp& op) {
     const IOMap& ioMap = authoredIoMap(op);
     std::vector<GraphBuffer> buffers;
@@ -390,7 +403,62 @@ std::vector<GraphBuffer> authoredConsumedBuffers(const RegionOp& op) {
     for (const auto& rw : ioMap.inouts()) {
         buffers.push_back(rw.in);
     }
+    auto appendStartBoundarySources = [&](const std::shared_ptr<GraphRegion>& child) {
+        if (!child) return;
+        for (const RegionOp& childOp : child->ops()) {
+            const auto* boundary = std::get_if<SubgraphBoundaryOp>(&childOp);
+            if (!boundary || boundary->side != BoundarySide::Start) continue;
+            for (const auto& mapping : boundary->bufferMappings) {
+                buffers.push_back(mapping.source);
+            }
+        }
+    };
+    if (const auto* loop = std::get_if<LoopOp>(&op)) {
+        appendStartBoundarySources(loop->body);
+    } else if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
+        appendStartBoundarySources(cond->thenRegion);
+        appendStartBoundarySources(cond->elseRegion);
+    }
     return buffers;
+}
+
+std::vector<GraphScalar> conditionScalars(const Condition& condition) {
+    std::vector<GraphScalar> scalars;
+    auto append = [&](const std::optional<ConditionOperand>& operand) {
+        if (operand && operand->isScalar()) {
+            scalars.push_back(GraphScalar::ref(operand->type(), operand->name(),
+                                               operand->scopeId()));
+        }
+    };
+    append(condition.lhs());
+    append(condition.rhs());
+    append(condition.epsilon());
+    return scalars;
+}
+
+std::vector<GraphScalar> authoredConsumedScalars(const RegionOp& op) {
+    const IOMap& ioMap = authoredIoMap(op);
+    std::vector<GraphScalar> scalars;
+    scalars.reserve(ioMap.inputScalars().size() + 2);
+    for (const auto& [port, scalar] : ioMap.inputScalars()) {
+        (void)port;
+        scalars.push_back(scalar);
+    }
+    if (const auto* loop = std::get_if<LoopOp>(&op)) {
+        if (loop->tripCount) {
+            scalars.push_back(GraphScalar::ref(loop->tripCount->type(),
+                                               loop->tripCount->name(),
+                                               loop->tripCount->scopeId()));
+        }
+        if (loop->condition) {
+            auto condScalars = conditionScalars(*loop->condition);
+            scalars.insert(scalars.end(), condScalars.begin(), condScalars.end());
+        }
+    } else if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
+        auto condScalars = conditionScalars(cond->condition);
+        scalars.insert(scalars.end(), condScalars.begin(), condScalars.end());
+    }
+    return scalars;
 }
 
 /// Identifies the kernel/control op (by qualified Graphviz id) that last writes
@@ -417,21 +485,85 @@ using ProducerMap = std::unordered_map<std::string, Producer>;
 ///     boundary's target tokens resolve naturally to a `boundary → consumer`
 ///     edge in the per-region pass, without that pass having to know about
 ///     boundaries.
-void collectGlobalProducers(const GraphRegion& region, ProducerMap& producers) {
+void recordIoMapProducers(const IOMap& ioMap,
+                          const std::string& qualifiedId,
+                          ProducerMap& producers) {
+    for (const auto& [port, buffer] : ioMap.outputs()) {
+        (void)port;
+        producers[authoredBufferKey(buffer)] =
+            Producer{qualifiedId, buffer.name()};
+    }
+    for (const auto& rw : ioMap.inouts()) {
+        producers[authoredBufferKey(rw.out)] =
+            Producer{qualifiedId, rw.out.name()};
+    }
+}
+
+void recordIoMapScalarProducers(const IOMap& ioMap,
+                                const std::string& qualifiedId,
+                                ProducerMap& producers) {
+    for (const auto& [port, scalar] : ioMap.outputScalars()) {
+        (void)port;
+        producers[authoredScalarKey(scalar)] =
+            Producer{qualifiedId, scalar.varName()};
+    }
+}
+
+void recordControlPublications(const std::string& controlId,
+                               const GraphRegion* child,
+                               uint64_t parentScopeId,
+                               ProducerMap& producers) {
+    if (!child) return;
+    for (const RegionOp& childOp : child->ops()) {
+        const auto* boundary = std::get_if<SubgraphBoundaryOp>(&childOp);
+        if (!boundary || boundary->side != BoundarySide::End) continue;
+        for (const auto& bm : boundary->bufferMappings) {
+            if (bm.target.scopeId() == parentScopeId) {
+                producers.emplace(authoredBufferKey(bm.target),
+                                  Producer{controlId, bm.target.name()});
+            }
+        }
+    }
+}
+
+void collectLogicalProducers(const GraphRegion& region, ProducerMap& producers) {
     const uint64_t scopeId = region.scopeId();
     for (const RegionOp& op : region.ops()) {
         const std::string qualifiedId = qualifiedNodeId(scopeId, regionOpId(op));
 
+        if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
+            for (const auto& bm : boundary->bufferMappings) {
+                if (boundary->side == BoundarySide::Start ||
+                    bm.target.scopeId() == scopeId) {
+                    producers[authoredBufferKey(bm.target)] =
+                        Producer{qualifiedId, bm.target.name()};
+                }
+            }
+        } else {
+            recordIoMapProducers(authoredIoMap(op), qualifiedId, producers);
+        }
+        recordIoMapScalarProducers(authoredIoMap(op), qualifiedId, producers);
+
+        if (const auto* loop = std::get_if<LoopOp>(&op)) {
+            recordControlPublications(qualifiedId, loop->body.get(), scopeId, producers);
+            if (loop->body) collectLogicalProducers(*loop->body, producers);
+        }
+        if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
+            recordControlPublications(qualifiedId, cond->thenRegion.get(), scopeId, producers);
+            recordControlPublications(qualifiedId, cond->elseRegion.get(), scopeId, producers);
+            if (cond->thenRegion) collectLogicalProducers(*cond->thenRegion, producers);
+            if (cond->elseRegion) collectLogicalProducers(*cond->elseRegion, producers);
+        }
+    }
+}
+
+void collectBoundaryProducers(const GraphRegion& region, ProducerMap& producers) {
+    const uint64_t scopeId = region.scopeId();
+    for (const RegionOp& op : region.ops()) {
+        const std::string qualifiedId = qualifiedNodeId(scopeId, regionOpId(op));
         const IOMap& ioMap = authoredIoMap(op);
-        for (const auto& [port, buffer] : ioMap.outputs()) {
-            (void)port;
-            producers[authoredBufferKey(buffer)] =
-                Producer{qualifiedId, buffer.name()};
-        }
-        for (const auto& rw : ioMap.inouts()) {
-            producers[authoredBufferKey(rw.out)] =
-                Producer{qualifiedId, rw.out.name()};
-        }
+        recordIoMapProducers(ioMap, qualifiedId, producers);
+        recordIoMapScalarProducers(ioMap, qualifiedId, producers);
 
         if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
             for (const auto& bm : boundary->bufferMappings) {
@@ -439,13 +571,12 @@ void collectGlobalProducers(const GraphRegion& region, ProducerMap& producers) {
                     Producer{qualifiedId, bm.target.name()};
             }
         }
-
         if (const auto* loop = std::get_if<LoopOp>(&op)) {
-            if (loop->body) collectGlobalProducers(*loop->body, producers);
+            if (loop->body) collectBoundaryProducers(*loop->body, producers);
         }
         if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
-            if (cond->thenRegion) collectGlobalProducers(*cond->thenRegion, producers);
-            if (cond->elseRegion) collectGlobalProducers(*cond->elseRegion, producers);
+            if (cond->thenRegion) collectBoundaryProducers(*cond->thenRegion, producers);
+            if (cond->elseRegion) collectBoundaryProducers(*cond->elseRegion, producers);
         }
     }
 }
@@ -460,7 +591,9 @@ void collectGlobalProducers(const GraphRegion& region, ProducerMap& producers) {
 /// *source* token to the boundary itself, labelled with the source name. This
 /// renders the data flow into / out of a boundary that was previously
 /// invisible in the authored DOT output.
-void collectRegionEdges(const GraphRegion& region, const ProducerMap& producers,
+void collectRegionEdges(const GraphRegion& region,
+                        const ProducerMap& logicalProducers,
+                        const ProducerMap& boundaryProducers,
                         AuthoredRenderContext& ctx) {
     const uint64_t scopeId = region.scopeId();
     std::unordered_set<std::string> idSet;  // bare authored ids local to this region
@@ -471,21 +604,37 @@ void collectRegionEdges(const GraphRegion& region, const ProducerMap& producers,
         const std::string toId = qualifiedNodeId(scopeId, regionOpId(op));
 
         for (const GraphBuffer& buffer : authoredConsumedBuffers(op)) {
-            auto pit = producers.find(authoredBufferKey(buffer));
-            if (pit == producers.end()) continue;
+            auto pit = logicalProducers.find(authoredBufferKey(buffer));
+            if (pit == logicalProducers.end()) continue;
             if (pit->second.id == toId) continue;
             ctx.edges.push_back(RenderEdge{RenderEdge::Kind::Data,
                                            pit->second.id, toId, buffer.name()});
         }
 
+        for (const GraphScalar& scalar : authoredConsumedScalars(op)) {
+            auto pit = logicalProducers.find(authoredScalarKey(scalar));
+            if (pit == logicalProducers.end()) {
+                const std::string id = scalarInputNodeId(scalar);
+                ctx.scalarInputs.emplace(id, scopedName(scalar.scopeId(), scalar.varName()));
+                ctx.edges.push_back(RenderEdge{RenderEdge::Kind::Scalar,
+                                               id, toId, scalar.varName()});
+                continue;
+            }
+            if (pit->second.id == toId) continue;
+            ctx.edges.push_back(RenderEdge{RenderEdge::Kind::Scalar,
+                                           pit->second.id, toId, scalar.varName()});
+        }
+
         if (const auto* boundary = std::get_if<SubgraphBoundaryOp>(&op)) {
-            for (const auto& bm : boundary->bufferMappings) {
-                auto pit = producers.find(authoredBufferKey(bm.source));
-                if (pit == producers.end()) continue;
-                if (pit->second.id == toId) continue;
-                ctx.edges.push_back(RenderEdge{RenderEdge::Kind::Data,
-                                               pit->second.id, toId,
-                                               bm.source.name()});
+            if (boundary->side == BoundarySide::End) {
+                for (const auto& bm : boundary->bufferMappings) {
+                    auto pit = boundaryProducers.find(authoredBufferKey(bm.source));
+                    if (pit == boundaryProducers.end()) continue;
+                    if (pit->second.id == toId) continue;
+                    ctx.edges.push_back(RenderEdge{RenderEdge::Kind::Data,
+                                                   pit->second.id, toId,
+                                                   bm.source.name()});
+                }
             }
         }
 
@@ -504,19 +653,23 @@ void collectRegionEdges(const GraphRegion& region, const ProducerMap& producers,
 /// cluster/visual-node emission so that the per-region edge pass has access
 /// to producers in *all* regions (not just its own).
 void collectAllRegionEdges(const GraphRegion& region,
-                           const ProducerMap& producers,
+                           const ProducerMap& logicalProducers,
+                           const ProducerMap& boundaryProducers,
                            AuthoredRenderContext& ctx) {
-    collectRegionEdges(region, producers, ctx);
+    collectRegionEdges(region, logicalProducers, boundaryProducers, ctx);
     for (const RegionOp& op : region.ops()) {
         if (const auto* loop = std::get_if<LoopOp>(&op)) {
-            if (loop->body) collectAllRegionEdges(*loop->body, producers, ctx);
+            if (loop->body) collectAllRegionEdges(*loop->body, logicalProducers,
+                                                  boundaryProducers, ctx);
         }
         if (const auto* cond = std::get_if<ConditionalOp>(&op)) {
             if (cond->thenRegion) {
-                collectAllRegionEdges(*cond->thenRegion, producers, ctx);
+                collectAllRegionEdges(*cond->thenRegion, logicalProducers,
+                                      boundaryProducers, ctx);
             }
             if (cond->elseRegion) {
-                collectAllRegionEdges(*cond->elseRegion, producers, ctx);
+                collectAllRegionEdges(*cond->elseRegion, logicalProducers,
+                                      boundaryProducers, ctx);
             }
         }
     }
@@ -619,24 +772,39 @@ std::string renderToDot(const Graph& graph) {
 
     AuthoredRenderContext ctx{graph.devices()};
 
-    // Phase 1: build a global producer map across the whole region tree so the
-    // edge pass can resolve cross-region producers (in particular for boundary
-    // mappings, which read tokens from the parent scope and publish into the
-    // local scope).
-    ProducerMap producers;
-    collectGlobalProducers(graph.rootRegion(), producers);
+    // Phase 1: build producer maps across the whole region tree. Logical
+    // producers make control nodes represent parent-visible loop/conditional
+    // outputs; boundary producers keep child-region import/export details
+    // visible inside nested clusters.
+    ProducerMap logicalProducers;
+    ProducerMap boundaryProducers;
+    collectLogicalProducers(graph.rootRegion(), logicalProducers);
+    collectBoundaryProducers(graph.rootRegion(), boundaryProducers);
 
     // Phase 2: walk every region and emit edges (regular consumers, boundary
     // mappings, and intra-region `afterOps`) into `ctx.edges`.
-    collectAllRegionEdges(graph.rootRegion(), producers, ctx);
+    collectAllRegionEdges(graph.rootRegion(), logicalProducers, boundaryProducers, ctx);
 
     // Phase 3: emit the cluster/visual-node tree. Edges are deferred to the
     // top level so Graphviz routes them through cluster boundaries correctly.
     emitRegionCluster(os, graph.rootRegion(), "root region", ctx, "  ");
 
+    for (const auto& [id, name] : ctx.scalarInputs) {
+        os << "  \"" << escape(id) << "\""
+           << " [shape=note, style=dashed, color=purple, label=\"scalar input\\n"
+           << escape(name) << "\"];\n";
+    }
+
+    std::unordered_set<std::string> emittedEdges;
     for (const RenderEdge& edge : ctx.edges) {
+        const std::string edgeKey =
+            std::to_string(static_cast<int>(edge.kind)) + "\n" +
+            edge.from + "\n" + edge.to + "\n" + edge.label;
+        if (!emittedEdges.insert(edgeKey).second) continue;
         if (edge.kind == RenderEdge::Kind::Data) {
             emitDataEdge(os, edge.from, edge.to, edge.label, "  ");
+        } else if (edge.kind == RenderEdge::Kind::Scalar) {
+            emitScalarEdge(os, edge.from, edge.to, edge.label, "  ");
         } else {
             emitAfterEdge(os, edge.from, edge.to, "  ");
         }

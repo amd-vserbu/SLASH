@@ -69,7 +69,7 @@ class GraphRegion : public std::enable_shared_from_this<GraphRegion> {
             throw std::invalid_argument("GraphRegion::scalar: name '" + name + "' already used");
         }
         scalarTypes_.emplace(name, type);
-        return GraphScalar::globalVar(type, std::move(name), scopeId_);
+        return GraphScalar::ref(type, std::move(name), scopeId_);
     }
 
     std::string addKernel(KernelDescriptor kernel, IOMap ioMap, std::string deviceHint = "",

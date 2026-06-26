@@ -37,6 +37,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <stdexcept>
