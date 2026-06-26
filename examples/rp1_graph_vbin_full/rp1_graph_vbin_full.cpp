@@ -415,7 +415,7 @@ int main(int argc, char** argv) try {
               << cli.iterations << " loop iteration(s), "
               << cli.elementCount << " element(s)" << std::endl;
     auto exec = graph.compile();
-    exec.setScalar(elementCount, cli.elementCount);
+    exec.setScalar(elementCount, static_cast<std::uint64_t>(cli.elementCount));
     exec.setScalar(loopIterations, cli.iterations);
     exec.write(raw, input);
 
