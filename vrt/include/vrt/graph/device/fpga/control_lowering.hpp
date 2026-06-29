@@ -41,6 +41,8 @@
 #define VRT_GRAPH_DEVICE_FPGA_CONTROL_LOWERING_HPP
 
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -136,6 +138,58 @@ class LoopIdAllocator {
    private:
     std::uint32_t next_ = 0;
 };
+
+struct BarrierPhysicalEvent {
+    std::uint8_t  bucket = 0;
+    std::uint32_t mask = 0;
+};
+
+struct BarrierBucketRange {
+    std::uint8_t start = 0;
+    std::uint8_t end = 0;
+    bool empty = true;
+};
+
+struct BarrierEventSpec {
+    std::string id;
+    std::string domain;
+    std::vector<std::string> depends;
+};
+
+struct BarrierResetDomainSpec {
+    std::string id;
+    std::optional<std::string> parent;
+    std::vector<std::string> children;
+};
+
+struct BarrierSyntheticNode {
+    enum class Kind {
+        Collector,
+        Transition,
+    };
+
+    Kind kind = Kind::Collector;
+    std::string id;
+    std::string domain;
+    std::vector<std::string> depends;
+    std::string set;
+};
+
+struct BarrierLoweringInput {
+    std::string rootDomain;
+    std::vector<BarrierResetDomainSpec> domains;
+    std::vector<BarrierEventSpec> events;
+    std::uint8_t bitsPerBucket = 31;
+    std::uint8_t maxBuckets = RP1_MAX_BUCKETS;
+};
+
+struct BarrierLoweringResult {
+    std::map<std::string, BarrierPhysicalEvent> events;
+    std::map<std::string, BarrierBucketRange> domainRanges;
+    std::vector<BarrierSyntheticNode> syntheticNodes;
+};
+
+BarrierLoweringResult lowerBarrierEvents(const BarrierLoweringInput& input);
 
 }  // namespace vrt::graph::fpga
 

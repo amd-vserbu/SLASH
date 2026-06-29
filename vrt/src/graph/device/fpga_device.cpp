@@ -1263,6 +1263,108 @@ class FpgaDevicePlan : public IDevicePlan {
         return image;
     }
 
+    struct BarrierRef {
+        std::uint8_t bucket = 0;
+        std::uint32_t mask = 0;
+    };
+
+    class ResetDomainEmitter {
+       public:
+        ResetDomainEmitter(fpga::Rp1GraphImage& image, std::uint8_t& nextBucket)
+            : image_(image), nextBucket_(nextBucket) {}
+
+        BarrierRef define(const std::string& id) {
+            BarrierRef ref = allocBit();
+            events_[id] = ref;
+            return ref;
+        }
+
+        std::vector<BarrierRef> refsFor(const std::vector<std::string>& deps) {
+            std::vector<BarrierRef> refs;
+            for (const auto& dep : deps) {
+                auto it = events_.find(dep);
+                if (it == events_.end()) continue;
+                refs.push_back(it->second);
+                consumed_.insert(dep);
+            }
+            return refs;
+        }
+
+        BarrierRef awaitFor(const std::vector<BarrierRef>& refs) {
+            std::map<std::uint8_t, std::uint32_t> groups;
+            for (const BarrierRef& ref : refs) {
+                if (ref.mask != 0) groups[ref.bucket] |= ref.mask;
+            }
+            if (groups.empty()) return {};
+            if (groups.size() == 1) return {groups.begin()->first, groups.begin()->second};
+
+            std::vector<BarrierRef> collectors;
+            collectors.reserve(groups.size());
+            for (const auto& [bucket, mask] : groups) {
+                BarrierRef c = allocBit();
+                rp1_node_t pkt{};
+                pkt.opcode = RP1_OP_NOP;
+                pkt.flags = RP1_FLAG_SILENT;
+                pkt.status = RP1_NODE_PENDING;
+                pkt.barrier_await_bucket = bucket;
+                pkt.barrier_await_mask = mask;
+                pkt.barrier_set_bucket = c.bucket;
+                pkt.barrier_set_mask = c.mask;
+                image_.nodes.push_back(pkt);
+                collectors.push_back(c);
+            }
+            return awaitFor(collectors);
+        }
+
+        BarrierRef leafAwait() const {
+            std::map<std::uint8_t, std::uint32_t> groups;
+            for (const auto& [id, ref] : events_) {
+                if (consumed_.find(id) == consumed_.end()) groups[ref.bucket] |= ref.mask;
+            }
+            if (groups.empty()) return {};
+            if (groups.size() == 1) return {groups.begin()->first, groups.begin()->second};
+            throw std::logic_error(
+                "ResetDomainEmitter::leafAwait: leaf set spans buckets; call mutableLeafAwait");
+        }
+
+        BarrierRef mutableLeafAwait() {
+            std::vector<BarrierRef> refs;
+            refs.reserve(events_.size());
+            for (const auto& [id, ref] : events_) {
+                if (consumed_.find(id) == consumed_.end()) refs.push_back(ref);
+            }
+            return awaitFor(refs);
+        }
+
+        std::uint8_t clearStart() const { return startBucket_; }
+        std::uint8_t clearEnd() const { return endBucket_; }
+
+       private:
+        BarrierRef allocBit() {
+            if (!haveBucket_ || nextBit_ >= kKernelBitsPerBucket) {
+                if (nextBucket_ >= RP1_MAX_BUCKETS) {
+                    throw std::logic_error("FpgaDevice: ran out of RP1 barrier buckets");
+                }
+                currentBucket_ = nextBucket_++;
+                if (!haveBucket_) startBucket_ = currentBucket_;
+                endBucket_ = currentBucket_;
+                nextBit_ = 0;
+                haveBucket_ = true;
+            }
+            return {currentBucket_, 1u << nextBit_++};
+        }
+
+        fpga::Rp1GraphImage& image_;
+        std::uint8_t& nextBucket_;
+        std::unordered_map<std::string, BarrierRef> events_;
+        std::set<std::string> consumed_;
+        std::uint8_t currentBucket_ = 0;
+        std::uint32_t nextBit_ = 0;
+        std::uint8_t startBucket_ = 0;
+        std::uint8_t endBucket_ = 0;
+        bool haveBucket_ = false;
+    };
+
     // Emit LOOP + flattened body + RERUN for a scalar fixed-count loop or a
     // data-dependent while-loop.  A while-loop's predicate is evaluated by RP1
     // against a signal slot that a body kernel's output scalar feeds each
@@ -1307,12 +1409,9 @@ class FpgaDevicePlan : public IDevicePlan {
                 "' has no body nodes (cross-device body is Phase 2)");
         }
 
-        const std::uint8_t bodyBkt = nextBodyBkt++;
-        if (bodyBkt >= RP1_MAX_BUCKETS) {
-            throw std::logic_error("FpgaDevice: ran out of barrier buckets for loop bodies");
-        }
         const std::uint32_t loopAwait = awaitMaskFor(loop.dependsOn);
         const std::uint32_t exitBit   = allocMainBit();
+        ResetDomainEmitter bodyDomain(image, nextBodyBkt);
 
         // LOOP packet (body_start/end backpatched after the body is emitted).
         rp1_node_t loopPkt{};
@@ -1334,26 +1433,9 @@ class FpgaDevicePlan : public IDevicePlan {
                 loop.id + "." + loop.tripCount->name()});
         }
 
-        // Flatten the body into bucket `bodyBkt`.
-        std::unordered_map<std::string, std::uint32_t> bodyBit;
-        std::vector<std::string> consumedBody;
-        std::uint32_t nextBodyBit = 0;
-        auto allocBodyBit = [&]() -> std::uint32_t {
-            if (nextBodyBit >= kKernelBitsPerBucket) {
-                throw std::logic_error(
-                    "FpgaDevice: loop '" + loop.id + "' body exceeds 31 nodes per bucket "
-                    "(multi-bucket loop bodies are a future phase)");
-            }
-            return 1u << (nextBodyBit++);
-        };
-        auto bodyAwait = [&](const std::vector<std::string>& deps) -> std::uint32_t {
-            std::uint32_t m = 0;
-            for (const auto& d : deps) {
-                auto it = bodyBit.find(d);
-                if (it != bodyBit.end()) { m |= it->second; consumedBody.push_back(d); }
-            }
-            return m;
-        };
+        // Flatten the body into one reset domain.  The domain emitter allocates
+        // as many contiguous buckets as needed and inserts silent collector NOPs
+        // whenever an await list spans buckets.
 
         // Declared byte-size of each carried token, taken from the body kernels'
         // buffer bindings.  A cross-device loop input is only filled at launch
@@ -1422,7 +1504,7 @@ class FpgaDevicePlan : public IDevicePlan {
                 // Feed any loop-carried scalar inputs from their slots before the
                 // dispatch (SCALAR_COPY slot -> input register); skip packing them.
                 std::set<std::string> carriedInputs;
-                std::uint32_t preAw = bodyAwait(k->dependsOn);
+                std::vector<BarrierRef> kernelAwaits = bodyDomain.refsFor(k->dependsOn);
                 const FpgaKernelLocation kloc = device_->resolveKernelLocation(k->kernel);
                 for (const ScalarPort& ip : k->kernel.ioType.inputScalars) {
                     auto bindIt = k->ioMap.inputScalars().find(ip.name);
@@ -1434,28 +1516,30 @@ class FpgaDevicePlan : public IDevicePlan {
                     carriedInputs.insert(ip.name);
                     const std::uint32_t slot = carriedSlot(impIt->second);
                     const std::uint32_t off  = device_->outputScalarRegOffset(k->kernel, ip.name);
-                    const std::uint32_t cbit = allocBodyBit();
+                    const BarrierRef copyAwait = bodyDomain.awaitFor(kernelAwaits);
+                    const BarrierRef copyDone = bodyDomain.define(k->id + ".scopy." + ip.name);
                     rp1_node_t cp{};
                     cp.opcode               = RP1_OP_SCALAR_COPY;
                     cp.status               = RP1_NODE_PENDING;
-                    cp.barrier_await_bucket = bodyBkt;
-                    cp.barrier_await_mask   = preAw;
-                    cp.barrier_set_bucket   = bodyBkt;
-                    cp.barrier_set_mask     = cbit;
+                    cp.barrier_await_bucket = copyAwait.bucket;
+                    cp.barrier_await_mask   = copyAwait.mask;
+                    cp.barrier_set_bucket   = copyDone.bucket;
+                    cp.barrier_set_mask     = copyDone.mask;
                     cp.payload.scalar_copy.source_slot = slot;
                     cp.payload.scalar_copy.dest_addr   = kloc.r5_base_addr + off;
                     image.nodes.push_back(cp);
-                    preAw |= cbit;  // the kernel waits for the carried value
+                    kernelAwaits.push_back(copyDone);  // the kernel waits for the carried value
                 }
 
-                const std::uint32_t bit = allocBodyBit();
-                emitKernelPacket(image, *k, bodyBkt, preAw, bodyBkt, bit, carriedInputs);
-                bodyBit[k->id] = bit;
+                const BarrierRef kernelAwait = bodyDomain.awaitFor(kernelAwaits);
+                const BarrierRef kernelDone = bodyDomain.define(k->id);
+                emitKernelPacket(image, *k, kernelAwait.bucket, kernelAwait.mask,
+                                 kernelDone.bucket, kernelDone.mask, carriedInputs);
                 // Capture body output scalars into signal slots each iteration
                 // (chained after the kernel) so a data-dependent loop predicate
                 // can read the freshly-produced value.  An exported output reuses
                 // its carried parent slot; others get a fresh slot.
-                std::uint32_t lastBit = bit;
+                BarrierRef lastDone = kernelDone;
                 std::string   lastId  = k->id;
                 for (const ScalarPort& sp : k->kernel.ioType.outputScalars) {
                     const FpgaKernelLocation loc = device_->resolveKernelLocation(k->kernel);
@@ -1473,28 +1557,24 @@ class FpgaDevicePlan : public IDevicePlan {
                     } else {
                         slot = slotAlloc.alloc();
                     }
-                    const std::uint32_t rbit = allocBodyBit();
+                    const BarrierRef readDone = bodyDomain.define(k->id + ".sread." + sp.name);
                     rp1_node_t sr{};
                     sr.opcode               = RP1_OP_SCALAR_READ;
                     sr.status               = RP1_NODE_PENDING;
-                    sr.barrier_await_bucket = bodyBkt;
-                    sr.barrier_await_mask   = lastBit;
-                    sr.barrier_set_bucket   = bodyBkt;
-                    sr.barrier_set_mask     = rbit;
+                    sr.barrier_await_bucket = lastDone.bucket;
+                    sr.barrier_await_mask   = lastDone.mask;
+                    sr.barrier_set_bucket   = readDone.bucket;
+                    sr.barrier_set_mask     = readDone.mask;
                     sr.payload.scalar_read.source_addr = loc.r5_base_addr + off;
                     sr.payload.scalar_read.target_slot = slot;
                     image.nodes.push_back(sr);
                     if (!localKey.empty()) scalarSlots_[localKey] = slot;
-                    consumedBody.push_back(lastId);
-                    lastId  = k->id + ".sread." + sp.name;
-                    lastBit = rbit;
-                    bodyBit[lastId] = rbit;
+                    lastDone = readDone;
                 }
             } else if (const auto* r = std::get_if<CompiledReprogramNode>(&bn)) {
-                const std::uint32_t aw  = bodyAwait(r->dependsOn);
-                const std::uint32_t bit = allocBodyBit();
-                emitReprogramPacket(image, *r, bodyBkt, aw, bodyBkt, bit);
-                bodyBit[r->id] = bit;
+                const BarrierRef aw = bodyDomain.awaitFor(bodyDomain.refsFor(r->dependsOn));
+                const BarrierRef done = bodyDomain.define(r->id);
+                emitReprogramPacket(image, *r, aw.bucket, aw.mask, done.bucket, done.mask);
             } else if (const auto* b = std::get_if<CompiledBoundaryNode>(&bn)) {
                 // Carried-buffer / import-export region boundary.  On the FPGA
                 // queue the parent and local tokens are the same device buffer,
@@ -1528,35 +1608,33 @@ class FpgaDevicePlan : public IDevicePlan {
             } else if (const auto* sg = std::get_if<CompiledSignalNode>(&bn)) {
                 // Cross-queue rendezvous: raise/clear a signal slot for a peer
                 // queue.  Lives in the body bucket so it re-arms each iteration.
-                const std::uint32_t aw  = bodyAwait(sg->dependsOn);
-                const std::uint32_t bit = allocBodyBit();
+                const BarrierRef aw = bodyDomain.awaitFor(bodyDomain.refsFor(sg->dependsOn));
+                const BarrierRef done = bodyDomain.define(sg->id);
                 rp1_node_t pkt{};
                 pkt.opcode               = RP1_OP_SIGNAL;
                 pkt.status               = RP1_NODE_PENDING;
-                pkt.barrier_await_bucket = bodyBkt;
-                pkt.barrier_await_mask   = aw;
-                pkt.barrier_set_bucket   = bodyBkt;
-                pkt.barrier_set_mask     = bit;
+                pkt.barrier_await_bucket = aw.bucket;
+                pkt.barrier_await_mask   = aw.mask;
+                pkt.barrier_set_bucket   = done.bucket;
+                pkt.barrier_set_mask     = done.mask;
                 pkt.payload.signal.target_slot = sg->slot;
                 pkt.payload.signal.value       = sg->value;
                 pkt.payload.signal.operation   = sg->operation;
                 image.nodes.push_back(pkt);
-                bodyBit[sg->id] = bit;
             } else if (const auto* wt = std::get_if<CompiledWaitNode>(&bn)) {
-                const std::uint32_t aw  = bodyAwait(wt->dependsOn);
-                const std::uint32_t bit = allocBodyBit();
+                const BarrierRef aw = bodyDomain.awaitFor(bodyDomain.refsFor(wt->dependsOn));
+                const BarrierRef done = bodyDomain.define(wt->id);
                 rp1_node_t pkt{};
                 pkt.opcode               = RP1_OP_WAIT;
                 pkt.status               = RP1_NODE_PENDING;
-                pkt.barrier_await_bucket = bodyBkt;
-                pkt.barrier_await_mask   = aw;
-                pkt.barrier_set_bucket   = bodyBkt;
-                pkt.barrier_set_mask     = bit;
+                pkt.barrier_await_bucket = aw.bucket;
+                pkt.barrier_await_mask   = aw.mask;
+                pkt.barrier_set_bucket   = done.bucket;
+                pkt.barrier_set_mask     = done.mask;
                 pkt.payload.wait.condition_signal = wt->slot;
                 pkt.payload.wait.condition_value  = wt->value;
                 pkt.payload.wait.condition_op     = wt->conditionOp;
                 image.nodes.push_back(pkt);
-                bodyBit[wt->id] = bit;
             } else {
                 throw std::logic_error(
                     "FpgaDevice: loop '" + loop.id + "' body node '" + compiledNodeId(bn) +
@@ -1567,12 +1645,7 @@ class FpgaDevicePlan : public IDevicePlan {
 
         // RERUN awaits the body leaves, re-arms the LOOP node.  Its own bit lives
         // in the body bucket so it is cleared each iteration.
-        std::uint32_t bodyLeaves = 0;
-        for (const auto& [id, bit] : bodyBit) {
-            if (std::find(consumedBody.begin(), consumedBody.end(), id) == consumedBody.end()) {
-                bodyLeaves |= bit;
-            }
-        }
+        BarrierRef bodyLeaves = bodyDomain.mutableLeafAwait();
 
         // Data-dependent split Follower: before re-arming the LOOP, await the
         // Authority's fresh continue/stop decision (broadcastReady), clear it,
@@ -1580,30 +1653,30 @@ class FpgaDevicePlan : public IDevicePlan {
         // on a decision the Authority wrote this iteration, and stops the
         // Authority outpacing the Follower.
         if (loop.broadcastRole == SplitBroadcastRole::Follower) {
-            const std::uint32_t wBit = allocBodyBit();
+            const BarrierRef wBit = bodyDomain.define(loop.id + ".broadcast_wait");
             rp1_node_t w{};
             w.opcode = RP1_OP_WAIT; w.status = RP1_NODE_PENDING;
-            w.barrier_await_bucket = bodyBkt; w.barrier_await_mask = bodyLeaves;
-            w.barrier_set_bucket = bodyBkt;   w.barrier_set_mask = wBit;
+            w.barrier_await_bucket = bodyLeaves.bucket; w.barrier_await_mask = bodyLeaves.mask;
+            w.barrier_set_bucket = wBit.bucket;   w.barrier_set_mask = wBit.mask;
             w.payload.wait.condition_signal = loop.broadcastReadySlot;
             w.payload.wait.condition_op = RP1_COP_AND_NZ;
             w.payload.wait.condition_value = 1;
             image.nodes.push_back(w);
 
-            const std::uint32_t clrBit = allocBodyBit();
+            const BarrierRef clrBit = bodyDomain.define(loop.id + ".broadcast_clear");
             rp1_node_t clr{};
             clr.opcode = RP1_OP_SIGNAL; clr.status = RP1_NODE_PENDING;
-            clr.barrier_await_bucket = bodyBkt; clr.barrier_await_mask = wBit;
-            clr.barrier_set_bucket = bodyBkt;   clr.barrier_set_mask = clrBit;
+            clr.barrier_await_bucket = wBit.bucket; clr.barrier_await_mask = wBit.mask;
+            clr.barrier_set_bucket = clrBit.bucket;   clr.barrier_set_mask = clrBit.mask;
             clr.payload.signal.target_slot = loop.broadcastReadySlot;
             clr.payload.signal.value = 0; clr.payload.signal.operation = RP1_SIGOP_SET;
             image.nodes.push_back(clr);
 
-            const std::uint32_t ackBit = allocBodyBit();
+            const BarrierRef ackBit = bodyDomain.define(loop.id + ".broadcast_ack");
             rp1_node_t ack{};
             ack.opcode = RP1_OP_SIGNAL; ack.status = RP1_NODE_PENDING;
-            ack.barrier_await_bucket = bodyBkt; ack.barrier_await_mask = clrBit;
-            ack.barrier_set_bucket = bodyBkt;   ack.barrier_set_mask = ackBit;
+            ack.barrier_await_bucket = clrBit.bucket; ack.barrier_await_mask = clrBit.mask;
+            ack.barrier_set_bucket = ackBit.bucket;   ack.barrier_set_mask = ackBit.mask;
             ack.payload.signal.target_slot = loop.broadcastAckSlot;
             ack.payload.signal.value = 1; ack.payload.signal.operation = RP1_SIGOP_SET;
             image.nodes.push_back(ack);
@@ -1611,14 +1684,14 @@ class FpgaDevicePlan : public IDevicePlan {
             bodyLeaves = ackBit;  // RERUN now gates on the acknowledged decision
         }
 
-        const std::uint32_t rerunBit = allocBodyBit();
+        const BarrierRef rerunBit = bodyDomain.define(loop.id + ".rerun");
         rp1_node_t rerun{};
         rerun.opcode               = RP1_OP_RERUN;
         rerun.status               = RP1_NODE_PENDING;
-        rerun.barrier_await_bucket = bodyBkt;
-        rerun.barrier_await_mask   = bodyLeaves;
-        rerun.barrier_set_bucket   = bodyBkt;
-        rerun.barrier_set_mask     = rerunBit;
+        rerun.barrier_await_bucket = bodyLeaves.bucket;
+        rerun.barrier_await_mask   = bodyLeaves.mask;
+        rerun.barrier_set_bucket   = rerunBit.bucket;
+        rerun.barrier_set_mask     = rerunBit.mask;
         rerun.payload.rerun.target_node = static_cast<std::uint32_t>(loopIdx);
         const std::size_t rerunIdx = image.nodes.size();
         image.nodes.push_back(rerun);
@@ -1657,8 +1730,8 @@ class FpgaDevicePlan : public IDevicePlan {
             lp.condition_value    = fpga::kNeverValue;
             lp.condition_op       = fpga::kNeverOp;  // (sig & 0) != 0 -> never; max_iter governs
         }
-        lp.bucket_clear_start = bodyBkt;
-        lp.bucket_clear_end   = bodyBkt;
+        lp.bucket_clear_start = bodyDomain.clearStart();
+        lp.bucket_clear_end   = bodyDomain.clearEnd();
         lp.loop_id            = loopIds.alloc();
 
         mainBit[loop.id] = exitBit;
@@ -1715,14 +1788,10 @@ class FpgaDevicePlan : public IDevicePlan {
             // (run-when-true) keeps it, the else branch (run-when-false) inverts.
             const rp1_condop_t op = runWhenTrue ? c.op : fpga::invertRp1Op(c.op);
 
-            std::uint8_t  bkt   = 0;
-            std::uint32_t goBit = 0;
+            ResetDomainEmitter branchDomain(image, nextBodyBkt);
+            BarrierRef goBit;
             if (hasBody) {
-                bkt = nextBodyBkt++;
-                if (bkt >= RP1_MAX_BUCKETS) {
-                    throw std::logic_error(
-                        "FpgaDevice: ran out of barrier buckets for conditional branches");
-                }
+                goBit = branchDomain.define(cond.id + (runWhenTrue ? ".then_go" : ".else_go"));
             }
 
             rp1_node_t cnode{};
@@ -1749,31 +1818,16 @@ class FpgaDevicePlan : public IDevicePlan {
                 return false;
             }
 
-            std::unordered_map<std::string, std::uint32_t> bodyBit;
-            std::vector<std::string> consumedBody;
-            std::uint32_t nextBodyBit = 0;
-            auto allocBodyBit = [&]() -> std::uint32_t {
-                if (nextBodyBit >= kKernelBitsPerBucket) {
-                    throw std::logic_error(
-                        "FpgaDevice: conditional '" + cond.id +
-                        "' branch exceeds 31 nodes per bucket");
-                }
-                return 1u << (nextBodyBit++);
-            };
-            goBit = allocBodyBit();
             auto& cp = image.nodes[condIdx].payload.cond;
-            cp.done_bucket = bkt;
-            cp.done_mask   = goBit;  // raised when this branch is taken
+            cp.done_bucket = goBit.bucket;
+            cp.done_mask   = goBit.mask;  // raised when this branch is taken
 
             // Root nodes (no intra-body dep) gate on the go bit so the body runs
             // only when the COND raised it.
-            auto bodyAwait = [&](const std::vector<std::string>& deps) -> std::uint32_t {
-                std::uint32_t m = 0;
-                for (const auto& d : deps) {
-                    auto it = bodyBit.find(d);
-                    if (it != bodyBit.end()) { m |= it->second; consumedBody.push_back(d); }
-                }
-                return m == 0 ? goBit : m;
+            auto branchAwait = [&](const std::vector<std::string>& deps) -> BarrierRef {
+                auto refs = branchDomain.refsFor(deps);
+                if (refs.empty()) refs.push_back(goBit);
+                return branchDomain.awaitFor(refs);
             };
 
             for (const CompiledNode* bnp : bodyNodes) {
@@ -1784,15 +1838,13 @@ class FpgaDevicePlan : public IDevicePlan {
                             "FpgaDevice: conditional '" + cond.id + "' branch kernel '" +
                             k->kernel.name + "' is not an FPGA kernel");
                     }
-                    const std::uint32_t aw  = bodyAwait(k->dependsOn);
-                    const std::uint32_t bit = allocBodyBit();
-                    emitKernelPacket(image, *k, bkt, aw, bkt, bit);
-                    bodyBit[k->id] = bit;
+                    const BarrierRef aw = branchAwait(k->dependsOn);
+                    const BarrierRef done = branchDomain.define(k->id);
+                    emitKernelPacket(image, *k, aw.bucket, aw.mask, done.bucket, done.mask);
                 } else if (const auto* r = std::get_if<CompiledReprogramNode>(&bn)) {
-                    const std::uint32_t aw  = bodyAwait(r->dependsOn);
-                    const std::uint32_t bit = allocBodyBit();
-                    emitReprogramPacket(image, *r, bkt, aw, bkt, bit);
-                    bodyBit[r->id] = bit;
+                    const BarrierRef aw = branchAwait(r->dependsOn);
+                    const BarrierRef done = branchDomain.define(r->id);
+                    emitReprogramPacket(image, *r, aw.bucket, aw.mask, done.bucket, done.mask);
                 } else if (const auto* bb = std::get_if<CompiledBoundaryNode>(&bn)) {
                     if (!bb->scalarCopies.empty() || !bb->bufferCopies.empty()) {
                         throw std::logic_error(
@@ -1807,18 +1859,12 @@ class FpgaDevicePlan : public IDevicePlan {
                 }
             }
 
-            std::uint32_t leaves = 0;
-            for (const auto& [id, bit] : bodyBit) {
-                if (std::find(consumedBody.begin(), consumedBody.end(), id) ==
-                    consumedBody.end()) {
-                    leaves |= bit;
-                }
-            }
+            const BarrierRef leaves = branchDomain.mutableLeafAwait();
             rp1_node_t join{};
             join.opcode               = RP1_OP_NOP;
             join.status               = RP1_NODE_PENDING;
-            join.barrier_await_bucket = bkt;
-            join.barrier_await_mask   = leaves;
+            join.barrier_await_bucket = leaves.bucket;
+            join.barrier_await_mask   = leaves.mask;
             join.barrier_set_bucket   = 0;
             join.barrier_set_mask     = condDone;  // OR-join: taken branch resolves
             image.nodes.push_back(join);

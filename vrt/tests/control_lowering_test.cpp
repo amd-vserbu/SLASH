@@ -32,6 +32,11 @@ using vrt::graph::fpga::invertRp1Op;
 using vrt::graph::fpga::LoopIdAllocator;
 using vrt::graph::fpga::mapRp1Condition;
 using vrt::graph::fpga::SignalSlotAllocator;
+using vrt::graph::fpga::BarrierLoweringInput;
+using vrt::graph::fpga::BarrierResetDomainSpec;
+using vrt::graph::fpga::BarrierSyntheticNode;
+using vrt::graph::fpga::BarrierEventSpec;
+using vrt::graph::fpga::lowerBarrierEvents;
 
 namespace {
 
@@ -155,4 +160,116 @@ TEST(ControlLowering, LoopIdAllocatorIncrementsAndBounds) {
         (void)alloc.alloc();
     }
     EXPECT_THROW(alloc.alloc(), std::runtime_error);
+}
+
+TEST(ControlLowering, BarrierLoweringRejectsChildToParentDependency) {
+    BarrierLoweringInput input;
+    input.rootDomain = "root";
+    input.domains = {
+        {"root", std::nullopt, {"body"}},
+        {"body", std::string("root"), {}},
+    };
+    input.events = {
+        {"child_done", "body", {}},
+        {"parent_consumer", "root", {"child_done"}},
+    };
+
+    EXPECT_THROW(lowerBarrierEvents(input), std::runtime_error);
+}
+
+TEST(ControlLowering, BarrierLoweringInsertsAncestorToChildTransition) {
+    BarrierLoweringInput input;
+    input.rootDomain = "root";
+    input.bitsPerBucket = 4;
+    input.domains = {
+        {"root", std::nullopt, {"body"}},
+        {"body", std::string("root"), {}},
+    };
+    input.events = {
+        {"root_done", "root", {}},
+        {"body_consumer", "body", {"root_done"}},
+    };
+
+    auto out = lowerBarrierEvents(input);
+    auto transitions = 0;
+    for (const auto& node : out.syntheticNodes) {
+        if (node.kind == BarrierSyntheticNode::Kind::Transition) {
+            ++transitions;
+            EXPECT_EQ(node.domain, "body");
+            EXPECT_EQ(node.depends, std::vector<std::string>{"root_done"});
+            EXPECT_TRUE(out.events.count(node.set));
+        }
+    }
+    EXPECT_EQ(transitions, 1);
+    EXPECT_LE(out.domainRanges["root"].start, out.domainRanges["body"].start);
+    EXPECT_LE(out.domainRanges["body"].end, out.domainRanges["root"].end);
+}
+
+TEST(ControlLowering, BarrierLoweringCreatesCollectorsAtLowBucketRate) {
+    BarrierLoweringInput input;
+    input.rootDomain = "root";
+    input.bitsPerBucket = 2;
+    input.domains = {{"root", std::nullopt, {}}};
+    input.events = {
+        {"a", "root", {}},
+        {"b", "root", {}},
+        {"c", "root", {}},
+        {"d", "root", {}},
+        {"join", "root", {"a", "b", "c", "d"}},
+    };
+
+    auto out = lowerBarrierEvents(input);
+    auto collectors = 0;
+    for (const auto& node : out.syntheticNodes) {
+        if (node.kind == BarrierSyntheticNode::Kind::Collector) {
+            ++collectors;
+            ASSERT_FALSE(node.depends.empty());
+            EXPECT_TRUE(out.events.count(node.set));
+        }
+    }
+    EXPECT_GT(collectors, 0);
+}
+
+TEST(ControlLowering, BarrierLoweringAssignsNestedContiguousRanges) {
+    BarrierLoweringInput input;
+    input.rootDomain = "root";
+    input.bitsPerBucket = 2;
+    input.domains = {
+        {"root", std::nullopt, {"loop1"}},
+        {"loop1", std::string("root"), {"loop2"}},
+        {"loop2", std::string("loop1"), {}},
+    };
+    input.events = {
+        {"r0", "root", {}},
+        {"r1", "root", {}},
+        {"l1", "loop1", {"r0"}},
+        {"l2", "loop2", {"r1", "l1"}},
+    };
+
+    auto out = lowerBarrierEvents(input);
+    const auto root = out.domainRanges.at("root");
+    const auto loop1 = out.domainRanges.at("loop1");
+    const auto loop2 = out.domainRanges.at("loop2");
+    EXPECT_FALSE(root.empty);
+    EXPECT_FALSE(loop1.empty);
+    EXPECT_FALSE(loop2.empty);
+    EXPECT_LE(root.start, loop1.start);
+    EXPECT_LE(loop1.end, root.end);
+    EXPECT_LE(loop1.start, loop2.start);
+    EXPECT_LE(loop2.end, loop1.end);
+}
+
+TEST(ControlLowering, BarrierLoweringFailsWhenBucketsExhausted) {
+    BarrierLoweringInput input;
+    input.rootDomain = "root";
+    input.bitsPerBucket = 2;
+    input.maxBuckets = 1;
+    input.domains = {{"root", std::nullopt, {}}};
+    input.events = {
+        {"a", "root", {}},
+        {"b", "root", {}},
+        {"c", "root", {}},
+    };
+
+    EXPECT_THROW(lowerBarrierEvents(input), std::runtime_error);
 }

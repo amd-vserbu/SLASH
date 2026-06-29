@@ -1336,6 +1336,60 @@ TEST_F(FpgaDeviceFixture, FixedCountLoopLowersToLoopRerunImage) {
     EXPECT_EQ(n[3].barrier_await_mask, n[0].barrier_set_mask);
 }
 
+TEST_F(FpgaDeviceFixture, FixedCountLoopBodySpansMultipleBarrierBuckets) {
+    FpgaDevice dev("fpga:0", window_,
+                   [](const std::string&) { return FpgaKernelLocation{0x88010000u, 0}; });
+
+    auto body = std::make_shared<DGraph>();
+    body->deviceId = "fpga:0";
+    body->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    std::string prev;
+    for (int i = 0; i < 40; ++i) {
+        CompiledKernelNode k;
+        k.id = "bk" + std::to_string(i);
+        k.deviceId = "fpga:0";
+        k.kernel = fpgaKernel("bodyK");
+        if (!prev.empty()) k.dependsOn = {prev};
+        prev = k.id;
+        body->nodes.emplace_back(k);
+    }
+
+    DGraph dg;
+    dg.deviceId = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    CompiledLoopNode loop;
+    loop.id = "loop0";
+    loop.deviceId = "fpga:0";
+    loop.loopKind = CompiledLoopKind::FixedCount;
+    loop.tripCount = bindTripCount(dg, 2);
+    dg.nodes.emplace_back(loop);
+
+    DGraphChild child;
+    child.parentNodeId = "loop0";
+    child.role = DGraphChildRole::LoopBody;
+    child.dgraphs.push_back(body);
+    dg.childDGraphs.push_back(child);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    const rp1_node_t* n = ddr_.nodes();
+    ASSERT_EQ(n[0].opcode, RP1_OP_LOOP);
+    EXPECT_EQ(n[0].payload.loop.bucket_clear_start, 1u);
+    EXPECT_GT(n[0].payload.loop.bucket_clear_end, n[0].payload.loop.bucket_clear_start)
+        << "40 body kernels should occupy more than one reset-domain bucket";
+
+    bool sawSecondBodyBucket = false;
+    for (std::uint32_t i = n[0].payload.loop.body_start; i <= n[0].payload.loop.body_end; ++i) {
+        if (n[i].opcode == RP1_OP_KERNEL_DISPATCH && n[i].barrier_set_bucket > 1u) {
+            sawSecondBodyBucket = true;
+        }
+    }
+    EXPECT_TRUE(sawSecondBodyBucket);
+}
+
 // End-to-end execution: a fixed-count loop must dispatch its body kernel
 // exactly N times when run on a faithful host RP1 scanner (LOOP/RERUN +
 // per-iteration body-bucket clear), proving the lowering iterates correctly
@@ -1666,6 +1720,64 @@ TEST(FpgaControlExecution, ConditionalGatesExactlyOneBranch) {
     runWithThreshold(2u, thenDisp, elseDisp);   // p(=1) >= 2 false -> else
     EXPECT_EQ(thenDisp, 0u) << "then branch must be skipped when predicate fails";
     EXPECT_EQ(elseDisp, 1u) << "else branch should run when predicate fails";
+}
+
+TEST(FpgaControlExecution, ConditionalBranchSpansMultipleBarrierBuckets) {
+    constexpr std::uint32_t kPredBase = 0x88010000u;
+    constexpr std::uint32_t kThenBase = 0x88020000u;
+    std::vector<std::byte> backing(kBarSize, std::byte{0});
+    DdrView ddr{backing.data()};
+    primeAsReady(ddr);
+    auto window =
+        std::make_shared<fpga::Rp1BarWindow>(backing.data(), backing.size(), kWindowOff);
+    FaithfulRp1 rp1(ddr);
+
+    FpgaDevice dev("fpga:0", window, [](const std::string& name) -> FpgaKernelLocation {
+        if (name == "pred") return {kPredBase, 0};
+        return {kThenBase, 0};
+    });
+
+    IOTypeMap predType;
+    predType.outputScalars.push_back({"p", ScalarType::U32});
+    CompiledKernelNode pred;
+    pred.id = "pred"; pred.deviceId = "fpga:0"; pred.kernel = fpgaKernel("pred", predType);
+    pred.ioMap.bindOutputScalar("p", GraphScalar::ref(ScalarType::U32, "p"));
+
+    auto thenBody = std::make_shared<DGraph>();
+    thenBody->deviceId = "fpga:0";
+    thenBody->scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    std::string prev;
+    for (int i = 0; i < 40; ++i) {
+        CompiledKernelNode k;
+        k.id = "tk" + std::to_string(i);
+        k.deviceId = "fpga:0";
+        k.kernel = fpgaKernel("thenK");
+        if (!prev.empty()) k.dependsOn = {prev};
+        prev = k.id;
+        thenBody->nodes.emplace_back(k);
+    }
+
+    DGraph dg;
+    dg.deviceId = "fpga:0";
+    dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    dg.nodes.emplace_back(pred);
+    CompiledConditionalNode cond;
+    cond.id = "cond0"; cond.deviceId = "fpga:0"; cond.dependsOn = {"pred"};
+    cond.condition = Condition::compare(CompareOp::GE,
+                                        ConditionOperand::scalar(ScalarType::U32, "p"),
+                                        ConditionOperand::constant<std::uint32_t>(1));
+    dg.nodes.emplace_back(cond);
+    DGraphChild thenChild;
+    thenChild.parentNodeId = "cond0"; thenChild.role = DGraphChildRole::ConditionalThen;
+    thenChild.dgraphs.push_back(thenBody);
+    dg.childDGraphs.push_back(thenChild);
+
+    auto plan = dev.compilePlan(dg);
+    ASSERT_NE(plan, nullptr);
+    plan->launch();
+    plan->wait();
+
+    EXPECT_EQ(rp1.dispatches(kThenBase), 40u);
 }
 
 // The one-path FPGA executor accepts only RP1-executable nodes. Host bridge
