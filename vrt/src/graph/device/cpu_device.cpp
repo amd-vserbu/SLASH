@@ -880,19 +880,10 @@ void CpuDevicePlan::executeKernel(const CompiledKernelNode& node) {
         bufViews[portName] = v;
     }
 
-    const auto& inBufs = node.ioMap.inputs();
-    size_t defaultOutputSize = 0;
-    if (!inBufs.empty()) {
-        const GraphBuffer& firstBuffer = inBufs.begin()->second;
-        const std::string firstKey = scopedBufferKey(firstBuffer.scopeId(), firstBuffer.name());
-        auto fit = device_.buffers_.find(firstKey);
-        if (fit != device_.buffers_.end()) {
-            defaultOutputSize = fit->second.size();
-        }
-    }
-
     for (const auto& [portName, gbuf] : node.ioMap.outputs()) {
-        auto& storage = ensureBuffer(gbuf, defaultOutputSize);
+        const std::size_t bytes =
+            resolvedBufferSizeBytes(gbuf, scalarValues_, "CpuDevice");
+        auto& storage = ensureBuffer(gbuf, bytes);
         bufViews[portName] = CpuBufferView{storage.data(), storage.size(), gbuf.type()};
     }
 
@@ -901,6 +892,13 @@ void CpuDevicePlan::executeKernel(const CompiledKernelNode& node) {
         const std::string inKey = scopedBufferKey(rwb.in.scopeId(), rwb.in.name());
         const std::string outKey = scopedBufferKey(rwb.out.scopeId(), rwb.out.name());
         auto& inStorage = device_.buffers_.at(inKey);
+        const std::size_t outBytes =
+            resolvedBufferSizeBytes(rwb.out, scalarValues_, "CpuDevice");
+        if (outBytes != inStorage.size()) {
+            throw std::runtime_error(
+                "CpuDevice: RW output buffer '" + rwb.out.name() +
+                "' size does not match input buffer '" + rwb.in.name() + "'");
+        }
         device_.buffers_[outKey] = inStorage;
         bufViews[rwb.outPort] = CpuBufferView{
             device_.buffers_[outKey].data(),
@@ -940,6 +938,16 @@ CpuBufferView CpuDevicePlan::resolveBuffer(const GraphBuffer& buffer) const {
             "CpuDevice: buffer '" + buffer.name() + "' not found; "
             "did you forget to call setInputBuffer()?");
     }
+    if (buffer.hasSizeScalar()) {
+        const std::size_t expected =
+            resolvedBufferSizeBytes(buffer, scalarValues_, "CpuDevice");
+        if (it->second.size() != expected) {
+            throw std::runtime_error(
+                "CpuDevice: buffer '" + buffer.name() + "' holds " +
+                std::to_string(it->second.size()) + " byte(s), expected " +
+                std::to_string(expected));
+        }
+    }
     return CpuBufferView{
         const_cast<void*>(static_cast<const void*>(it->second.data())),
         it->second.size(),
@@ -949,9 +957,7 @@ CpuBufferView CpuDevicePlan::resolveBuffer(const GraphBuffer& buffer) const {
 
 std::vector<uint8_t>& CpuDevicePlan::ensureBuffer(const GraphBuffer& buffer, size_t sizeBytes) {
     auto& buf = device_.buffers_[scopedBufferKey(buffer.scopeId(), buffer.name())];
-    if (buf.size() < sizeBytes) {
-        buf.resize(sizeBytes);
-    }
+    buf.resize(sizeBytes);
     return buf;
 }
 

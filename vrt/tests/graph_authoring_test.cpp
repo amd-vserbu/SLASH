@@ -177,13 +177,15 @@ TEST(GraphAuthoringTest, ElementwiseShorthandRoundTrips) {
 
     auto addOne = graph.cpu().elementwise<int32_t>("add_one", [](int32_t v) { return v + 1; });
 
-    GraphBuffer raw = graph.input<int32_t>("raw", n);
-    GraphBuffer out = graph.buffer<int32_t>("out", n);
+    GraphScalar size = graph.scalarInput<std::uint64_t>("n");
+    GraphBuffer raw = graph.input<int32_t>("raw", size);
+    GraphBuffer out = graph.buffer<int32_t>("out", size);
     graph.addKernelCall({.kernel = addOne, .inputs = {{"in", raw}}, .outputs = {{"out", out}}});
 
     std::vector<int32_t> input(n);
     for (std::size_t i = 0; i < n; ++i) input[i] = static_cast<int32_t>(i);
     auto exec = graph.compile();
+    exec.setScalar(size, static_cast<std::uint64_t>(n));
     exec.write(raw, input);
 
     exec.run();
@@ -199,12 +201,14 @@ TEST(GraphAuthoringTest, InoutKernelMutatesInPlace) {
 
     auto sparse = graph.cpu().add<CpuSparse>();
 
-    GraphBuffer raw = graph.input<int32_t>("raw", n);
-    GraphBuffer bumped = graph.buffer<int32_t>("bumped", n);
+    GraphScalar size = graph.scalarInput<std::uint64_t>("n");
+    GraphBuffer raw = graph.input<int32_t>("raw", size);
+    GraphBuffer bumped = graph.buffer<int32_t>("bumped", size);
     graph.addKernelCall({.kernel = sparse, .inouts = {{"data", raw, bumped}}});
 
     std::vector<int32_t> input(n, 0);
     auto exec = graph.compile();
+    exec.setScalar(size, static_cast<std::uint64_t>(n));
     exec.write(raw, input);
 
     exec.run();
@@ -229,11 +233,12 @@ TEST(GraphAuthoringTest, LoopConditionalInplaceFullPipeline) {
     auto report = graph.cpu().add<CpuReport>();
     auto reportOdd = graph.cpu().add<CpuReportOdd>();
 
-    GraphBuffer raw = graph.input<int32_t>("raw", n);
-    GraphBuffer pre = graph.buffer<int32_t>("pre", n);
+    GraphScalar size = graph.scalarInput<std::uint64_t>("n");
+    GraphBuffer raw = graph.input<int32_t>("raw", size);
+    GraphBuffer pre = graph.buffer<int32_t>("pre", size);
     graph.addKernelCall({.kernel = preprocess, .inputs = {{"in", raw}}, .outputs = {{"out", pre}}});
 
-    GraphBuffer post = graph.buffer<int32_t>("post", n);
+    GraphBuffer post = graph.buffer<int32_t>("post", size);
     GraphScalar loopCount = graph.scalarInput<std::uint32_t>("loop_count");
     {
         auto loop = graph.addLoop({.count = loopCount,
@@ -241,10 +246,10 @@ TEST(GraphAuthoringTest, LoopConditionalInplaceFullPipeline) {
                                    .outputs = {{"state", post}}});
         GraphBuffer s = loop.input("state");
 
-        GraphBuffer staged = loop.buffer<int32_t>("staged", n);
+        GraphBuffer staged = loop.buffer<int32_t>("staged", size);
         loop.addKernelCall({.kernel = stage, .inputs = {{"in", s}}, .outputs = {{"out", staged}}});
 
-        GraphBuffer bumped = loop.buffer<int32_t>("bumped", n);
+        GraphBuffer bumped = loop.buffer<int32_t>("bumped", size);
         loop.addKernelCall({.kernel = sparse, .inouts = {{"data", staged, bumped}}});
 
         loop.addKernelCall({.kernel = finalize,
@@ -257,7 +262,7 @@ TEST(GraphAuthoringTest, LoopConditionalInplaceFullPipeline) {
                          .inputs = {{"in", post}},
                          .outputScalars = {{"parity", parity}}});
 
-    GraphBuffer out = graph.buffer<int32_t>("out", n);
+    GraphBuffer out = graph.buffer<int32_t>("out", size);
     {
         auto [thenBranch, elseBranch] = graph.addConditional({
             .condition = (parity == 0), .inputs = {{"x", post}}, .outputs = {{"y", out}}});
@@ -272,6 +277,7 @@ TEST(GraphAuthoringTest, LoopConditionalInplaceFullPipeline) {
     std::vector<int32_t> input(n);
     for (std::uint32_t i = 0; i < n; ++i) input[i] = static_cast<int32_t>(i);
     auto exec = graph.compile();
+    exec.setScalar(size, static_cast<std::uint64_t>(n));
     exec.setScalar(loopCount, iters);
     exec.write(raw, input);
 
@@ -290,7 +296,8 @@ TEST(GraphAuthoringTest, UngatedFpgaDispatchIsRejected) {
     KernelHandle fpgaK{"graph_kernel_0", DeviceType::FPGA, "imageA",
                        IOTypeMap{}.scalarIn<uint64_t>("n").out<int32_t>("out"), "fpga:0"};
     GraphScalar n = graph.scalarInput<uint64_t>("n");
-    GraphBuffer out = graph.buffer<int32_t>("out", 4);
+    GraphScalar size = graph.scalarInput<std::uint64_t>("n_elements");
+    GraphBuffer out = graph.buffer<int32_t>("out", size);
     graph.addKernelCall({.kernel = fpgaK, .inputScalars = {{"n", n}}, .outputs = {{"out", out}}});
 
     EXPECT_THROW(graph.compile(), std::runtime_error);
@@ -303,7 +310,8 @@ TEST(GraphAuthoringTest, GatedFpgaDispatchCompiles) {
     KernelHandle fpgaK{"graph_kernel_0", DeviceType::FPGA, "imageA",
                        IOTypeMap{}.scalarIn<uint64_t>("n").out<int32_t>("out"), "fpga:0"};
     GraphScalar n = graph.scalarInput<uint64_t>("n");
-    GraphBuffer out = graph.buffer<int32_t>("out", 4);
+    GraphScalar size = graph.scalarInput<std::uint64_t>("n_elements");
+    GraphBuffer out = graph.buffer<int32_t>("out", size);
 
     auto r = graph.addReprogram({.image = {"imageA", "imageA.pdi", "fpga:0"}});
     graph.addKernelCall({.kernel = fpgaK,

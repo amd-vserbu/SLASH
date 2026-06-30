@@ -23,8 +23,8 @@
  * @brief GraphBuffer — typed, opaque buffer token used in graph construction.
  *
  * A GraphBuffer is a first-class value in the graph: a (scope, name,
- * element-type) tuple that the compiler resolves to a concrete,
- * device-allocated buffer at compile time.
+ * element-type, size-scalar) tuple that the compiler resolves to a concrete,
+ * device-allocated buffer in a compiled execution.
  *
  * Tokens are minted via the public factory:
  *   GraphBuffer::make(BufferType, std::string, scopeId)
@@ -41,10 +41,14 @@
 #define VRT_GRAPH_CORE_GRAPH_BUFFER_HPP
 
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+#include <vrt/graph/core/graph_scalar.hpp>
 #include <vrt/graph/core/types.hpp>
 
 namespace vrt::graph {
@@ -63,15 +67,22 @@ class GraphBuffer {
      * @param type  Element type of the buffer.
      * @param name     Logical name (unique within its scope).  Must be non-empty.
      * @param scopeId  Graph-region namespace that owns this token.
+     * @param size     U64 graph input scalar used as the symbolic element count.
      * @throws std::invalid_argument if @p name is empty.
      */
     static GraphBuffer make(BufferType type, std::string name, uint64_t scopeId = 0,
-                            std::size_t elementCount = 0) {
+                            std::optional<GraphScalar> size = std::nullopt) {
         if (name.empty()) {
             throw std::invalid_argument(
                 "GraphBuffer::make: name must not be empty");
         }
-        return GraphBuffer(type, std::move(name), scopeId, elementCount);
+        return GraphBuffer(type, std::move(name), scopeId, std::move(size));
+    }
+
+    static GraphBuffer make(BufferType type, std::string name, uint64_t scopeId,
+                            GraphScalar size) {
+        return make(type, std::move(name), scopeId,
+                    std::optional<GraphScalar>(std::move(size)));
     }
 
     /**
@@ -93,18 +104,29 @@ class GraphBuffer {
     BufferType type() const { return type_; }
 
     /**
-     * @brief Number of elements this token was declared with (0 if unspecified).
-     *
-     * Carried for host-side sizing (Graph::write / Graph::read), output
-     * allocation, and in-place length checks. Tokens minted through the
-     * lower-level IOMap binders default to 0 (size inferred at runtime).
+     * @brief Returns true when this token carries a symbolic size scalar.
      */
-    std::size_t count() const { return count_; }
+    bool hasSizeScalar() const { return size_.has_value(); }
 
     /**
-     * @brief Declared size in bytes (count() * element size), or 0 if unknown.
+     * @brief Symbolic element count used for allocation.
+     *
+     * Throws if this token is intentionally unsized. Unsized tokens are only
+     * valid when the compiler can prove they are pure aliases of sized tokens.
      */
-    std::size_t sizeBytes() const { return count_ * bufferElementSize(type_); }
+    const GraphScalar& sizeScalar() const {
+        if (!size_) {
+            throw std::runtime_error(
+                "GraphBuffer::sizeScalar: buffer '" + name_ +
+                "' has no size scalar");
+        }
+        return *size_;
+    }
+
+    /**
+     * @brief Optional symbolic element count used for allocation.
+     */
+    const std::optional<GraphScalar>& maybeSizeScalar() const { return size_; }
 
     /**
      * @brief Returns false for default-constructed (unbound) tokens.
@@ -112,14 +134,51 @@ class GraphBuffer {
     bool valid() const { return !name_.empty(); }
 
    private:
-    GraphBuffer(BufferType type, std::string name, uint64_t scopeId, std::size_t count)
-        : type_(type), name_(std::move(name)), scopeId_(scopeId), count_(count) {}
+    GraphBuffer(BufferType type, std::string name, uint64_t scopeId,
+                std::optional<GraphScalar> size)
+        : type_(type), name_(std::move(name)), scopeId_(scopeId), size_(std::move(size)) {}
 
     BufferType  type_ = BufferType::U8;  // placeholder for default-constructed tokens
     std::string name_;
     uint64_t    scopeId_ = 0;
-    std::size_t count_ = 0;
+    std::optional<GraphScalar> size_;
 };
+
+inline std::size_t resolvedBufferElements(
+    const GraphBuffer& buffer,
+    const std::shared_ptr<std::map<std::string, std::uint64_t>>& scalarValues,
+    const char* diagnostic) {
+    if (!buffer.valid()) {
+        throw std::runtime_error(
+            std::string(diagnostic) + ": invalid GraphBuffer");
+    }
+    if (!buffer.hasSizeScalar()) {
+        throw std::runtime_error(
+            std::string(diagnostic) + ": buffer '" + buffer.name() +
+            "' has no size scalar");
+    }
+    if (!scalarValues) {
+        throw std::runtime_error(
+            std::string(diagnostic) + ": no scalar map is available");
+    }
+    const GraphScalar& size = buffer.sizeScalar();
+    const std::string key = scopedScalarKey(size.scopeId(), size.varName());
+    auto it = scalarValues->find(key);
+    if (it == scalarValues->end()) {
+        throw std::runtime_error(
+            std::string(diagnostic) + ": size scalar '" + size.varName() +
+            "' is not set");
+    }
+    return static_cast<std::size_t>(it->second);
+}
+
+inline std::size_t resolvedBufferSizeBytes(
+    const GraphBuffer& buffer,
+    const std::shared_ptr<std::map<std::string, std::uint64_t>>& scalarValues,
+    const char* diagnostic) {
+    return resolvedBufferElements(buffer, scalarValues, diagnostic) *
+           bufferElementSize(buffer.type());
+}
 
 }  // namespace vrt::graph
 

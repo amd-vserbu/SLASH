@@ -134,13 +134,25 @@ IOTypeMap singleOutputScalarType(ScalarType scalarType = ScalarType::I32) {
     return ioType;
 }
 
+GraphScalar testSize(GraphRegion& region) {
+    static std::uint64_t next = 0;
+    return region.inputScalar(ScalarType::U64, "__test_size_" + std::to_string(next++));
+}
+
+GraphBuffer testInput(GraphRegion& region, BufferType type, const std::string& name) {
+    return region.inputBuffer(type, name, testSize(region));
+}
+
 std::string addOutputKernel(GraphRegion& region,
                             KernelDescriptor kernel,
                             BufferType bufferType,
-                            const std::string& deviceHint) {
+                            const std::string& deviceHint,
+                            std::optional<GraphScalar> size = std::nullopt) {
     IOMap kernelIo;
     GraphBuffer output;
-    kernelIo.bindOutput("out", bufferType, output, region.scopeId());
+    kernelIo.bindOutput("out", bufferType, output,
+                        size ? *size : testSize(region),
+                        region.scopeId());
     return region.addKernel(std::move(kernel), std::move(kernelIo), deviceHint);
 }
 
@@ -171,10 +183,10 @@ class AddI32BufferKernel : public CpuKernel {
 };
 
 GraphBuffer bindControlOutput(IOMap& ioMap,
-                              const GraphRegion& region,
+                              GraphRegion& region,
                               BufferType bufferType = BufferType::I32) {
     GraphBuffer output;
-    ioMap.bindOutput("out", bufferType, output, region.scopeId());
+    ioMap.bindOutput("out", bufferType, output, testSize(region), region.scopeId());
     return output;
 }
 
@@ -330,7 +342,7 @@ TEST(RegionCompilerTest, ScopedTokensCarryRegionIdentity) {
     auto root = GraphRegion::createRoot();
     auto body = root->createChild();
 
-    GraphBuffer rootInput = root->inputBuffer(BufferType::I32, "raw");
+    GraphBuffer rootInput = testInput(*root, BufferType::I32, "raw");
     GraphScalar bodyScalar = body->scalar(ScalarType::I32, "limit");
 
     EXPECT_EQ(rootInput.scopeId(), root->scopeId());
@@ -356,7 +368,7 @@ TEST(RegionCompilerTest, GraphAddNodeAuthorsKernelInRootRegion) {
     kernelType.inputs.push_back({"in", BufferType::I32});
     kernelType.outputs.push_back({"out", BufferType::I32});
 
-    GraphBuffer input = graph.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer input = graph.inputBuffer(BufferType::I32, "raw", testSize(graph.rootRegion()));
     IOMap io;
     GraphBuffer output;
     io.bindInput("in", input)
@@ -381,6 +393,7 @@ TEST(RegionCompilerTest, GraphRootControlHelpersDelegateToRootRegion) {
     Graph graph;
     auto loopBody = graph.rootRegion().createChild();
     auto whileBody = graph.rootRegion().createChild();
+    GraphScalar size = testSize(graph.rootRegion());
     auto thenRegion = graph.rootRegion().createChild();
     auto elseRegion = graph.rootRegion().createChild();
 
@@ -408,7 +421,7 @@ TEST(RegionCompilerTest, RegionStoresKernelAndControlOps) {
     kernelType.inputs.push_back({"in", BufferType::I32});
     kernelType.outputs.push_back({"out", BufferType::I32});
 
-    GraphBuffer bodyInput = body->inputBuffer(BufferType::I32, "in_buf");
+    GraphBuffer bodyInput = testInput(*body, BufferType::I32, "in_buf");
     IOMap bodyIo;
     GraphBuffer bodyOutput;
     bodyIo.bindInput("in", bodyInput)
@@ -564,6 +577,7 @@ TEST(RegionCompilerTest, WhileLoopWithExportedFpgaPredicatePlacedOnFpgaQueue) {
 
     GraphScalar counter = graph.globalScalar(ScalarType::U32, "counter");
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     GraphScalar localNext = body->scalar(ScalarType::U32, "next");
     IOTypeMap bodyType;
@@ -608,6 +622,7 @@ TEST(RegionCompilerTest, FixedCountLoopWithCpuBodyStaysOnCpu) {
     graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
     graph.registerDevice(std::make_shared<StubDevice>("fpga:0", DeviceType::FPGA));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     body->addKernel(cpuKernel("body"), IOMap{}, "cpu");
     std::string loopId =
@@ -634,10 +649,11 @@ TEST(RegionCompilerTest, CrossDeviceLoopSplitsIntoPerQueueRendezvous) {
     inOutT.inputs.push_back({"in", BufferType::I32});
     inOutT.outputs.push_back({"out", BufferType::I32});
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     IOMap fIo;
     GraphBuffer produced;
-    fIo.bindOutput("out", BufferType::I32, produced, body->scopeId());
+    fIo.bindOutput("out", BufferType::I32, produced, size, body->scopeId());
     const std::string fpgaKId = body->addKernel(
         KernelDescriptor{"fk", DeviceType::FPGA, std::nullopt, outT}, std::move(fIo), "fpga:0");
 
@@ -725,12 +741,13 @@ TEST(RegionCompilerTest, MultiStageCrossDeviceLoopRendezvousSlotsMatchPerBridge)
     inOutT.inputs.push_back({"in", BufferType::I32});
     inOutT.outputs.push_back({"out", BufferType::I32});
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     const auto scope = body->scopeId();
 
     IOMap io0;
     GraphBuffer staged;
-    io0.bindOutput("out", BufferType::I32, staged, scope);
+    io0.bindOutput("out", BufferType::I32, staged, size, scope);
     const std::string stageId =
         body->addKernel(cpuKernel("cpu_stage", outT), std::move(io0), "cpu");
 
@@ -813,7 +830,7 @@ TEST(RegionCompilerTest, SplitLoopCpuOutputConsumerUsesCpuDeliveredParentBuffer)
     inOutT.inputs.push_back({"in", BufferType::I32});
     inOutT.outputs.push_back({"out", BufferType::I32});
 
-    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw", testSize(graph.rootRegion()));
     IOMap preIo;
     GraphBuffer pre;
     preIo.bindInput("in", raw)
@@ -821,10 +838,12 @@ TEST(RegionCompilerTest, SplitLoopCpuOutputConsumerUsesCpuDeliveredParentBuffer)
     graph.addNode(cpuKernel("cpu_pre", inOutT), std::move(preIo), "cpu");
 
     GraphBuffer post = GraphBuffer::make(BufferType::I32, "post",
-                                         graph.rootRegion().scopeId());
+                                         graph.rootRegion().scopeId(),
+                                         raw.sizeScalar());
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     const auto scope = body->scopeId();
-    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state");
+    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state", raw.sizeScalar());
     body->importFromParent(std::vector<BufferBoundaryMapping>{{pre, localState}});
 
     IOMap io0;
@@ -924,7 +943,7 @@ TEST(RegionCompilerTest, TopLevelCpuFpgaBridgeMovesHostActionToCpuDGraph) {
 
     IOMap cIo;
     GraphBuffer produced;
-    cIo.bindOutput("out", BufferType::I32, produced);
+    cIo.bindOutput("out", BufferType::I32, produced, testSize(graph.rootRegion()));
     const std::string cpuProducer =
         graph.addNode(cpuKernel("produce", cpuOutT), std::move(cIo), "cpu");
 
@@ -1001,10 +1020,11 @@ TEST(RegionCompilerTest, DataDependentCrossDeviceLoopSplitsWithBroadcastRoles) {
     inOutT.inputs.push_back({"in", BufferType::I32});
     inOutT.outputs.push_back({"out", BufferType::I32});
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     IOMap fIo;
     GraphBuffer produced;
-    fIo.bindOutput("out", BufferType::I32, produced, body->scopeId());
+    fIo.bindOutput("out", BufferType::I32, produced, size, body->scopeId());
     const std::string fpgaKId = body->addKernel(
         KernelDescriptor{"fk", DeviceType::FPGA, std::nullopt, outT}, std::move(fIo), "fpga:0");
     IOMap cIo;
@@ -1058,7 +1078,7 @@ TEST(RegionCompilerTest, FpgaLoopCarriedBufferWithCpuIoPlacesLoopAndBoundariesOn
     kt.inputs.push_back({"in", BufferType::I32});
     kt.outputs.push_back({"out", BufferType::I32});
 
-    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw", testSize(graph.rootRegion()));
     IOMap initIo;
     GraphBuffer parentState;
     initIo.bindInput("in", raw)
@@ -1066,7 +1086,7 @@ TEST(RegionCompilerTest, FpgaLoopCarriedBufferWithCpuIoPlacesLoopAndBoundariesOn
     graph.addNode(cpuKernel("init", kt), std::move(initIo), "cpu");
 
     auto body = graph.rootRegion().createChild();
-    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state");
+    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state", parentState.sizeScalar());
     const std::string startId = body->importFromParent(
         std::vector<BufferBoundaryMapping>{{parentState, localState}});
     IOMap bodyIo;
@@ -1136,13 +1156,14 @@ TEST(RegionCompilerTest, CompilerBuildsNestedCrossDeviceBridgesInLoopBody) {
     graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
     graph.registerDevice(std::make_shared<StubDevice>("mcpu:0", DeviceType::MOCK_CPU));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     IOTypeMap outputType = singleOutputType();
     IOTypeMap inOutType = singleInputOutputType();
 
     IOMap producerIo;
     GraphBuffer cpuProduced;
-    producerIo.bindOutput("out", BufferType::I32, cpuProduced, body->scopeId());
+    producerIo.bindOutput("out", BufferType::I32, cpuProduced, size, body->scopeId());
     std::string cpuProducerId = body->addKernel(cpuKernel("produce", outputType),
                                                 std::move(producerIo), "cpu");
 
@@ -1212,6 +1233,7 @@ TEST(RegionCompilerTest, CompilerBuildsNestedCrossDeviceBridgesInConditionalBran
     graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
     graph.registerDevice(std::make_shared<StubDevice>("mcpu:0", DeviceType::MOCK_CPU));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto thenRegion = graph.rootRegion().createChild();
     auto elseRegion = graph.rootRegion().createChild();
     IOTypeMap outputType = singleOutputType();
@@ -1220,7 +1242,7 @@ TEST(RegionCompilerTest, CompilerBuildsNestedCrossDeviceBridgesInConditionalBran
     IOMap producerIo;
     GraphBuffer cpuProduced;
     producerIo.bindOutput("out", BufferType::I32, cpuProduced,
-                                thenRegion->scopeId());
+                          size, thenRegion->scopeId());
     std::string cpuProducerId = thenRegion->addKernel(
         cpuKernel("produce", outputType), std::move(producerIo), "cpu");
 
@@ -1303,6 +1325,7 @@ TEST(RegionCompilerTest, CompilerBuildsConditionalControlNodeAndBranchDGraphs) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto thenRegion = graph.rootRegion().createChild();
     auto elseRegion = graph.rootRegion().createChild();
     std::string thenKernelId = thenRegion->addKernel(cpuKernel("then"), IOMap{}, "cpu");
@@ -1339,6 +1362,7 @@ TEST(RegionCompilerTest, CompilerLowersScalarBoundaryMappingsInChildDGraph) {
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
     GraphScalar parentCounter = graph.globalScalar(ScalarType::I32, "counter");
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     GraphScalar localCounter = body->scalar(ScalarType::I32, "counter");
 
@@ -1590,18 +1614,20 @@ TEST(RegionCompilerTest, CompilerLowersBufferBoundaryMappingsInChildDGraph) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
-    GraphBuffer parentInput = graph.inputBuffer(BufferType::I32, "parent_input");
+    GraphBuffer parentInput = graph.inputBuffer(BufferType::I32, "parent_input", testSize(graph.rootRegion()));
     GraphBuffer parentOutput = GraphBuffer::make(BufferType::I32, "parent_output",
-                                                 graph.rootRegion().scopeId());
+                                                 graph.rootRegion().scopeId(),
+                                                 parentInput.sizeScalar());
     auto body = graph.rootRegion().createChild();
-    GraphBuffer localInput = body->inputBuffer(BufferType::I32, "input");
+    GraphBuffer localInput = body->inputBuffer(BufferType::I32, "input", parentInput.sizeScalar());
 
     std::string startId = body->importFromParent(
         std::vector<BufferBoundaryMapping>{{parentInput, localInput}});
 
     IOMap producerIo;
     GraphBuffer localOutput;
-    producerIo.bindOutput("out", BufferType::I32, localOutput, body->scopeId());
+    producerIo.bindOutput("out", BufferType::I32, localOutput,
+                          parentInput.sizeScalar(), body->scopeId());
     std::string producerId = body->addKernel(cpuKernel("produce", singleOutputType()),
                                              std::move(producerIo), "cpu");
     std::string endId = body->exportToParent(
@@ -1641,9 +1667,9 @@ TEST(RegionCompilerTest, CompilerOrdersBufferBoundaryDependencies) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
-    GraphBuffer parentState = graph.inputBuffer(BufferType::I32, "state");
+    GraphBuffer parentState = graph.inputBuffer(BufferType::I32, "state", testSize(graph.rootRegion()));
     auto body = graph.rootRegion().createChild();
-    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state");
+    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state", parentState.sizeScalar());
 
     std::string startId = body->importFromParent(
         std::vector<BufferBoundaryMapping>{{parentState, localState}});
@@ -1682,7 +1708,7 @@ TEST(RegionCompilerTest, CompilerAllowsLoopCarriedBufferWithInitialProducer) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
-    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw", testSize(graph.rootRegion()));
     IOTypeMap kernelType;
     kernelType.inputs.push_back({"in", BufferType::I32});
     kernelType.outputs.push_back({"out", BufferType::I32});
@@ -1695,7 +1721,7 @@ TEST(RegionCompilerTest, CompilerAllowsLoopCarriedBufferWithInitialProducer) {
                                              std::move(initIo), "cpu");
 
     auto body = graph.rootRegion().createChild();
-    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state");
+    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state", parentState.sizeScalar());
     const std::string startId = body->importFromParent(
         std::vector<BufferBoundaryMapping>{{parentState, localState}});
 
@@ -1735,9 +1761,9 @@ TEST(RegionCompilerTest, CompilerRejectsBufferBoundaryTypeMismatch) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
-    GraphBuffer parentInput = graph.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer parentInput = graph.inputBuffer(BufferType::I32, "raw", testSize(graph.rootRegion()));
     auto body = graph.rootRegion().createChild();
-    GraphBuffer localInput = body->inputBuffer(BufferType::U32, "raw");
+    GraphBuffer localInput = body->inputBuffer(BufferType::U32, "raw", parentInput.sizeScalar());
 
     body->importFromParent(std::vector<BufferBoundaryMapping>{{parentInput, localInput}});
     graph.addLoop(fixedLoopSpec(tripCount(tripCountScalar(graph.rootRegion())), body));
@@ -1749,8 +1775,9 @@ TEST(RegionCompilerTest, CompilerRejectsUnimportedChildBufferInput) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
-    GraphBuffer localInput = body->inputBuffer(BufferType::I32, "raw");
+    GraphBuffer localInput = body->inputBuffer(BufferType::I32, "raw", size);
 
     IOTypeMap kernelType;
     kernelType.inputs.push_back({"in", BufferType::I32});
@@ -1766,9 +1793,9 @@ TEST(RegionCompilerTest, CompilerRejectsWrongDirectionBufferBoundaryMapping) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
-    GraphBuffer parentInput = graph.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer parentInput = graph.inputBuffer(BufferType::I32, "raw", testSize(graph.rootRegion()));
     auto body = graph.rootRegion().createChild();
-    GraphBuffer localInput = body->inputBuffer(BufferType::I32, "raw");
+    GraphBuffer localInput = body->inputBuffer(BufferType::I32, "raw", parentInput.sizeScalar());
 
     body->importFromParent(std::vector<BufferBoundaryMapping>{{localInput, parentInput}});
     graph.addLoop(fixedLoopSpec(tripCount(tripCountScalar(graph.rootRegion())), body));
@@ -1903,9 +1930,10 @@ TEST(RegionCompilerTest, CompilerInfersLoopOutputPlacementAndParentDependency) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     std::string bodyKernelId = addOutputKernel(
-        *body, cpuKernel("body", singleOutputType()), BufferType::I32, "cpu");
+        *body, cpuKernel("body", singleOutputType()), BufferType::I32, "cpu", size);
 
     IOTypeMap loopType = singleOutputType();
     IOMap loopIo;
@@ -1949,12 +1977,13 @@ TEST(RegionCompilerTest, CompilerInfersConditionalOutputPlacementWhenBranchesAgr
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto thenRegion = graph.rootRegion().createChild();
     auto elseRegion = graph.rootRegion().createChild();
     addOutputKernel(*thenRegion, cpuKernel("then", singleOutputType()), BufferType::I32,
-                    "cpu");
+                    "cpu", size);
     addOutputKernel(*elseRegion, cpuKernel("else", singleOutputType()), BufferType::I32,
-                    "cpu");
+                    "cpu", size);
 
     IOTypeMap conditionalType = singleOutputType();
     IOMap conditionalIo;
@@ -2027,12 +2056,13 @@ TEST(RegionCompilerTest, CompilerRejectsMixedBranchOutputPlacementWithoutHint) {
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
     graph.registerDevice(std::make_shared<StubDevice>("mock", DeviceType::MOCK_CPU));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto thenRegion = graph.rootRegion().createChild();
     auto elseRegion = graph.rootRegion().createChild();
     addOutputKernel(*thenRegion, cpuKernel("then", singleOutputType()), BufferType::I32,
-                    "cpu");
+                    "cpu", size);
     addOutputKernel(*elseRegion, mockCpuKernel("else", singleOutputType()), BufferType::I32,
-                    "mock");
+                    "mock", size);
 
     IOTypeMap conditionalType = singleOutputType();
     IOMap conditionalIo;
@@ -2048,12 +2078,13 @@ TEST(RegionCompilerTest, CompilerAcceptsExplicitMixedBranchOutputPlacement) {
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
     graph.registerDevice(std::make_shared<StubDevice>("mock", DeviceType::MOCK_CPU));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto thenRegion = graph.rootRegion().createChild();
     auto elseRegion = graph.rootRegion().createChild();
     addOutputKernel(*thenRegion, cpuKernel("then", singleOutputType()), BufferType::I32,
-                    "cpu");
+                    "cpu", size);
     addOutputKernel(*elseRegion, mockCpuKernel("else", singleOutputType()), BufferType::I32,
-                    "mock");
+                    "mock", size);
 
     ConditionalSpec spec;
     spec.ioType = singleOutputType();
@@ -2083,10 +2114,11 @@ TEST(RegionCompilerTest, CompilerBuildsOutputPlacementBridgeForLoopBodyBuffer) {
     graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
     graph.registerDevice(std::make_shared<StubDevice>("mcpu:0", DeviceType::MOCK_CPU));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
     IOMap producerIo;
     GraphBuffer bodyOutput;
-    producerIo.bindOutput("out", BufferType::I32, bodyOutput, body->scopeId());
+    producerIo.bindOutput("out", BufferType::I32, bodyOutput, size, body->scopeId());
     std::string mockProducerId = body->addKernel(
         mockCpuKernel("remote_output", singleOutputType()), std::move(producerIo), "mcpu:0");
 
@@ -2151,17 +2183,18 @@ TEST(RegionCompilerTest, CompilerBuildsOutputPlacementBridgeForConditionalBranch
     graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
     graph.registerDevice(std::make_shared<StubDevice>("mcpu:0", DeviceType::MOCK_CPU));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto thenRegion = graph.rootRegion().createChild();
     IOMap thenIo;
     GraphBuffer thenOutput;
-    thenIo.bindOutput("out", BufferType::I32, thenOutput, thenRegion->scopeId());
+    thenIo.bindOutput("out", BufferType::I32, thenOutput, size, thenRegion->scopeId());
     thenRegion->addKernel(cpuKernel("then_output", singleOutputType()),
                           std::move(thenIo), "cpu");
 
     auto elseRegion = graph.rootRegion().createChild();
     IOMap elseIo;
     GraphBuffer elseOutput;
-    elseIo.bindOutput("out", BufferType::I32, elseOutput, elseRegion->scopeId());
+    elseIo.bindOutput("out", BufferType::I32, elseOutput, size, elseRegion->scopeId());
     std::string elseProducerId = elseRegion->addKernel(
         mockCpuKernel("else_remote_output", singleOutputType()), std::move(elseIo), "mcpu:0");
 
@@ -2241,8 +2274,9 @@ TEST(RegionCompilerTest, ParentKernelReadsControlOutputAcrossDevices) {
     graph.registerDevice(std::make_shared<StubDevice>("cpu", DeviceType::CPU));
     graph.registerDevice(std::make_shared<StubDevice>("mcpu:0", DeviceType::MOCK_CPU));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
-    addOutputKernel(*body, cpuKernel("body", singleOutputType()), BufferType::I32, "cpu");
+    addOutputKernel(*body, cpuKernel("body", singleOutputType()), BufferType::I32, "cpu", size);
 
     LoopSpec loopSpec;
     loopSpec.ioType = singleOutputType();
@@ -2306,7 +2340,7 @@ TEST(RegionCompilerTest, GraphRunCarriesLoopBufferStateAcrossIterations) {
     cpu->registerKernel(advanceKernel);
     cpu->registerKernel(reportKernel);
 
-    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "raw", testSize(graph.rootRegion()));
 
     IOMap initIo;
     GraphBuffer state;
@@ -2315,7 +2349,7 @@ TEST(RegionCompilerTest, GraphRunCarriesLoopBufferStateAcrossIterations) {
     graph.addNode(initKernel->descriptor(), std::move(initIo), "cpu");
 
     auto body = graph.rootRegion().createChild();
-    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state");
+    GraphBuffer localState = body->inputBuffer(BufferType::I32, "state", state.sizeScalar());
     const std::string startId = body->importFromParent(
         std::vector<BufferBoundaryMapping>{{state, localState}});
 
@@ -2342,6 +2376,7 @@ TEST(RegionCompilerTest, GraphRunCarriesLoopBufferStateAcrossIterations) {
     cpu->setInputBuffer(raw.name(), input.data(), input.size() * sizeof(input[0]));
 
     auto exec = graph.compile();
+    exec.setScalar(raw.sizeScalar(), static_cast<std::uint64_t>(input.size()));
     exec.setScalar(loopCount, 3);
     ASSERT_NO_THROW(exec.run());
 
@@ -2355,7 +2390,7 @@ TEST(RegionCompilerTest, CompilerRejectsDirectParentTokenUseInsideNestedRegion) 
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
     auto body = graph.rootRegion().createChild();
-    GraphBuffer rootInput = graph.inputBuffer(BufferType::I32, "raw");
+    GraphBuffer rootInput = graph.inputBuffer(BufferType::I32, "raw", testSize(graph.rootRegion()));
 
     IOTypeMap kernelType;
     kernelType.inputs.push_back({"in", BufferType::I32});
@@ -2475,8 +2510,9 @@ TEST(RegionCompilerTest, CompilerAllowsScalarTripCountWithOutputs) {
     Graph graph;
     graph.registerDevice(std::make_shared<CpuDevice>("cpu"));
 
+    GraphScalar size = testSize(graph.rootRegion());
     auto body = graph.rootRegion().createChild();
-    addOutputKernel(*body, cpuKernel("body_out", singleOutputType()), BufferType::I32, "cpu");
+    addOutputKernel(*body, cpuKernel("body_out", singleOutputType()), BufferType::I32, "cpu", size);
 
     IOTypeMap loopType = singleOutputType();
     IOMap loopIo;
@@ -2551,7 +2587,7 @@ TEST(RegionCompilerTest, CompiledGraphSurvivesGraphStructuralMutation) {
     cpu->registerKernel(addOne);
     cpu->registerKernel(addTen);
 
-    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "snapshot_raw");
+    GraphBuffer raw = graph.inputBuffer(BufferType::I32, "snapshot_raw", testSize(graph.rootRegion()));
     IOMap firstIo;
     GraphBuffer firstOut;
     firstIo.bindInput("in", raw)
@@ -2561,6 +2597,7 @@ TEST(RegionCompilerTest, CompiledGraphSurvivesGraphStructuralMutation) {
     std::vector<std::int32_t> input = {1, 2};
     cpu->setInputBuffer(raw.name(), input.data(), input.size() * sizeof(input[0]));
     auto oldSnapshot = graph.compile();
+    oldSnapshot.setScalar(raw.sizeScalar(), static_cast<std::uint64_t>(input.size()));
     EXPECT_NO_THROW(oldSnapshot.run());
 
     IOMap secondIo;
@@ -2575,6 +2612,7 @@ TEST(RegionCompilerTest, CompiledGraphSurvivesGraphStructuralMutation) {
     EXPECT_EQ(oldOutput, (std::vector<std::int32_t>{2, 3}));
 
     auto newSnapshot = graph.compile();
+    newSnapshot.setScalar(raw.sizeScalar(), static_cast<std::uint64_t>(input.size()));
     EXPECT_NO_THROW(newSnapshot.run());
     std::vector<std::int32_t> newOutput(input.size(), 0);
     cpu->getOutputBuffer(secondOut.name(), newOutput.data(), newOutput.size() * sizeof(newOutput[0]));

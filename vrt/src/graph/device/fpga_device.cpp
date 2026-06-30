@@ -326,6 +326,19 @@ struct DeferredLoopTripCount {
     std::string diagnostic;
 };
 
+struct DeferredBufferAddress {
+    GraphBuffer   buffer;
+    std::uint32_t arg_word_offset = 0;  // first value word for the 64-bit address
+    std::string   diagnostic;
+};
+
+struct DeferredBufferAlias {
+    std::string sourceKey;
+    std::string targetKey;
+    GraphBuffer sizeToken;
+    std::string diagnostic;
+};
+
 const char* deviceTypeName(DeviceType t) {
     switch (t) {
         case DeviceType::CPU:      return "CPU";
@@ -492,6 +505,8 @@ class FpgaDevicePlan : public IDevicePlan {
                 resolveDeferredScalars();
                 resolveDeferredLoopTripCounts();
                 stageDeferredPdis();
+                resolveDeferredBufferAliases();
+                resolveDeferredBufferAddresses();
                 const bool signalsPrepared = signalsPrepared_;
                 signalsPrepared_ = false;
                 fpga::Rp1GraphImage submitImage = image_;
@@ -605,6 +620,39 @@ class FpgaDevicePlan : public IDevicePlan {
         }
     }
 
+    void resolveDeferredBufferAliases() {
+        if (deferredBufferAliases_.empty()) return;
+        if (!device_) {
+            throw std::runtime_error(
+                "FpgaDevicePlan: deferred buffer aliases require an FpgaDevice");
+        }
+        for (const DeferredBufferAlias& alias : deferredBufferAliases_) {
+            const std::size_t bytes =
+                resolvedBufferSizeBytes(alias.sizeToken, scalarValues_, "FpgaDevicePlan");
+            if (device_->bufferSize(alias.sourceKey) == 0) {
+                device_->setInputBuffer(alias.sourceKey, nullptr, bytes);
+            }
+            device_->aliasBufferKey(alias.targetKey, alias.sourceKey);
+        }
+    }
+
+    void resolveDeferredBufferAddresses() {
+        if (deferredBufferAddresses_.empty()) return;
+        if (!device_) {
+            throw std::runtime_error(
+                "FpgaDevicePlan: deferred buffer address resolution requires an FpgaDevice");
+        }
+        for (const DeferredBufferAddress& d : deferredBufferAddresses_) {
+            const std::size_t bytes =
+                resolvedBufferSizeBytes(d.buffer, scalarValues_, "FpgaDevicePlan");
+            const std::uint64_t addr = device_->bufferDeviceAddress(d.buffer, bytes);
+            std::uint32_t words[2] = {0u, 0u};
+            writeU64ToArgWords(addr, words);
+            image_.arg_buf[d.arg_word_offset] = words[0];
+            image_.arg_buf[d.arg_word_offset + 2u] = words[1];
+        }
+    }
+
     void stageDeferredPdis() {
         if (deferredPdis_.empty()) return;
         std::map<std::string, std::uint64_t> stagedByPath;
@@ -648,26 +696,7 @@ class FpgaDevicePlan : public IDevicePlan {
     }
 
     std::size_t currentBufferSize(const GraphBuffer& buffer) const {
-        const std::size_t live = device_->bufferSize(scopedBufferKey(buffer.scopeId(), buffer.name()));
-        return live != 0 ? live : buffer.sizeBytes();
-    }
-
-    std::size_t defaultOutputSize(const CompiledKernelNode& node) const {
-        for (const auto& port : node.kernel.ioType.inputs) {
-            auto it = node.ioMap.inputs().find(port.name);
-            if (it == node.ioMap.inputs().end()) continue;
-            const std::size_t size = currentBufferSize(it->second);
-            if (size != 0) return size;
-        }
-        for (const auto& rw : node.kernel.ioType.inouts) {
-            for (const auto& binding : node.ioMap.inouts()) {
-                if (binding.inPort == rw.in.name && binding.outPort == rw.out.name) {
-                    const std::size_t size = currentBufferSize(binding.in);
-                    if (size != 0) return size;
-                }
-            }
-        }
-        return 0;
+        return resolvedBufferSizeBytes(buffer, scalarValues_, "FpgaDevicePlan");
     }
 
     void appendBufferAddress(fpga::Rp1GraphImage& image,
@@ -678,12 +707,16 @@ class FpgaDevicePlan : public IDevicePlan {
                              std::size_t sizeBytes,
                              std::uint32_t& cursor_words,
                              std::uint32_t& arg_count) {
-        const std::uint64_t addr = device_->bufferDeviceAddress(buffer, sizeBytes);
         std::uint32_t words[2] = {0u, 0u};
-        writeU64ToArgWords(addr, words);
         const std::uint32_t base = layout.take(portName, 2u);
-        appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, 2u,
-                              node.kernel.name, portName);
+        const std::uint32_t firstValueWord =
+            appendArgWordsAsPairs(image.arg_buf, cursor_words, base, words, 2u,
+                                  node.kernel.name, portName);
+        (void)sizeBytes;
+        deferredBufferAddresses_.push_back(DeferredBufferAddress{
+            buffer,
+            firstValueWord,
+            node.id + "." + portName});
         arg_count += 2u;
     }
 
@@ -726,8 +759,6 @@ class FpgaDevicePlan : public IDevicePlan {
         // kernel completes via an RP1_OP_SCALAR_READ into a signal slot
         // (see emitOutputScalarReads).  Nothing to pack here.
 
-        const std::size_t defaultSize = defaultOutputSize(node);
-
         for (const BufferPort& port : node.kernel.ioType.inputs) {
             auto it = node.ioMap.inputs().find(port.name);
             if (it == node.ioMap.inputs().end()) {
@@ -736,7 +767,7 @@ class FpgaDevicePlan : public IDevicePlan {
                     "' input buffer port '" + port.name + "' has no IOMap binding");
             }
             appendBufferAddress(image, node, layout, port.name, it->second,
-                                currentBufferSize(it->second), cursor_words, arg_count);
+                                0, cursor_words, arg_count);
         }
 
         for (const BufferPort& port : node.kernel.ioType.outputs) {
@@ -746,9 +777,8 @@ class FpgaDevicePlan : public IDevicePlan {
                     "FpgaDevice: kernel '" + node.kernel.name +
                     "' output buffer port '" + port.name + "' has no IOMap binding");
             }
-            const std::size_t existing = currentBufferSize(it->second);
             appendBufferAddress(image, node, layout, port.name, it->second,
-                                std::max(defaultSize, existing), cursor_words, arg_count);
+                                0, cursor_words, arg_count);
         }
 
         for (const RWBufferPort& port : node.kernel.ioType.inouts) {
@@ -764,12 +794,10 @@ class FpgaDevicePlan : public IDevicePlan {
                     "' RW buffer ports '" + port.in.name + "'/'" +
                     port.out.name + "' have no IOMap binding");
             }
-            const std::size_t inSize = currentBufferSize(it->in);
             appendBufferAddress(image, node, layout, port.in.name, it->in,
-                                inSize, cursor_words, arg_count);
+                                0, cursor_words, arg_count);
             appendBufferAddress(image, node, layout, port.out.name, it->out,
-                                std::max(inSize, currentBufferSize(it->out)),
-                                cursor_words, arg_count);
+                                0, cursor_words, arg_count);
         }
 
         if (arg_count > UINT16_MAX) {
@@ -1437,23 +1465,21 @@ class FpgaDevicePlan : public IDevicePlan {
         // as many contiguous buckets as needed and inserts silent collector NOPs
         // whenever an await list spans buckets.
 
-        // Declared byte-size of each carried token, taken from the body kernels'
-        // buffer bindings.  A cross-device loop input is only filled at launch
-        // time by its input bridge, so its carried-buffer boundary must pre-
-        // reserve device memory now (at build time) at this size; aliasing then
-        // points the body's local token at that stable reservation.
-        std::unordered_map<std::string, std::size_t> tokenBytes;
-        auto noteBytes = [&](const GraphBuffer& gb) {
-            if (!gb.valid() || gb.sizeBytes() == 0) return;
+        // Size token of each carried buffer, taken from the body kernels'
+        // buffer bindings.  Concrete bytes are resolved at launch so one
+        // compiled graph can run with different size-constant values.
+        std::unordered_map<std::string, GraphBuffer> tokenBuffers;
+        auto noteBuffer = [&](const GraphBuffer& gb) {
+            if (!gb.valid() || !gb.hasSizeScalar()) return;
             const std::string key = scopedBufferKey(gb.scopeId(), gb.name());
-            tokenBytes[key] = std::max(tokenBytes[key], gb.sizeBytes());
+            tokenBuffers.emplace(key, gb);
         };
         for (const CompiledNode* bnp : bodyNodes) {
             const auto* k = std::get_if<CompiledKernelNode>(bnp);
             if (!k) continue;
-            for (const auto& [port, gb] : k->ioMap.inputs())  { (void)port; noteBytes(gb); }
-            for (const auto& [port, gb] : k->ioMap.outputs()) { (void)port; noteBytes(gb); }
-            for (const IOMap::InoutBinding& rw : k->ioMap.inouts())  { noteBytes(rw.in); noteBytes(rw.out); }
+            for (const auto& [port, gb] : k->ioMap.inputs())  { (void)port; noteBuffer(gb); }
+            for (const auto& [port, gb] : k->ioMap.outputs()) { (void)port; noteBuffer(gb); }
+            for (const IOMap::InoutBinding& rw : k->ioMap.inouts())  { noteBuffer(rw.in); noteBuffer(rw.out); }
         }
 
         // Loop-carried scalars: an import (Start) boundary feeds the parent
@@ -1587,19 +1613,18 @@ class FpgaDevicePlan : public IDevicePlan {
                 for (const CompiledBufferBoundaryCopy& copy : b->bufferCopies) {
                     const std::string src = scopedBufferKey(copy.sourceScopeId, copy.sourceName);
                     const std::string tgt = scopedBufferKey(copy.targetScopeId, copy.targetName);
-                    // If the alias source is a cross-device loop input not yet
-                    // staged, pre-reserve it at the carried token's declared
-                    // size so the kernel arg address is stable; the input bridge
-                    // fills it at launch (setInputBuffer reuses the reservation).
-                    if (device_->bufferSize(src) == 0) {
-                        std::size_t sz = 0;
-                        if (auto it = tokenBytes.find(tgt); it != tokenBytes.end()) sz = it->second;
-                        if (sz == 0) {
-                            if (auto it = tokenBytes.find(src); it != tokenBytes.end()) sz = it->second;
-                        }
-                        if (sz > 0) device_->setInputBuffer(src, nullptr, sz);
+                    auto tokIt = tokenBuffers.find(tgt);
+                    if (tokIt == tokenBuffers.end()) tokIt = tokenBuffers.find(src);
+                    if (tokIt == tokenBuffers.end()) {
+                        throw std::runtime_error(
+                            "FpgaDevice: boundary alias '" + src + "' -> '" + tgt +
+                            "' has no sized token in the loop body");
                     }
-                    device_->aliasBufferKey(tgt, src);
+                    deferredBufferAliases_.push_back(DeferredBufferAlias{
+                        src,
+                        tgt,
+                        tokIt->second,
+                        b->id});
                 }
                 // Boundaries emit no RP1 node and take no barrier bit: they are
                 // compile-time aliases, so a body kernel that "depends on" a
@@ -1886,6 +1911,8 @@ class FpgaDevicePlan : public IDevicePlan {
     std::vector<DeferredScalar>                                deferred_;
     std::vector<DeferredLoopTripCount>                         deferredTripCounts_;
     std::vector<DeferredPdi>                                   deferredPdis_;
+    std::vector<DeferredBufferAddress>                         deferredBufferAddresses_;
+    std::vector<DeferredBufferAlias>                           deferredBufferAliases_;
     std::shared_ptr<std::map<std::string, std::uint64_t>>      scalarValues_;
     std::uint32_t                                              sentinelSlot_;
     std::uint32_t                                              sentinelValue_;
@@ -2017,7 +2044,7 @@ FpgaDevice::BufferRecord FpgaDevice::ensureBufferByKey(const std::string& key,
     auto it = buffers_.find(key);
     if (it != buffers_.end() && it->second.capacity >= sizeBytes &&
         ((it->second.mem != nullptr) == deviceMode)) {
-        if (it->second.size < sizeBytes) it->second.size = sizeBytes;
+        it->second.size = sizeBytes;
         it->second.type = type;
         return it->second;
     }

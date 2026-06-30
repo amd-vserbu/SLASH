@@ -176,26 +176,36 @@ std::vector<std::int32_t> expectedOutput(std::uint32_t elementCount, std::uint32
 class CpuPreprocess : public CpuKernel {
    public:
     CpuPreprocess() : CpuKernel("cpu_preprocess") {}
+    
     IOTypeMap ioTypeMap() const override {
         return IOTypeMap{}.in<int32_t>("in").out<int32_t>("out");
     }
+
     void run(Args& args) override {
         auto in = args.in<int32_t>("in");
         auto out = args.out<int32_t>("out");
-        for (std::size_t i = 0; i < in.size(); ++i) out[i] = in[i] + 10;
+        
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            out[i] = in[i] + 10;
+        }
     }
 };
 
 class CpuStage : public CpuKernel {
    public:
     CpuStage() : CpuKernel("cpu_stage") {}
+    
     IOTypeMap ioTypeMap() const override {
         return IOTypeMap{}.in<int32_t>("in").out<int32_t>("out");
     }
+    
     void run(Args& args) override {
         auto in = args.in<int32_t>("in");
         auto out = args.out<int32_t>("out");
-        for (std::size_t i = 0; i < in.size(); ++i) out[i] = in[i] + 1;
+        
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            out[i] = in[i] + 1;
+        }
     }
 };
 
@@ -207,7 +217,10 @@ class CpuSparse : public CpuKernel {
     IOTypeMap ioTypeMap() const override { return IOTypeMap{}.inout<int32_t>("data"); }
     void run(Args& args) override {
         auto data = args.inout<int32_t>("data");
-        for (std::size_t i = 0; i < data.size(); i += 10) data[i] += 1;
+
+        for (std::size_t i = 0; i < data.size(); i += 10) {
+            data[i] += 1;
+        }
     }
 };
 
@@ -220,7 +233,10 @@ class CpuFinalize : public CpuKernel {
     void run(Args& args) override {
         auto in = args.in<int32_t>("in");
         auto out = args.out<int32_t>("out");
-        for (std::size_t i = 0; i < in.size(); ++i) out[i] = in[i] - 4;
+
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            out[i] = in[i] - 4;
+        }
     }
 };
 
@@ -233,6 +249,7 @@ class CpuParity : public CpuKernel {
     }
     void run(Args& args) override {
         auto in = args.in<int32_t>("in");
+
         args.setScalar("parity", static_cast<std::uint64_t>(in[0] & 1));
     }
 };
@@ -240,26 +257,36 @@ class CpuParity : public CpuKernel {
 class CpuReport : public CpuKernel {
    public:
     CpuReport() : CpuKernel("cpu_report") {}
+
     IOTypeMap ioTypeMap() const override {
         return IOTypeMap{}.in<int32_t>("in").out<int32_t>("out");
     }
+
     void run(Args& args) override {
         auto in = args.in<int32_t>("in");
         auto out = args.out<int32_t>("out");
-        for (std::size_t i = 0; i < in.size(); ++i) out[i] = in[i] + 100;
+
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            out[i] = in[i] + 100;
+        }
     }
 };
 
 class CpuReportOdd : public CpuKernel {
    public:
     CpuReportOdd() : CpuKernel("cpu_report_odd") {}
+
     IOTypeMap ioTypeMap() const override {
         return IOTypeMap{}.in<int32_t>("in").out<int32_t>("out");
     }
+
     void run(Args& args) override {
         auto in = args.in<int32_t>("in");
         auto out = args.out<int32_t>("out");
-        for (std::size_t i = 0; i < in.size(); ++i) out[i] = in[i] + 200;
+        
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            out[i] = in[i] + 200;
+        }
     }
 };
 
@@ -300,18 +327,19 @@ int main(int argc, char** argv) try {
                      .out<int32_t>("out");
 
     // 3. Author the graph.
-    GraphBuffer raw = graph.input<int32_t>("raw", cli.elementCount);
+    GraphScalar elements = graph.scalarInput<std::uint64_t>("elements");
+    GraphBuffer raw = graph.input<int32_t>("raw", elements);
     GraphScalar elementCount = graph.scalarInput<uint64_t>("elementCount");
     GraphScalar loopIterations = graph.scalarInput<std::uint32_t>("loopIterations");
 
-    GraphBuffer pre = graph.buffer<int32_t>("pre", cli.elementCount);
+    GraphBuffer pre = graph.buffer<int32_t>("pre", elements);
     graph.addKernelCall({
         .kernel  = preprocess,
         .inputs  = {{"in", raw}},
         .outputs = {{"out", pre}},
     });
 
-    GraphBuffer post = graph.buffer<int32_t>("post", cli.elementCount);
+    GraphBuffer post = graph.buffer<int32_t>("post", elements);
     {
         auto loop = graph.addLoop({
             .count   = loopIterations,
@@ -321,7 +349,7 @@ int main(int argc, char** argv) try {
 
         GraphBuffer s = loop.input("state");
 
-        GraphBuffer staged = loop.buffer<int32_t>("staged", cli.elementCount);
+        GraphBuffer staged = loop.buffer<int32_t>("staged", elements);
         loop.addKernelCall({
             .kernel  = stage,
             .inputs  = {{"in", s}},
@@ -335,7 +363,7 @@ int main(int argc, char** argv) try {
 
         // `.after = {rA}` orders this dispatch after the reprogram and binds it
         // to image A; compile() rejects the graph if fpgaA's image != rA's.
-        GraphBuffer afterA = loop.buffer<int32_t>("afterA", cli.elementCount);
+        GraphBuffer afterA = loop.buffer<int32_t>("afterA", elements);
         loop.addKernelCall({
             .kernel       = fpgaA,
             .inputScalars = {{"n", elementCount}},
@@ -346,7 +374,7 @@ int main(int argc, char** argv) try {
 
         // cpu_sparse mutates afterA in place, producing `bumped`; afterA is dead
         // afterward.
-        GraphBuffer bumped = loop.buffer<int32_t>("bumped", cli.elementCount);
+        GraphBuffer bumped = loop.buffer<int32_t>("bumped", elements);
         loop.addKernelCall({
             .kernel = sparse,
             .inouts = {{"data", afterA, bumped}},
@@ -359,7 +387,7 @@ int main(int argc, char** argv) try {
             .after = {rA},
         });
 
-        GraphBuffer afterB = loop.buffer<int32_t>("afterB", cli.elementCount);
+        GraphBuffer afterB = loop.buffer<int32_t>("afterB", elements);
         loop.addKernelCall({
             .kernel       = fpgaB,
             .inputScalars = {{"n", elementCount}},
@@ -384,7 +412,7 @@ int main(int argc, char** argv) try {
         .outputScalars = {{"parity", parity}},
     });
 
-    GraphBuffer out = graph.buffer<int32_t>("out", cli.elementCount);
+    GraphBuffer out = graph.buffer<int32_t>("out", elements);
     {
         auto [thenBranch, elseBranch] = graph.addConditional({
             .condition = (parity == 0),       // even -> then (+100), odd -> else (+200)
@@ -415,6 +443,7 @@ int main(int argc, char** argv) try {
               << cli.iterations << " loop iteration(s), "
               << cli.elementCount << " element(s)" << std::endl;
     auto exec = graph.compile();
+    exec.setScalar(elements, static_cast<std::uint64_t>(cli.elementCount));
     exec.setScalar(elementCount, static_cast<std::uint64_t>(cli.elementCount));
     exec.setScalar(loopIterations, cli.iterations);
     exec.write(raw, input);

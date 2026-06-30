@@ -38,6 +38,7 @@
 
 #include <atomic>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -106,7 +107,25 @@ class IOMap {
             throw std::invalid_argument("bindOutput: port '" + portName + "' already bound");
         }
         std::string tokenName = nextTokenName(portName);
-        out = GraphBuffer::make(type, tokenName, scopeId);
+        std::optional<GraphScalar> size;
+        if (!inputs_.empty()) {
+            size = inputs_.begin()->second.maybeSizeScalar();
+        }
+        out = GraphBuffer::make(type, tokenName, scopeId, std::move(size));
+        outputs_.emplace(std::move(portName), out);
+        return *this;
+    }
+
+    /**
+     * @brief Bind an output buffer port with an explicit symbolic size.
+     */
+    IOMap& bindOutput(std::string portName, BufferType type, GraphBuffer& out,
+                      GraphScalar size, uint64_t scopeId = 0) {
+        if (outputs_.count(portName)) {
+            throw std::invalid_argument("bindOutput: port '" + portName + "' already bound");
+        }
+        std::string tokenName = nextTokenName(portName);
+        out = GraphBuffer::make(type, tokenName, scopeId, std::move(size));
         outputs_.emplace(std::move(portName), out);
         return *this;
     }
@@ -190,7 +209,8 @@ class IOMap {
             }
         }
         std::string tokenName = nextTokenName(outPortName);
-        out = GraphBuffer::make(in.type(), tokenName, scopeId);
+        out = GraphBuffer::make(in.type(), tokenName, scopeId,
+                                in.maybeSizeScalar());
         inouts_.emplace_back(InoutBinding{std::move(inPortName), std::move(outPortName),
                                           std::move(in), out});
         return *this;

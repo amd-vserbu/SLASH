@@ -530,6 +530,139 @@ void validateRootScopeBufferReferences(const GraphRegion& rootRegion) {
     walk(rootRegion);
 }
 
+void validateSizeScalarReferences(const GraphRegion& rootRegion) {
+    const auto& declaredInputScalars = rootRegion.declaredInputScalars();
+    std::set<std::string> sizeScalarKeys;
+
+    auto requireValidSizeScalar = [&](const GraphScalar& scalar,
+                                      const std::string& context) {
+        if (scalar.scopeId() != rootRegion.scopeId()) {
+            throw std::runtime_error(
+                "GraphCompiler: " + context + " size scalar '" +
+                scalar.varName() + "' is not root-scope");
+        }
+        auto it = declaredInputScalars.find(scalar.varName());
+        if (it == declaredInputScalars.end()) {
+            throw std::runtime_error(
+                "GraphCompiler: " + context + " size scalar '" +
+                scalar.varName() + "' is not a graph input scalar");
+        }
+        if (it->second != ScalarType::U64) {
+            throw std::runtime_error(
+                "GraphCompiler: " + context + " size scalar '" +
+                scalar.varName() + "' must be U64");
+        }
+        sizeScalarKeys.insert(scopedScalarKey(scalar.scopeId(), scalar.varName()));
+    };
+
+    auto checkBuffer = [&](const GraphBuffer& buffer,
+                           const std::string& context,
+                           bool aliasEdge) {
+        if (!buffer.valid()) return;
+        if (!buffer.hasSizeScalar()) {
+            if (aliasEdge) return;
+            throw std::runtime_error(
+                "GraphCompiler: " + context + " buffer '" + buffer.name() +
+                "' has no size scalar");
+        }
+        requireValidSizeScalar(buffer.sizeScalar(), context);
+    };
+
+    auto checkIoMap = [&](const IOMap& ioMap, const std::string& opId) {
+        for (const auto& [port, buffer] : ioMap.inputs()) {
+            checkBuffer(buffer, "op '" + opId + "' input port '" + port + "'", false);
+        }
+        for (const auto& [port, buffer] : ioMap.outputs()) {
+            checkBuffer(buffer, "op '" + opId + "' output port '" + port + "'", false);
+        }
+        for (const auto& rw : ioMap.inouts()) {
+            checkBuffer(rw.in, "op '" + opId + "' RW input port '" + rw.inPort + "'", false);
+            checkBuffer(rw.out, "op '" + opId + "' RW output port '" + rw.outPort + "'", false);
+        }
+    };
+
+    std::function<void(const GraphRegion&)> walk = [&](const GraphRegion& region) {
+        for (const RegionOp& op : region.ops()) {
+            std::visit(
+                [&](const auto& concrete) {
+                    using T = std::decay_t<decltype(concrete)>;
+                    checkIoMap(concrete.ioMap, concrete.id);
+                    if constexpr (std::is_same_v<T, SubgraphBoundaryOp>) {
+                        for (const auto& mapping : concrete.bufferMappings) {
+                            const bool sourceSized = mapping.source.hasSizeScalar();
+                            const bool targetSized = mapping.target.hasSizeScalar();
+                            if (!sourceSized && !targetSized) {
+                                throw std::runtime_error(
+                                    "GraphCompiler: boundary op '" + concrete.id +
+                                    "' buffer mapping '" + mapping.source.name() + "' -> '" +
+                                    mapping.target.name() +
+                                    "' has no size scalar on either side");
+                            }
+                            checkBuffer(mapping.source,
+                                        "boundary op '" + concrete.id + "' source",
+                                        true);
+                            checkBuffer(mapping.target,
+                                        "boundary op '" + concrete.id + "' target",
+                                        true);
+                        }
+                    } else if constexpr (std::is_same_v<T, LoopOp>) {
+                        if (concrete.body) walk(*concrete.body);
+                    } else if constexpr (std::is_same_v<T, ConditionalOp>) {
+                        if (concrete.thenRegion) walk(*concrete.thenRegion);
+                        if (concrete.elseRegion) walk(*concrete.elseRegion);
+                    }
+                },
+                op);
+        }
+    };
+
+    walk(rootRegion);
+
+    std::function<void(const GraphRegion&)> rejectProducedSizeScalars =
+        [&](const GraphRegion& region) {
+            for (const RegionOp& op : region.ops()) {
+                std::visit(
+                    [&](const auto& concrete) {
+                        using T = std::decay_t<decltype(concrete)>;
+                        for (const auto& [port, scalar] : concrete.ioMap.outputScalars()) {
+                            (void)port;
+                            const std::string key =
+                                scopedScalarKey(scalar.scopeId(), scalar.varName());
+                            if (sizeScalarKeys.count(key)) {
+                                throw std::runtime_error(
+                                    "GraphCompiler: size scalar '" + scalar.varName() +
+                                    "' is produced by op '" + concrete.id + "'");
+                            }
+                        }
+                        if constexpr (std::is_same_v<T, SubgraphBoundaryOp>) {
+                            for (const auto& mapping : concrete.scalarMappings) {
+                                const std::string key = scopedScalarKey(
+                                    mapping.target.scopeId(), mapping.target.varName());
+                                if (sizeScalarKeys.count(key)) {
+                                    throw std::runtime_error(
+                                        "GraphCompiler: size scalar '" +
+                                        mapping.target.varName() +
+                                        "' is produced by boundary op '" +
+                                        concrete.id + "'");
+                                }
+                            }
+                        } else if constexpr (std::is_same_v<T, LoopOp>) {
+                            if (concrete.body) rejectProducedSizeScalars(*concrete.body);
+                        } else if constexpr (std::is_same_v<T, ConditionalOp>) {
+                            if (concrete.thenRegion) {
+                                rejectProducedSizeScalars(*concrete.thenRegion);
+                            }
+                            if (concrete.elseRegion) {
+                                rejectProducedSizeScalars(*concrete.elseRegion);
+                            }
+                        }
+                    },
+                    op);
+            }
+        };
+    rejectProducedSizeScalars(rootRegion);
+}
+
 // ---- RegionOp accessors -------------------------------------------------
 //
 // regionOpId() lives in control_node.hpp; the per-field accessors below are
@@ -2310,7 +2443,9 @@ class RegionCompiler {
     RegionCompiler(const std::map<std::string, std::shared_ptr<IDevice>>& devices,
                    const GraphCompiler::BridgeFor& bridgeFor,
                    std::shared_ptr<std::map<std::string, uint64_t>> scalarValues)
-        : devices_(devices), bridgeFor_(bridgeFor), scalarValues_(std::move(scalarValues)) {
+        : devices_(devices),
+          bridgeFor_(bridgeFor),
+          scalarValues_(std::move(scalarValues)) {
         rendezvousSlots_.reserve(RP1_MAX_SIGNALS - 1u);  // FPGA sentinel slot
     }
 
@@ -3869,6 +4004,7 @@ std::vector<DGraph> GraphCompiler::compile(
         }
     }
     validateRegionScopes(rootRegion, rootProducedScalars);
+    validateSizeScalarReferences(rootRegion);
     validateRootScopeScalarReferences(rootRegion);
     validateRootScopeBufferReferences(rootRegion);
     RegionCompiler compiler(devices, bridgeFor, scalarValues);

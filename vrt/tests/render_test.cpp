@@ -76,6 +76,7 @@ class CopyKernel : public CpuKernel {
 struct ChainGraph {
     Graph                       g;
     std::shared_ptr<CpuDevice>  cpu;
+    GraphScalar                 size = GraphScalar::ref(ScalarType::U64, "__unset_size");
     std::string                 nodeA, nodeB, nodeC;
 };
 
@@ -92,7 +93,8 @@ ChainGraph buildChain() {
     c.cpu->registerKernel(std::make_shared<CopyKernel>("kC", io));
     c.g.registerDevice(c.cpu);
 
-    GraphBuffer raw = c.g.inputBuffer(BufferType::U8, "raw");
+    c.size = c.g.scalarInput<std::uint64_t>("elements");
+    GraphBuffer raw = c.g.inputBuffer(BufferType::U8, "raw", c.size);
 
     GraphBuffer outA, outB, outC;
 
@@ -389,6 +391,7 @@ TEST(RenderDotTest, DGraphRendersAfterCompile) {
     std::vector<uint8_t> data(16, 0xAB);
     c.cpu->setInputBuffer("raw", data.data(), data.size());
     auto exec = c.g.compile();
+    exec.setScalar(c.size, static_cast<std::uint64_t>(data.size()));
     exec.run();
 
     ASSERT_FALSE(exec.dgraphs().empty());
@@ -542,6 +545,7 @@ TEST(RenderDotTest, WriteToDotFileWritesGraphAndDGraph) {
     std::vector<uint8_t> data(8, 0xCD);
     c.cpu->setInputBuffer("raw", data.data(), data.size());
     auto exec = c.g.compile();
+    exec.setScalar(c.size, static_cast<std::uint64_t>(data.size()));
     exec.run();
 
     char gpath[]  = "/tmp/vrt_render_test_graph_XXXXXX.dot";

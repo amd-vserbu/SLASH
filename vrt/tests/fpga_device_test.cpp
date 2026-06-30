@@ -544,7 +544,8 @@ TEST_F(FpgaDeviceFixture, CpuToFpgaBufferEdgeCopiesIntoFpgaStore) {
     auto dev = std::make_shared<FpgaDevice>("fpga:0", window_, makeDiamondLookup());
     g.registerDevice(dev);
 
-    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
+    GraphScalar elements = g.scalarInput<std::uint64_t>("elements");
+    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw", elements);
     IOTypeMap cpuIo;
     cpuIo.inputs.push_back({"in", BufferType::I32});
     cpuIo.outputs.push_back({"out", BufferType::I32});
@@ -566,6 +567,7 @@ TEST_F(FpgaDeviceFixture, CpuToFpgaBufferEdgeCopiesIntoFpgaStore) {
     g.cpuDevice()->setInputBuffer("raw", input.data(), input.size() * sizeof(input[0]));
 
     auto debugExec = g.compile();
+    debugExec.setScalar(elements, static_cast<std::uint64_t>(input.size()));
     for (const DGraph& dg : debugExec.dgraphs()) {
         std::cerr << "DEBUG DG " << dg.deviceId << "\n";
         for (const auto& node : dg.nodes) {
@@ -588,7 +590,8 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     g.cpuDevice()->registerKernel(std::make_shared<CopyKernel>());
     g.registerDevice(dev);
 
-    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw");
+    GraphScalar elements = g.scalarInput<std::uint64_t>("elements");
+    GraphBuffer raw = g.inputBuffer(BufferType::I32, "raw", elements);
 
     IOTypeMap cpuIo;
     cpuIo.inputs.push_back({"in", BufferType::I32});
@@ -596,7 +599,7 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     KernelDescriptor cpu{"copy", DeviceType::CPU, std::nullopt, cpuIo};
 
     IOMap cpuProduceIo;
-    GraphBuffer toFpga = g.buffer<std::int32_t>("toFpga", 4);
+    GraphBuffer toFpga = g.buffer<std::int32_t>("toFpga", elements);
     cpuProduceIo.bindInput("in", raw)
                 .bindExistingOutput("out", toFpga);
     const std::string cpuProducer = g.addNode(cpu, std::move(cpuProduceIo), "cpu");
@@ -608,7 +611,7 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     GraphScalar copyBytes = g.scalarInput<std::uint32_t>("copy_bytes");
 
     IOMap fpgaCopyIo;
-    GraphBuffer fromFpga = g.buffer<std::int32_t>("fromFpga", 4);
+    GraphBuffer fromFpga = g.buffer<std::int32_t>("fromFpga", elements);
     constexpr std::uint32_t kBytes = 4u * sizeof(std::int32_t);
     fpgaCopyIo.bindInputScalar("bytes", copyBytes)
               .bindInput("in", toFpga)
@@ -616,7 +619,7 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     g.addNode(fpgaKernel("kA", fpgaIo), std::move(fpgaCopyIo), "fpga:0", {cpuProducer});
 
     IOMap cpuConsumeIo;
-    GraphBuffer finalOut = g.buffer<std::int32_t>("finalOut", 4);
+    GraphBuffer finalOut = g.buffer<std::int32_t>("finalOut", elements);
     cpuConsumeIo.bindInput("in", fromFpga)
                 .bindExistingOutput("out", finalOut);
     g.addNode(cpu, std::move(cpuConsumeIo), "cpu");
@@ -625,6 +628,7 @@ TEST_F(FpgaDeviceFixture, CpuFpgaCpuBufferRoundTripUsesPackedBufferPointers) {
     g.cpuDevice()->setInputBuffer("raw", input.data(), input.size() * sizeof(input[0]));
 
     auto exec = g.compile();
+    exec.setScalar(elements, static_cast<std::uint64_t>(input.size()));
     exec.setScalar(copyBytes, kBytes);
     std::vector<std::int32_t> output(input.size(), 0);
     for (int attempt = 0; attempt < 3; ++attempt) {
@@ -1003,6 +1007,8 @@ TEST_F(FpgaDeviceFixture, NonContiguousSystemMapOffsetsAreHonored) {
     dg.deviceId = "fpga:0";
     dg.device   = dev;
     dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    GraphScalar elements = GraphScalar::ref(ScalarType::U64, "elements");
+    (*dg.scalarValues)[scopedScalarKey(elements.scopeId(), elements.varName())] = 4;
     (*dg.scalarValues)[scopedScalarKey(0, "n")] = 0x1122'3344'5566'7788ull;
 
     CompiledKernelNode node;
@@ -1013,7 +1019,7 @@ TEST_F(FpgaDeviceFixture, NonContiguousSystemMapOffsetsAreHonored) {
     GraphBuffer outTok;
     node.ioMap
         .bindInputScalar("n", GraphScalar::ref(ScalarType::U64, "n"))
-        .bindInput("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
+        .bindInput("in", GraphBuffer::make(BufferType::I32, "inBuf", 0, elements))
         .bindOutput("out", BufferType::I32, outTok);
     dg.nodes.push_back(std::move(node));
 
@@ -1087,6 +1093,8 @@ TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
     dg.deviceId = "fpga:0";
     dg.device   = dev;
     dg.scalarValues = std::make_shared<std::map<std::string, std::uint64_t>>();
+    GraphScalar elements = GraphScalar::ref(ScalarType::U64, "elements");
+    (*dg.scalarValues)[scopedScalarKey(elements.scopeId(), elements.varName())] = 4;
     (*dg.scalarValues)[scopedScalarKey(0, "n")] = 0x1122'3344'5566'7788ull;
 
     // Descriptor renames the buffer ports, as the real example does.
@@ -1103,7 +1111,7 @@ TEST_F(FpgaDeviceFixture, RenamedDescriptorPortsResolveToSystemMapArgs) {
     GraphBuffer outTok;
     node.ioMap
         .bindInputScalar("n", GraphScalar::ref(ScalarType::U64, "n"))
-        .bindInput("in", GraphBuffer::make(BufferType::I32, "inBuf", 0))
+        .bindInput("in", GraphBuffer::make(BufferType::I32, "inBuf", 0, elements))
         .bindOutput("image_out", BufferType::I32, outTok);
     dg.nodes.push_back(std::move(node));
 

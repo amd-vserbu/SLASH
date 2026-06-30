@@ -120,6 +120,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -412,6 +413,12 @@ class Graph {
         return token;
     }
 
+    GraphBuffer inputBuffer(BufferType type, std::string name, GraphScalar size) {
+        GraphBuffer token = rootRegion_->inputBuffer(type, std::move(name),
+                                                     std::move(size));
+        return token;
+    }
+
     /**
      * @brief Add a kernel node to the graph.
      *
@@ -470,9 +477,9 @@ class Graph {
      * @brief Declare a graph-level typed input buffer token.
      */
     template <class T>
-    GraphBuffer input(std::string name, std::size_t count) {
+    GraphBuffer input(std::string name, GraphScalar size) {
         GraphBuffer token = rootRegion_->inputBuffer(typeToBufferType<T>(), std::move(name),
-                                                      count);
+                                                      std::move(size));
         return token;
     }
 
@@ -480,9 +487,9 @@ class Graph {
      * @brief Mint a typed, single-assignment buffer token at root scope.
      */
     template <class T>
-    GraphBuffer buffer(std::string name, std::size_t count) {
+    GraphBuffer buffer(std::string name, GraphScalar size) {
         return GraphBuffer::make(typeToBufferType<T>(), std::move(name),
-                                 rootRegion_->scopeId(), count);
+                                 rootRegion_->scopeId(), std::move(size));
     }
 
     /**
@@ -490,7 +497,7 @@ class Graph {
      */
     template <class T>
     GraphScalar scalarInput(std::string name) {
-        return globalScalar(typeToScalarType<T>(), std::move(name));
+        return rootRegion_->inputScalar(typeToScalarType<T>(), std::move(name));
     }
 
     /**
@@ -569,7 +576,8 @@ class Graph {
             bridgePinList.push_back(std::move(bridge));
         }
         return CompiledGraph(std::move(dgraphs), std::move(snapshotScalars),
-                             rootRegion_->declaredScalars(), std::move(bridgePinList));
+                             rootRegion_->declaredScalars(),
+                             std::move(bridgePinList));
     }
 
    private:

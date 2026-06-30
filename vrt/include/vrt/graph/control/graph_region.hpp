@@ -56,12 +56,18 @@ class GraphRegion : public std::enable_shared_from_this<GraphRegion> {
     uint64_t scopeId() const { return scopeId_; }
     uint64_t parentScopeId() const { return parentScopeId_; }
 
-    GraphBuffer inputBuffer(BufferType type, std::string name, std::size_t count = 0) {
+    GraphBuffer inputBuffer(BufferType type, std::string name,
+                            std::optional<GraphScalar> size = std::nullopt) {
         if (bufferNames_.count(name)) {
             throw std::invalid_argument("GraphRegion::inputBuffer: name '" + name + "' already used");
         }
         bufferNames_.insert(name);
-        return GraphBuffer::make(type, std::move(name), scopeId_, count);
+        return GraphBuffer::make(type, std::move(name), scopeId_, std::move(size));
+    }
+
+    GraphBuffer inputBuffer(BufferType type, std::string name, GraphScalar size) {
+        return inputBuffer(type, std::move(name),
+                           std::optional<GraphScalar>(std::move(size)));
     }
 
     GraphScalar scalar(ScalarType type, std::string name) {
@@ -69,6 +75,16 @@ class GraphRegion : public std::enable_shared_from_this<GraphRegion> {
             throw std::invalid_argument("GraphRegion::scalar: name '" + name + "' already used");
         }
         scalarTypes_.emplace(name, type);
+        return GraphScalar::ref(type, std::move(name), scopeId_);
+    }
+
+    GraphScalar inputScalar(ScalarType type, std::string name) {
+        if (scalarTypes_.count(name)) {
+            throw std::invalid_argument(
+                "GraphRegion::inputScalar: name '" + name + "' already used");
+        }
+        scalarTypes_.emplace(name, type);
+        inputScalarTypes_.emplace(name, type);
         return GraphScalar::ref(type, std::move(name), scopeId_);
     }
 
@@ -235,6 +251,10 @@ class GraphRegion : public std::enable_shared_from_this<GraphRegion> {
      */
     const std::map<std::string, ScalarType>& declaredScalars() const { return scalarTypes_; }
 
+    const std::map<std::string, ScalarType>& declaredInputScalars() const {
+        return inputScalarTypes_;
+    }
+
     /**
      * @brief Returns the declared element type of @p name on this region, or
      *        std::nullopt if the name was never registered via scalar().
@@ -296,6 +316,7 @@ class GraphRegion : public std::enable_shared_from_this<GraphRegion> {
     uint32_t opCounter_ = 0;
     std::set<std::string> bufferNames_;
     std::map<std::string, ScalarType> scalarTypes_;
+    std::map<std::string, ScalarType> inputScalarTypes_;
     std::set<std::string> opIds_;
     std::vector<RegionOp> ops_;
 };

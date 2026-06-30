@@ -46,6 +46,7 @@
 #ifndef VRT_GRAPH_COMPILER_HPP
 #define VRT_GRAPH_COMPILER_HPP
 
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <functional>

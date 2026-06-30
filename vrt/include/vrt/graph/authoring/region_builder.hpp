@@ -73,9 +73,9 @@ class RegionBuilder {
 
     /** @brief Mint a fresh typed buffer token in this region's scope. */
     template <class T>
-    GraphBuffer buffer(std::string name, std::size_t count = 0) {
+    GraphBuffer buffer(std::string name, GraphScalar size) {
         return GraphBuffer::make(typeToBufferType<T>(), std::move(name), region_->scopeId(),
-                                 count);
+                                 std::move(size));
     }
 
     /** @brief Per-iteration / per-branch input token bound to a named port. */
@@ -170,7 +170,8 @@ inline RegionBuilder RegionBuilder::addLoop(const LoopBuildSpec& spec) {
     for (const auto& in : spec.inputs) {
         GraphBuffer localIn = GraphBuffer::make(in.buffer.type(),
                                                 detail::nextInternalToken("loop_in_" + in.port),
-                                                body->scopeId(), in.buffer.count());
+                                                body->scopeId(),
+                                                in.buffer.maybeSizeScalar());
         imports.push_back({in.buffer, localIn});
         loop.inputs_[in.port] = localIn;
     }
@@ -178,7 +179,8 @@ inline RegionBuilder RegionBuilder::addLoop(const LoopBuildSpec& spec) {
     for (const auto& out : spec.outputs) {
         GraphBuffer localOut = GraphBuffer::make(out.buffer.type(),
                                                  detail::nextInternalToken("loop_out_" + out.port),
-                                                 body->scopeId(), out.buffer.count());
+                                                 body->scopeId(),
+                                                 out.buffer.maybeSizeScalar());
         loop.outputs_[out.port] = localOut;
         // Publish the produced value to the parent output token.
         exports.push_back({localOut, out.buffer});
@@ -218,7 +220,8 @@ inline std::pair<RegionBuilder, RegionBuilder> RegionBuilder::addConditional(
         for (const auto& in : spec.inputs) {
             GraphBuffer local = GraphBuffer::make(in.buffer.type(),
                                                   detail::nextInternalToken("if_in_" + in.port),
-                                                  branch->scopeId(), in.buffer.count());
+                                                  branch->scopeId(),
+                                                  in.buffer.maybeSizeScalar());
             imports.push_back({in.buffer, local});
             builder.inputs_[in.port] = local;
         }
@@ -230,7 +233,8 @@ inline std::pair<RegionBuilder, RegionBuilder> RegionBuilder::addConditional(
         for (const auto& out : spec.outputs) {
             GraphBuffer local = GraphBuffer::make(out.buffer.type(),
                                                   detail::nextInternalToken("if_out_" + out.port),
-                                                  branch->scopeId(), out.buffer.count());
+                                                  branch->scopeId(),
+                                                  out.buffer.maybeSizeScalar());
             builder.outputs_[out.port] = local;
             exports.push_back({local, out.buffer});
         }

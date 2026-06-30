@@ -34,6 +34,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -75,6 +76,7 @@ class CompiledGraph {
         for (const auto& [name, type] : scalarTypes_) {
             scopedScalarTypes_[scopedScalarKey(rootScopeId_, name)] = type;
         }
+        collectSizeScalarKeys();
         plans_.reserve(dgraphs_.size());
         for (const auto& dg : dgraphs_) {
             plans_.push_back(dg.device->compilePlan(dg));
@@ -172,6 +174,7 @@ class CompiledGraph {
     }
 
     void write(const GraphBuffer& token, const void* data, std::size_t bytes) {
+        validateBufferByteCount(token, bytes, "CompiledGraph::write");
         if (bytes > 0 && data == nullptr) {
             throw std::invalid_argument("CompiledGraph::write: data must not be null");
         }
@@ -196,6 +199,7 @@ class CompiledGraph {
     }
 
     void read(const GraphBuffer& token, void* data, std::size_t bytes) const {
+        validateBufferByteCount(token, bytes, "CompiledGraph::read");
         if (bytes > 0 && data == nullptr) {
             throw std::invalid_argument("CompiledGraph::read: data must not be null");
         }
@@ -219,6 +223,7 @@ class CompiledGraph {
      * @brief Start asynchronous execution on every top-level device plan.
      */
     void launch() {
+        requireAllSizesSet();
         for (auto& plan : plans_) {
             plan->prepareLaunch();
         }
@@ -245,6 +250,38 @@ class CompiledGraph {
     }
 
    private:
+    void requireAllSizesSet() const {
+        std::vector<std::string> missing;
+        for (const auto& [key, name] : sizeScalarKeys_) {
+            if (scalarValues_->find(key) == scalarValues_->end()) {
+                missing.push_back(name);
+            }
+        }
+        if (missing.empty()) return;
+        std::ostringstream msg;
+        msg << "CompiledGraph::launch: unset size scalar";
+        if (missing.size() != 1) msg << "s";
+        msg << ": ";
+        for (std::size_t i = 0; i < missing.size(); ++i) {
+            if (i != 0) msg << ", ";
+            msg << missing[i];
+        }
+        throw std::runtime_error(msg.str());
+    }
+
+    void validateBufferByteCount(const GraphBuffer& token,
+                                 std::size_t bytes,
+                                 const char* method) const {
+        const std::size_t expected =
+            resolvedBufferSizeBytes(token, scalarValues_, method);
+        if (bytes != expected) {
+            throw std::invalid_argument(
+                std::string(method) + ": buffer '" + token.name() +
+                "' expects " + std::to_string(expected) +
+                " byte(s), got " + std::to_string(bytes));
+        }
+    }
+
     void requireScalar(const std::string& name, const char* method) const {
         if (scalarTypes_.find(name) == scalarTypes_.end()) {
             throw std::out_of_range(
@@ -369,10 +406,49 @@ class CompiledGraph {
 
     static constexpr uint64_t rootScopeId_ = 0;
 
+    static void noteSizeScalar(const GraphBuffer& buffer,
+                               std::map<std::string, std::string>& out) {
+        if (!buffer.valid() || !buffer.hasSizeScalar()) return;
+        const GraphScalar& scalar = buffer.sizeScalar();
+        out[scopedScalarKey(scalar.scopeId(), scalar.varName())] = scalar.varName();
+    }
+
+    static void collectSizeScalarKeys(const DGraph& dg,
+                                      std::map<std::string, std::string>& out) {
+        for (const CompiledNode& node : dg.nodes) {
+            if (const auto* kernel = std::get_if<CompiledKernelNode>(&node)) {
+                for (const auto& [port, buffer] : kernel->ioMap.inputs()) {
+                    (void)port;
+                    noteSizeScalar(buffer, out);
+                }
+                for (const auto& [port, buffer] : kernel->ioMap.outputs()) {
+                    (void)port;
+                    noteSizeScalar(buffer, out);
+                }
+                for (const auto& rw : kernel->ioMap.inouts()) {
+                    noteSizeScalar(rw.in, out);
+                    noteSizeScalar(rw.out, out);
+                }
+            }
+        }
+        for (const DGraphChild& child : dg.childDGraphs) {
+            for (const auto& childDg : child.dgraphs) {
+                if (childDg) collectSizeScalarKeys(*childDg, out);
+            }
+        }
+    }
+
+    void collectSizeScalarKeys() {
+        for (const DGraph& dg : dgraphs_) {
+            collectSizeScalarKeys(dg, sizeScalarKeys_);
+        }
+    }
+
     std::vector<DGraph>                       dgraphs_;
     std::shared_ptr<std::map<std::string, uint64_t>> scalarValues_;
     std::map<std::string, ScalarType>         scalarTypes_;
     std::map<std::string, ScalarType>         scopedScalarTypes_;
+    std::map<std::string, std::string>        sizeScalarKeys_;
     std::vector<std::shared_ptr<IBridge>>     bridgePins_;
     std::vector<std::unique_ptr<IDevicePlan>> plans_;
 };
