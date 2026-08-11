@@ -48,10 +48,11 @@ loaded into a running kernel.
 ## Local libqdma patches
 
 SLASH carries small patches for the pinned `libqdma` submodule under
-`driver/patches/`. The driver `Makefile` applies them before building, and
-`make clean` attempts to revert them so the submodule working copy returns to
-its pristine pinned state. DKMS packages include the same patch directory and
-depend on `patch(1)`.
+`driver/patches/`. In-tree builds stage the vendor sources under
+`driver/build/libqdma`, apply the patches there, and remove the staged copy on
+`make clean`, leaving the submodule pristine. DKMS builds patch their packaged
+`libqdma` copy in place and attempt to revert it on clean. Both paths depend on
+`patch(1)`.
 
 ### Prerequisites
 
