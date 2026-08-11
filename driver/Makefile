@@ -31,22 +31,24 @@ ifeq ($(SLASH_VERSION),)
 SLASH_VERSION := unknown
 endif
 
-# This exists when installed for dkms
+# DKMS packages libqdma beside this Makefile.
 LIBQDMA_LOCAL_DIR := ./libqdma
-# This exists when building from tree
-LIBQDMA_FALLBACK  := ../submodules/qdma_drv/QDMA/linux-kernel/driver/libqdma
+# In-tree builds copy the read-only vendor sources here before compiling.
+LIBQDMA_VENDOR_DIR := ../submodules/qdma_drv/QDMA/linux-kernel/driver/libqdma
+LIBQDMA_STAGE_DIR  := build/libqdma
+# Kbuild sets src when it parses this file; direct make invocations do not.
+LIBQDMA_DRIVER_DIR := $(if $(src),$(src),$(PWD))
 
-ifneq (,$(wildcard $(src)/$(LIBQDMA_LOCAL_DIR)/.))
+ifneq (,$(wildcard $(LIBQDMA_DRIVER_DIR)/$(LIBQDMA_LOCAL_DIR)/.))
   LIBQDMA_PATH := $(LIBQDMA_LOCAL_DIR)
 else
-  LIBQDMA_PATH := $(LIBQDMA_FALLBACK)
+  LIBQDMA_PATH := $(LIBQDMA_STAGE_DIR)
 endif
 
 # SLASH carries a few local modifications to the pinned QDMA submodule's
-# libqdma sources (see $(LIBQDMA_PATCH_DIR)/). The submodule itself stays
-# pristine; the patches are applied to whichever libqdma tree is being built
-# (the DKMS-local ./libqdma or the in-tree submodule) by the libqdma-patches
-# target before the module is compiled. See that target for details.
+# libqdma sources (see $(LIBQDMA_PATCH_DIR)/). In-tree builds stage the vendor
+# sources under driver/build/ so patches and Kbuild outputs never dirty the
+# submodule. DKMS builds patch their packaged ./libqdma copy in place.
 LIBQDMA_PATCH_DIR := patches
 
 SLASH_QDMA_OP_DEBUG ?= 0
@@ -168,29 +170,35 @@ all: libqdma-patches
 	echo "slash: kcompat: $$flags"; \
 	$(MAKE) -C "$(KDIR)" M="$(PWD)" $$flags modules
 
+# Mirror vendor sources into the ignored build directory. Keep newer patched
+# files and Kbuild outputs intact across incremental builds.
+prepare-libqdma:
+	@set -e; \
+	if [ -d "$(PWD)/$(LIBQDMA_LOCAL_DIR)" ]; then exit 0; fi; \
+	src="$(PWD)/$(LIBQDMA_VENDOR_DIR)"; \
+	dst="$(PWD)/$(LIBQDMA_STAGE_DIR)"; \
+	mkdir -p "$$dst"; \
+	rsync -ac --delete --update \
+		--exclude='*.o' --exclude='.*.cmd' --exclude='.*.d' \
+		"$$src/" "$$dst/"
+
 # Apply SLASH's local libqdma patches ($(LIBQDMA_PATCH_DIR)/*.patch) to the
 # libqdma source tree in use, in filename order, right before building.
 #
-# The pinned submodule is not edited directly by commits: patches live in-tree
-# and are stamped onto the working copy here. Application is idempotent — each patch is first tested
-# for being already applied (reverse dry-run) and skipped if so — so repeated
-# `make` runs, incremental builds, and DKMS rebuilds are all safe. A patch that
-# neither applies cleanly nor is already present aborts the build.
+# Application is idempotent: each patch is first tested for being already
+# applied and skipped if so. A patch that neither applies cleanly nor is
+# already present aborts the build.
 #
 # $(PWD) is the driver dir for both `make` (in-tree) and DKMS (MAKE[0] runs
-# `make -C driver ...`); ./libqdma is the DKMS-packaged copy, otherwise fall
-# back to the in-tree submodule path. Uses patch(1) so it is independent of
-# whether the libqdma tree lives inside a git checkout.
-libqdma-patches:
+# `make -C driver ...`). Uses patch(1) so DKMS does not need a git checkout.
+libqdma-patches: prepare-libqdma
 	@set -e; \
 	patch_dir="$(PWD)/$(LIBQDMA_PATCH_DIR)"; \
 	set -- "$$patch_dir"/*.patch; \
 	if [ ! -e "$$1" ]; then exit 0; fi; \
-	if [ -d "$(PWD)/libqdma" ]; then lq="$(PWD)/libqdma"; \
-	else lq="$(PWD)/$(LIBQDMA_FALLBACK)"; fi; \
+	lq="$(PWD)/$(LIBQDMA_PATH)"; \
 	if [ ! -d "$$lq" ]; then \
 		echo "slash: ERROR libqdma sources not found at $$lq" >&2; \
-		echo "slash:       run 'git submodule update --init --recursive' first" >&2; \
 		exit 1; \
 	fi; \
 	command -v patch >/dev/null 2>&1 || { \
@@ -210,16 +218,15 @@ libqdma-patches:
 		fi; \
 	done
 
-# Best-effort revert of the libqdma patches, restoring the submodule working
-# copy to pristine. Useful when editing the patches themselves. Never fails the
-# build: patches that are not currently applied are simply skipped.
+# Best-effort revert of the libqdma patches from the active build copy. Useful
+# when editing the patches themselves. Patches not currently applied are
+# skipped.
 unpatch-libqdma:
 	@set -e; \
 	patch_dir="$(PWD)/$(LIBQDMA_PATCH_DIR)"; \
 	set -- "$$patch_dir"/*.patch; \
 	if [ ! -e "$$1" ]; then exit 0; fi; \
-	if [ -d "$(PWD)/libqdma" ]; then lq="$(PWD)/libqdma"; \
-	else lq="$(PWD)/$(LIBQDMA_FALLBACK)"; fi; \
+	lq="$(PWD)/$(LIBQDMA_PATH)"; \
 	[ -d "$$lq" ] || exit 0; \
 	for p in $$(printf '%s\n' "$$@" | tac); do \
 		name="$$(basename "$$p")"; \
@@ -233,10 +240,11 @@ clean:
 	-$(MAKE) -C "$(KDIR)" M="$(PWD)" clean
 	rm -rf "$(PWD)/kcompat/.scratch"
 	$(MAKE) unpatch-libqdma
+	if [ ! -d "$(PWD)/$(LIBQDMA_LOCAL_DIR)" ]; then rm -rf "$(PWD)/build"; fi
 
 install: all
 	sudo install -d -m 755 /lib/modules/$(shell uname -r)/extra
 	sudo install -m 644 $(MODULE).ko /lib/modules/$(shell uname -r)/extra
 	sudo depmod -a
 
-.PHONY: all clean install libqdma-patches unpatch-libqdma
+.PHONY: all clean install prepare-libqdma libqdma-patches unpatch-libqdma
