@@ -506,8 +506,9 @@ doorbell/IRQ path described in earlier drafts of this document
    resets per-graph BTCM state, and sets `rp1_state = RUNNING`.
 7. **RP1 processes** the graph via `rp1_loop()` (Section D)
 8. **RP1 writes** CQ entries for completed/failed nodes as it goes (skipped
-   for `SILENT` nodes), and if `trace_enable != 0`, writes trace-ring events
-   for graph, scheduling, wait, control-flow, PDI, and kernel lifecycle points
+   for `SILENT` nodes), and if `trace_enable != 0`, stages graph, scheduling,
+   wait, control-flow, PDI, and kernel lifecycle events in BTCM. Full BTCM
+   pages flush synchronously to the configured DDR trace ring.
 9. A non-silent completion is activated/finalized only when
    `cq_write_idx - cq_read_idx != cq_size`; a full CQ stalls that work instead
    of overwriting unread entries. The host drains and advances `cq_read_idx`
@@ -516,10 +517,10 @@ doorbell/IRQ path described in earlier drafts of this document
 10. On a terminal failure RP1 stops activation/sentinel work, latches the first
     `(code,node,detail,aux)`, and quiesces tracked finite kernels. Infinite or
     expired work sets `RP1_ERR_RECOVERY_REQUIRED`.
-11. RP1 publishes CQ and trace writes and the error record, then publishes
-    `READY`/`ERROR`/`HALTED`, executes a barrier, and finally writes the exact
-    accepted sequence to `graph_done_seq`. `ERROR` and `HALTED` are reset-only
-    and reject later graph sequences.
+11. RP1 flushes the final partial trace page and publishes CQ writes plus the
+    error record, then publishes `READY`/`ERROR`/`HALTED`, executes a barrier,
+    and finally writes the exact accepted sequence to `graph_done_seq`.
+    `ERROR` and `HALTED` are reset-only and reject later graph sequences.
 12. **Host polls** at ~1ms cadence using equality (`graph_done_seq == wanted`)
     so sequence wrap is valid. It also checks terminal state each poll and
     surfaces the full terminal record immediately, even in the publication
@@ -531,9 +532,6 @@ doorbell/IRQ path described in earlier drafts of this document
   waking the host without polling is a `TODO` left in `rp1_run.c`; the
   symmetric host->RP1 `irq_sq` doorbell and a host-side `eventfd` consumer
   for `irq_cq` are not implemented either. Today both sides poll a DDR word.
-- **Host trace consumer.** The optional trace ring ABI exists and the firmware
-  can write it, but `Rp1Submitter`/SMI do not yet drain or decode it.
-
 ### Completion Queue Entry (16 bytes)
 
 ```
@@ -561,9 +559,9 @@ corruption. Ring addressing alone uses `cursor & (size - 1)`.
 
 ### Optional Trace Queue Entry (16 bytes)
 
-When `trace_enable != 0`, RP1 writes trace events into the ring described by
-`trace_base_lo/hi`, `trace_size`, and `trace_write_idx`. The ring uses the same
-monotonic-index convention as the CQ:
+When `trace_enable != 0`, RP1 eventually flushes staged trace events into the
+ring described by `trace_base_lo/hi`, `trace_size`, and `trace_write_idx`. The
+ring uses the same monotonic-index convention as the CQ:
 
 ```
 Offset  Size  Field
@@ -590,11 +588,29 @@ RP1_TRACE_WAIT_WAKE
 RP1_TRACE_PDI_LOAD
 RP1_TRACE_IMAGE_MISMATCH
 RP1_TRACE_GRAPH_DONE
+RP1_TRACE_FLUSH_START
+RP1_TRACE_FLUSH_END
 ```
 
-The firmware resets `trace_write_idx` at each graph submission. This keeps the
-first trace entry for a submission at index 0; a cumulative cross-graph trace
-can be added later when a host-side drainer exists.
+Normal trace emission is staged in a fixed 4KB BTCM page (256 x 16-byte
+entries), so hot-path events do not write DDR or execute a publication barrier.
+Firmware advertises this behavior with `RP1_CAP_BTCM_TRACE_STAGING`, which is a
+required host capability so older protocol-v4 firmware cannot be benchmarked
+under the new timing semantics accidentally.
+After a normal event leaves one slot free, firmware writes
+`RP1_TRACE_FLUSH_START` into that final slot and synchronously copies the full
+page into the configured DDR ring. The first entry in the fresh BTCM page is
+then `RP1_TRACE_FLUSH_END`; subtracting its timestamp from the preceding start
+marker measures the blocking flush itself. Both markers use `node_index =
+0xFFFF`; `aux0` is the flushed entry count and `aux1` is the DDR producer cursor
+before/after the copy.
+
+The final partial BTCM page is copied after `RP1_TRACE_GRAPH_DONE` without
+adding another marker pair. This avoids an infinite marker/flush recursion and
+places terminal drain cost outside graph execution. Firmware resets both
+`trace_write_idx` and the BTCM staging count at each graph submission. This
+keeps the first trace entry for a submission at index 0; a cumulative
+cross-graph trace can be added later when a host-side drainer exists.
 
 ### Memory Ordering
 
@@ -1419,9 +1435,10 @@ unsafe for concurrent submitters against the same `Rp1BarWindow`.
 | `node_status[4096]` | 4KB |
 | `loop_iterations[64]` | 256B |
 | `inflight[32]` | 768B |
+| Trace staging page | 4KB |
 | Stack | 4KB |
 | Code variables | ~1KB |
-| **Total** | **~10.1KB of 64KB** |
+| **Total** | **~14.3KB of 64KB** |
 
 ---
 
