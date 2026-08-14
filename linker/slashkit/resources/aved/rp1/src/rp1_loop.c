@@ -83,22 +83,6 @@ static int write_cq_entry(uint16_t flags, uint32_t node_index,
     return 1;
 }
 
-static void trace(uint16_t event, uint32_t node_index, uint32_t aux0, uint32_t aux1)
-{
-    if (!g_trace_enable || !g_trace || !g_trace_size)
-        return;
-
-    uint32_t idx = g_ctrl->trace_write_idx % g_trace_size;
-    g_trace[idx].timestamp  = rp1_cycles() - g_graph_start_cycles;
-    g_trace[idx].event      = event;
-    g_trace[idx].node_index = (uint16_t)node_index;
-    g_trace[idx].aux0       = aux0;
-    g_trace[idx].aux1       = aux1;
-    rp1_barrier();
-    g_ctrl->trace_write_idx++;
-    rp1_barrier();
-}
-
 /* -------------------------------------------------------------------------
  * Inflight kernel management
  * ---------------------------------------------------------------------- */
@@ -444,7 +428,8 @@ static int check_inflight(void)
                                    RP1_CQ_OK, 0) < 0)
                     return -1;
             }
-            trace(RP1_TRACE_KERNEL_DONE, k->node_index, k->base_addr, k->infinite);
+            rp1_trace_emit(RP1_TRACE_KERNEL_DONE, k->node_index,
+                           k->base_addr, k->infinite);
             remove_inflight(i);
             made_progress = 1;
             /* don't increment i — slot was replaced by swap */
@@ -463,8 +448,8 @@ static int check_inflight(void)
                 if (write_cq_entry(flags, k->node_index,
                                    RP1_CQ_TIMEOUT, k->base_addr) < 0)
                     return -1;
-                trace(RP1_TRACE_KERNEL_TIMEOUT, k->node_index,
-                      k->base_addr, k->timeout_cycles);
+                rp1_trace_emit(RP1_TRACE_KERNEL_TIMEOUT, k->node_index,
+                               k->base_addr, k->timeout_cycles);
 
                 if (flags & RP1_FLAG_HALT_ON_ERROR) {
                     /* Keep the timed-out kernel tracked for fatal quiesce. */
@@ -520,7 +505,8 @@ static int check_waits(uint32_t node_count)
             g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
             if (write_cq_entry(node->flags, i, RP1_CQ_OK, 0) < 0)
                 return -1;
-            trace(RP1_TRACE_WAIT_WAKE, i, w->condition_signal, sig_val);
+            rp1_trace_emit(RP1_TRACE_WAIT_WAKE, i,
+                           w->condition_signal, sig_val);
             made_progress = 1;
         }
     }
@@ -561,7 +547,8 @@ static int activate_nodes(uint32_t node_count)
         }
 
         g_ctrl->rp1_current_node = i;
-        trace(RP1_TRACE_NODE_ACTIVATE, i, node->opcode, node->flags);
+        rp1_trace_emit(RP1_TRACE_NODE_ACTIVATE, i,
+                       node->opcode, node->flags);
 
         /*
          * Phase 1: launch asynchronous fabric work or perform the serialized
@@ -582,8 +569,8 @@ static int activate_nodes(uint32_t node_count)
                 if (write_cq_entry(node->flags, i, RP1_CQ_ERROR,
                                    g_active_image_id) < 0)
                     return -1;
-                trace(RP1_TRACE_IMAGE_MISMATCH, i,
-                      kd->expected_image_id, g_active_image_id);
+                rp1_trace_emit(RP1_TRACE_IMAGE_MISMATCH, i,
+                               kd->expected_image_id, g_active_image_id);
                 if (node->flags & RP1_FLAG_HALT_ON_ERROR)
                     return -1;
                 /* Non-fatal: set barriers so dependents can proceed. */
@@ -601,8 +588,8 @@ static int activate_nodes(uint32_t node_count)
                 return -1;
             }
             launch_kernel(node);
-            trace(RP1_TRACE_KERNEL_LAUNCH, i,
-                  kd->kernel_base_addr, kd->arg_count);
+            rp1_trace_emit(RP1_TRACE_KERNEL_LAUNCH, i,
+                           kd->kernel_base_addr, kd->arg_count);
             if (node->flags & RP1_FLAG_INFINITE) {
                 set_node_status(i, RP1_NODE_DONE);
                 g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
@@ -621,7 +608,8 @@ static int activate_nodes(uint32_t node_count)
             rp1_pdi_result_t result =
                 rp1_pdi_load(p->pdi_addr_lo, p->pdi_addr_hi,
                              p->timeout_cycles);
-            trace(RP1_TRACE_PDI_LOAD, i, result.status, result.detail);
+            rp1_trace_emit(RP1_TRACE_PDI_LOAD, i,
+                           result.status, result.detail);
 
             if (result.outcome == RP1_PDI_RESULT_OK) {
                 /* Record the now-active image for the dispatch guard. */
@@ -674,8 +662,10 @@ static int activate_nodes(uint32_t node_count)
                 exit_loop = 1;
             if (compare(sig_val, lp->condition_op, lp->condition_value))
                 exit_loop = 1;
-            trace(RP1_TRACE_LOOP_ITER, i, lp->loop_id,
-                  (g_loop_iters[lp->loop_id] << 1) | (uint32_t)exit_loop);
+            rp1_trace_emit(
+                RP1_TRACE_LOOP_ITER, i, lp->loop_id,
+                (g_loop_iters[lp->loop_id] << 1) |
+                    (uint32_t)exit_loop);
 
             if (exit_loop) {
                 set_node_status(i, RP1_NODE_DONE);
@@ -700,7 +690,8 @@ static int activate_nodes(uint32_t node_count)
             uint32_t sig_val = g_signals[cd->condition_signal].value;
             uint32_t cond_met = compare(sig_val, cd->condition_op, cd->condition_value);
 
-            trace(RP1_TRACE_COND_EVAL, i, cd->condition_signal, cond_met);
+            rp1_trace_emit(RP1_TRACE_COND_EVAL, i,
+                           cd->condition_signal, cond_met);
             if (cond_met) {
                 /* Condition met — set done barriers. */
                 g_barriers[cd->done_bucket] |= cd->done_mask;
@@ -745,8 +736,9 @@ static int activate_nodes(uint32_t node_count)
             } else {
                 /* Park the node; check_waits() re-polls the slot each pass. */
                 set_node_status(i, RP1_NODE_WAITING);
-                trace(RP1_TRACE_WAIT_PARK, i,
-                      w->condition_signal, w->condition_value);
+                rp1_trace_emit(RP1_TRACE_WAIT_PARK, i,
+                               w->condition_signal,
+                               w->condition_value);
             }
             break;
         }
@@ -820,8 +812,9 @@ static void quiesce_inflight(void)
                                        RP1_CQ_OK, 0u) < 0)
                         rp1_mark_recovery_required();
                 }
-                trace(RP1_TRACE_KERNEL_DONE, kernel->node_index,
-                      kernel->base_addr, 0u);
+                rp1_trace_emit(RP1_TRACE_KERNEL_DONE,
+                               kernel->node_index,
+                               kernel->base_addr, 0u);
                 remove_inflight(i);
                 continue;
             }

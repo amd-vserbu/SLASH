@@ -53,7 +53,7 @@ static int test_struct_sizes(void)
     CHECK_EQ32(sizeof(rp1_trace_entry_t),  16,     "trace entry size");
     CHECK_EQ32(sizeof(rp1_inflight_t),     24,     "inflight entry size");
     CHECK_EQ32(RP1_PROTOCOL_VERSION,       4,      "protocol version");
-    CHECK_EQ32(RP1_REQUIRED_CAPABILITIES,  0x1F,   "required capabilities");
+    CHECK_EQ32(RP1_REQUIRED_CAPABILITIES,  0x3F,   "required capabilities");
     CHECK_EQ32(RP1_MAX_CQ_ENTRIES,         4096,   "maximum CQ entries");
     CHECK_EQ32(RP1_PMU_CYCLE_DIVISOR,      64,     "PMU tick divisor");
     CHECK(RP1_PLATFORM_ID != RP1_PDI_IPI_PLATFORM_UNKNOWN,

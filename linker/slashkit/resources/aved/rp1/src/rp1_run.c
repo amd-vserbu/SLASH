@@ -15,22 +15,6 @@
 #include <slash/uapi/rp1_protocol.h>
 #include <stdint.h>
 
-static void trace(uint16_t event, uint32_t node_index, uint32_t aux0, uint32_t aux1)
-{
-    if (!g_trace_enable || !g_trace || !g_trace_size)
-        return;
-
-    uint32_t idx = g_ctrl->trace_write_idx % g_trace_size;
-    g_trace[idx].timestamp  = rp1_cycles() - g_graph_start_cycles;
-    g_trace[idx].event      = event;
-    g_trace[idx].node_index = (uint16_t)node_index;
-    g_trace[idx].aux0       = aux0;
-    g_trace[idx].aux1       = aux1;
-    rp1_barrier();
-    g_ctrl->trace_write_idx++;
-    rp1_barrier();
-}
-
 #ifdef QEMU_SEMIHOSTING
 int rp1_run(const rp1_hooks_t *hooks)
 #else
@@ -114,8 +98,8 @@ int rp1_run(void)
         }
         g_graph_start_cycles = rp1_cycles();
         if (store_ready)
-            trace(RP1_TRACE_GRAPH_START, 0xFFFFu,
-                  accepted_seq, g_ctrl->node_count);
+            rp1_trace_emit(RP1_TRACE_GRAPH_START, 0xFFFFu,
+                           accepted_seq, g_ctrl->node_count);
 
         /*
          * Phase 2: run only a fully initialized store. Configuration failure
@@ -132,9 +116,16 @@ int rp1_run(void)
 #endif
         }
 
-        if (store_ready)
-            trace(RP1_TRACE_GRAPH_DONE, 0xFFFFu,
-                  (uint32_t)result, accepted_seq);
+        if (store_ready) {
+            rp1_trace_emit(RP1_TRACE_GRAPH_DONE, 0xFFFFu,
+                           (uint32_t)result, accepted_seq);
+            /*
+             * Publish the final partial BTCM page after graph work ends.
+             * Periodic flushes are measured by FLUSH_START/END; this terminal
+             * drain intentionally adds no recursive marker pair.
+             */
+            rp1_trace_flush_final();
+        }
 
         /*
          * Phase 3: classify scanner completion without clearing its first-error

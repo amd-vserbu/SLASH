@@ -386,6 +386,14 @@ TEST_F(SubmitterFixture, MissingRequiredCapabilityIsRejected) {
         std::runtime_error);
 }
 
+TEST_F(SubmitterFixture, MissingBtcmTraceStagingCapabilityIsRejected) {
+    ddr_.ctrl().capabilities &=
+        ~RP1_CAP_BTCM_TRACE_STAGING;
+    EXPECT_THROW(
+        submitter_->ensureReady(std::chrono::milliseconds(20)),
+        std::runtime_error);
+}
+
 TEST_F(SubmitterFixture, UnknownPlatformConfigIsRejected) {
     ddr_.ctrl().pdi_ipi_platform_id = RP1_PDI_IPI_PLATFORM_UNKNOWN;
     EXPECT_THROW(

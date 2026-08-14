@@ -111,6 +111,8 @@ const char* traceEventStr(uint32_t e) {
     case RP1_TRACE_PDI_LOAD:       return "PDI_LOAD";
     case RP1_TRACE_IMAGE_MISMATCH: return "IMAGE_MISMATCH";
     case RP1_TRACE_GRAPH_DONE:     return "GRAPH_DONE";
+    case RP1_TRACE_FLUSH_START:    return "TRACE_FLUSH_START";
+    case RP1_TRACE_FLUSH_END:      return "TRACE_FLUSH_END";
     default:                       return "?";
     }
 }
@@ -146,6 +148,8 @@ void printCtrl(volatile rp1_ctrl_t* c) {
                     RP1_CAP_STRUCTURED_PDI_RESPONSE);
     printCapability("latched_terminal_errors", capabilities,
                     RP1_CAP_LATCHED_TERMINAL_ERRORS);
+    printCapability("btcm_trace_staging", capabilities,
+                    RP1_CAP_BTCM_TRACE_STAGING);
     std::printf("  required_capabilities = 0x%08x\n",
                 static_cast<uint32_t>(RP1_REQUIRED_CAPABILITIES));
     std::printf("  missing_capabilities  = 0x%08x\n",

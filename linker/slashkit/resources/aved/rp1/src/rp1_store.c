@@ -5,6 +5,8 @@
  * RP1 static storage definitions and initialisation.
  */
 
+#include "rp1_cycles.h"
+#include "rp1_hal.h"
 #include "rp1_store.h"
 #include <slash/uapi/rp1_protocol.h>
 #include <stddef.h>
@@ -29,9 +31,17 @@ uint32_t      g_inflight_count             BTCM_SECTION;
 uint32_t      g_graph_start_cycles         BTCM_SECTION;
 uint32_t      g_trace_size                 BTCM_SECTION;
 uint32_t      g_trace_enable               BTCM_SECTION;
+/* Fixed on-chip trace page; only explicit flushes touch the DDR trace ring. */
+static rp1_trace_entry_t
+    g_trace_staging[RP1_TRACE_STAGING_ENTRIES] BTCM_SECTION;
+/* Number of valid entries at the front of g_trace_staging. */
+static uint32_t g_trace_staging_count       BTCM_SECTION;
 
 /* Persists across graphs (physical reconfig state); zeroed only at boot. */
 uint32_t      g_active_image_id            BTCM_SECTION;
+
+_Static_assert(sizeof(g_trace_staging) == RP1_TRACE_STAGING_BYTES,
+               "BTCM trace staging must occupy exactly 4 KB");
 
 /* -------------------------------------------------------------------------
  * DDR-backed pointer table (set by rp1_store_init)
@@ -73,6 +83,47 @@ static uint32_t valid_window_range(uint32_t lo, uint32_t hi,
     if (alignment != 0u && (lo & (alignment - 1u)) != 0u)
         return 0u;
     return lo - RP1_CTRL_PHYS_ADDR <= RP1_CTRL_WINDOW_SIZE - size;
+}
+
+/*
+ * Stage one event without testing the flush threshold. Callers reserve space
+ * first so marker insertion cannot recurse or overrun the fixed BTCM page.
+ */
+static void trace_stage(uint16_t event, uint32_t node_index,
+                        uint32_t aux0, uint32_t aux1)
+{
+    rp1_trace_entry_t *entry = &g_trace_staging[g_trace_staging_count++];
+    entry->timestamp = rp1_cycles() - g_graph_start_cycles;
+    entry->event = event;
+    entry->node_index = (uint16_t)node_index;
+    entry->aux0 = aux0;
+    entry->aux1 = aux1;
+}
+
+/*
+ * Copy the staged prefix into the monotonic DDR ring and publish its producer
+ * cursor only after every entry is visible. Ring wrap deliberately overwrites
+ * the oldest records, matching the existing host-side overflow contract.
+ */
+static void trace_flush_staged(void)
+{
+    uint32_t count = g_trace_staging_count;
+    if (count == 0u)
+        return;
+
+    uint32_t write = g_ctrl->trace_write_idx;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t idx = (write + i) % g_trace_size;
+        g_trace[idx].timestamp = g_trace_staging[i].timestamp;
+        g_trace[idx].event = g_trace_staging[i].event;
+        g_trace[idx].node_index = g_trace_staging[i].node_index;
+        g_trace[idx].aux0 = g_trace_staging[i].aux0;
+        g_trace[idx].aux1 = g_trace_staging[i].aux1;
+    }
+    rp1_barrier();
+    g_ctrl->trace_write_idx = write + count;
+    rp1_barrier();
+    g_trace_staging_count = 0u;
 }
 
 /* -------------------------------------------------------------------------
@@ -163,6 +214,7 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux)
     g_trace_size = g_ctrl->trace_size;
     g_trace_enable = g_ctrl->trace_enable;
     g_ctrl->trace_write_idx = 0;
+    g_trace_staging_count = 0u;
 
     /*
      * Phase 3: reset only per-graph state and status. The active image id is
@@ -181,6 +233,37 @@ void rp1_store_reset_graph(void)
     memzero(g_loop_iters,  sizeof(g_loop_iters));
     memzero(g_inflight,    sizeof(g_inflight));
     g_inflight_count = 0;
+}
+
+/*
+ * A normal event may consume at most the penultimate slot. The final slot
+ * names the synchronous flush, and the first entry staged afterward records
+ * when that blocking copy returned.
+ */
+void rp1_trace_emit(uint16_t event, uint32_t node_index,
+                    uint32_t aux0, uint32_t aux1)
+{
+    if (!g_trace_enable || !g_trace || !g_trace_size)
+        return;
+
+    trace_stage(event, node_index, aux0, aux1);
+    if (RP1_TRACE_STAGING_ENTRIES - g_trace_staging_count != 1u)
+        return;
+
+    uint32_t write = g_ctrl->trace_write_idx;
+    trace_stage(RP1_TRACE_FLUSH_START, 0xFFFFu,
+                RP1_TRACE_STAGING_ENTRIES, write);
+    trace_flush_staged();
+    trace_stage(RP1_TRACE_FLUSH_END, 0xFFFFu,
+                RP1_TRACE_STAGING_ENTRIES,
+                g_ctrl->trace_write_idx);
+}
+
+void rp1_trace_flush_final(void)
+{
+    if (!g_trace_enable || !g_trace || !g_trace_size)
+        return;
+    trace_flush_staged();
 }
 
 void rp1_clear_error_latch(void)

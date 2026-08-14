@@ -672,6 +672,10 @@ TEST_F(FpgaDeviceFixture, BarBackedBufferArenaDoesNotOverlapTraceRing) {
     ddr_.traces()[0].node_index = 7u;
     ddr_.traces()[0].aux0 = 0x55667788u;
     ddr_.traces()[0].aux1 = 0x99aabbccu;
+    ddr_.traces()[RP1_MAX_TRACE_ENTRIES - 1u].timestamp =
+        0x22334455u;
+    ddr_.traces()[RP1_MAX_TRACE_ENTRIES - 1u].event =
+        RP1_TRACE_FLUSH_END;
 
     const std::uint8_t bytes[32] = {};
     dev.setInputBuffer("scratch", bytes, sizeof(bytes));
@@ -681,6 +685,12 @@ TEST_F(FpgaDeviceFixture, BarBackedBufferArenaDoesNotOverlapTraceRing) {
     EXPECT_EQ(ddr_.traces()[0].node_index, 7u);
     EXPECT_EQ(ddr_.traces()[0].aux0, 0x55667788u);
     EXPECT_EQ(ddr_.traces()[0].aux1, 0x99aabbccu);
+    EXPECT_EQ(
+        ddr_.traces()[RP1_MAX_TRACE_ENTRIES - 1u].timestamp,
+        0x22334455u);
+    EXPECT_EQ(
+        ddr_.traces()[RP1_MAX_TRACE_ENTRIES - 1u].event,
+        static_cast<std::uint16_t>(RP1_TRACE_FLUSH_END));
 }
 
 TEST_F(FpgaDeviceFixture, ImageNumericIdIsStableOneBasedAndZeroForUnguarded) {

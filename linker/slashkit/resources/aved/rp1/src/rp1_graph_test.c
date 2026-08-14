@@ -705,6 +705,52 @@ static int test_trace_queue(void)
     return 0;
 }
 
+/*
+ * Fill one BTCM trace page and prove the synchronous DDR copy is bracketed by
+ * adjacent FLUSH_START/END events. Silent NOPs isolate trace traffic from CQ
+ * backpressure while retaining one NODE_ACTIVATE event per command.
+ */
+static int test_trace_btcm_flush(void)
+{
+    const uint32_t node_count = 260u;
+    const uint32_t trace_size = 512u;
+    setup_graph(node_count, 0);
+    tmemzero((volatile void *)G_TRACE,
+             trace_size * sizeof(rp1_trace_entry_t));
+    G_CTRL->trace_enable = 1u;
+    G_CTRL->trace_size = trace_size;
+
+    for (uint32_t i = 0; i < node_count; i++) {
+        G_NODES[i].opcode = RP1_OP_NOP;
+        G_NODES[i].flags = RP1_FLAG_SILENT;
+        G_NODES[i].status = RP1_NODE_PENDING;
+    }
+
+    int rc = rp1_run(&s_hooks);
+    CHECK_EQ32(rc, 0u, "trace_flush: rp1_run rc");
+    CHECK_EQ32(G_CTRL->trace_write_idx, 264u,
+               "trace_flush: events plus flush markers");
+    CHECK_EQ32(G_TRACE[0].event, RP1_TRACE_GRAPH_START,
+               "trace_flush: graph start first");
+    CHECK_EQ32(G_TRACE[255].event, RP1_TRACE_FLUSH_START,
+               "trace_flush: full page ends with flush start");
+    CHECK_EQ32(G_TRACE[256].event, RP1_TRACE_FLUSH_END,
+               "trace_flush: fresh page begins with flush end");
+    CHECK_EQ32(G_TRACE[263].event, RP1_TRACE_GRAPH_DONE,
+               "trace_flush: final partial page ends with graph done");
+    CHECK_EQ32(G_TRACE[255].aux0, RP1_TRACE_STAGING_ENTRIES,
+               "trace_flush: start reports page entries");
+    CHECK_EQ32(G_TRACE[255].aux1, 0u,
+               "trace_flush: start reports old DDR cursor");
+    CHECK_EQ32(G_TRACE[256].aux0, RP1_TRACE_STAGING_ENTRIES,
+               "trace_flush: end reports page entries");
+    CHECK_EQ32(G_TRACE[256].aux1, RP1_TRACE_STAGING_ENTRIES,
+               "trace_flush: end reports new DDR cursor");
+    CHECK(G_TRACE[256].timestamp >= G_TRACE[255].timestamp,
+          "trace_flush: end follows start");
+    return 0;
+}
+
 /* -------------------------------------------------------------------------
  * test_kernel_unblocks_signal
  *
@@ -1690,6 +1736,7 @@ void rp1_graph_test_run(void)
     run("cq_timestamps",       test_cq_timestamps);
     run("trace_disabled_by_default", test_trace_disabled_by_default);
     run("trace_queue",         test_trace_queue);
+    run("trace_btcm_flush",    test_trace_btcm_flush);
     run("kernel_unblocks_signal", test_kernel_unblocks_signal);
     run("signal_chain",        test_signal_chain);
     run("cq_flow_control",     test_cq_flow_control);

@@ -205,6 +205,8 @@ typedef enum {
     RP1_TRACE_PDI_LOAD       = 9,
     RP1_TRACE_IMAGE_MISMATCH = 10,
     RP1_TRACE_GRAPH_DONE     = 11,
+    RP1_TRACE_FLUSH_START    = 12,
+    RP1_TRACE_FLUSH_END      = 13,
 } rp1_trace_event_t;
 
 /* =========================================================================
@@ -428,11 +430,12 @@ typedef struct {
 #define RP1_CAP_CQ_FLOW_CONTROL           (1u << 2)
 #define RP1_CAP_STRUCTURED_PDI_RESPONSE   (1u << 3)
 #define RP1_CAP_LATCHED_TERMINAL_ERRORS   (1u << 4)
+#define RP1_CAP_BTCM_TRACE_STAGING        (1u << 5)
 
 #define RP1_REQUIRED_CAPABILITIES                                      \
     (RP1_CAP_PLATFORM_PDI_IPI_CONFIG | RP1_CAP_PMU_CYCLE_TIMEOUTS |   \
      RP1_CAP_CQ_FLOW_CONTROL | RP1_CAP_STRUCTURED_PDI_RESPONSE |      \
-     RP1_CAP_LATCHED_TERMINAL_ERRORS)
+     RP1_CAP_LATCHED_TERMINAL_ERRORS | RP1_CAP_BTCM_TRACE_STAGING)
 
 #define RP1_PDI_IPI_PLATFORM_UNKNOWN  0u
 #define RP1_TERMINAL_ERROR_NODE_NONE  0xFFFFFFFFu

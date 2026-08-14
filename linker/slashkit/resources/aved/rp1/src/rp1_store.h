@@ -14,16 +14,23 @@
  *   loop_iterations[64]       256 B
  *   inflight[32]              768 B   (32 * sizeof(rp1_inflight_t) = 24)
  *   inflight_count              4 B
+ *   trace staging            4096 B   (256 * sizeof(rp1_trace_entry_t))
+ *   trace staging count         4 B
  *   stack                    4096 B   (linker script)
  *   code variables           ~1 KB
  *   ─────────────────────────────
- *   Total hot data           ~10.3 KB
+ *   Total hot data           ~14.3 KB
  */
 
 #ifndef RP1_STORE_H
 #define RP1_STORE_H
 
 #include <slash/uapi/rp1_protocol.h>
+
+/* One fixed 4 KB BTCM page stages trace entries before a blocking DDR flush. */
+#define RP1_TRACE_STAGING_BYTES   4096u
+#define RP1_TRACE_STAGING_ENTRIES \
+    (RP1_TRACE_STAGING_BYTES / (uint32_t)sizeof(rp1_trace_entry_t))
 
 /* -------------------------------------------------------------------------
  * BTCM-resident hot stores
@@ -97,6 +104,22 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux);
  * Called at the start of every new graph submission.
  */
 void rp1_store_reset_graph(void);
+
+/*
+ * Append one timestamped event to the BTCM trace page. When one slot remains,
+ * the implementation fills it with FLUSH_START, copies the full page to the
+ * configured DDR ring, and makes FLUSH_END the first entry in the new page.
+ * Disabled tracing is a no-op.
+ */
+void rp1_trace_emit(uint16_t event, uint32_t node_index,
+                    uint32_t aux0, uint32_t aux1);
+
+/*
+ * Copy the final partial BTCM page to DDR without adding flush markers.
+ * Graph completion calls this after emitting GRAPH_DONE, so no recursive
+ * marker flush is needed merely to publish FLUSH_END or GRAPH_DONE.
+ */
+void rp1_trace_flush_final(void);
 
 /*
  * First-error-wins diagnostic publication for the current graph. Clear only
