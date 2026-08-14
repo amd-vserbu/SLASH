@@ -23,11 +23,15 @@ targets latency and dispatch scaling, not application throughput.
   - Raw `Rp1Submitter::submitAndWait()` host round trip. The projected backend
     image includes its lifecycle `SIGNAL` sentinel, so this is a tiny graph
     round trip rather than a bare one-packet doorbell.
+  - `rp1.result.kernel.graph_elapsed` is the firmware's uninstrumented
+    `Rp1GraphResult::graphElapsedTicks` for that graph.
   - Instrumented RP1 graph-to-dispatch, launch-to-done, and graph duration in
     protocol PMU ticks.
 - Sequential batches of 1, 10, and 100 launches by default:
   - Legacy VRT performs `start()`/`wait()` for each launch.
   - RP1 submits one dependency chain and executes it without host intervention.
+  - `rp1.result.batch.<N>.graph_elapsed` reports the graph-result timing without
+    enabling tracing.
   - `rp1.trace.batch.10.done_to_next_launch` summarizes all nine adjacent
     `KERNEL_DONE(i)` to `KERNEL_LAUNCH(i+1)` handoffs per traced submission.
   - `done_to_next_launch_excluding_flush` subtracts any bracketed
@@ -36,7 +40,7 @@ targets latency and dispatch scaling, not application throughput.
 - Transfers:
   - Legacy VRT host-to-DDR and DDR-to-host QDMA sync.
   - RP1 phase-1 DDR-to-DDR software `DMA_COPY`, reported both as host round-trip
-    time and graph-start-to-CQ timestamp.
+    time and graph-result elapsed ticks.
 
 The transfer metrics are intentionally not presented as a speedup ratio. The
 current RP1 firmware only implements local DDR-to-DDR software copies; it does
@@ -74,7 +78,7 @@ The hardware artifact is `rp1_latency_hw.vbin`.
 
 ## Run
 
-The FPGA host must run matching protocol-v4 RP1 firmware and vrtd. No other RP1
+The FPGA host must run matching protocol-v5 RP1 firmware and vrtd. No other RP1
 submitter may use the card concurrently.
 
 ```bash
@@ -125,6 +129,20 @@ Raw RP1 host round trips currently include the submitter's one-millisecond
 polling cadence. Fast graphs can therefore appear quantized near one
 millisecond even when firmware trace intervals are much smaller. Trace runs are
 reported separately because recording timestamps still adds firmware work.
+Every raw submission measures the complete `submitAndWait()` call, including
+firmware-contract preflight, BAR staging, polling, result reads, and protocol
+consistency validation. The benchmark then checks outcome, flags, active image,
+completed operation count, timing, trace state, and quiescence after the stop
+timestamp. Those benchmark-specific checks do not inflate the host-latency
+rows, but submitter validation does.
+
+`rp1.result.*.graph_elapsed` and
+`rp1.transfer.*.graph_elapsed` come from
+`Rp1GraphResult::graphElapsedTicks`. This interval starts when firmware accepts
+the graph and ends immediately after it emits `GRAPH_DONE`; it excludes final
+trace draining and result publication. The associated raw kernel/batch samples
+run with tracing disabled, while the separate `rp1.trace.*` rows intentionally
+measure instrumented executions.
 
 Normal events are staged in a 4 KiB BTCM page. When that page fills, firmware
 blocks to copy it to the shared DDR ring and brackets the copy with
@@ -135,10 +153,11 @@ activation, and the next kernel's no-argument launch. At the V80 R5's 800 MHz
 clock, five microseconds is 62.5 protocol PMU ticks; pass `--r5-hz 800000000`
 to emit estimated-nanosecond rows.
 
-The RP1 transfer CQ timestamp includes graph validation, scanner dispatch, the
-copy, and CQ publication. It is not a copy-only hardware timer. Programming
-rows also have intentionally different boundaries, as described above, and
-should not be interpreted as a pure PDI-loader speedup ratio.
+The RP1 transfer graph-result timing includes graph validation, scanner
+dispatch, the software copy, and graph completion. It is not a copy-only
+hardware timer. Programming rows also have intentionally different boundaries,
+as described above, and should not be interpreted as a pure PDI-loader speedup
+ratio.
 
 For less noisy host measurements, reserve the machine, pin the process to one
 CPU, use a fixed CPU frequency policy, and repeat the complete run. Programming

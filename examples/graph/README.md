@@ -61,11 +61,17 @@ continuous device session it runs:
 
 A read-only RP1 dump follows every application. Each case runs under GNU
 `timeout --foreground` with a configurable `CASE_TIMEOUT` and `KILL_GRACE`.
-The script forces `VRT_RP1_TRACE=1` and `VRT_RP1_CQ=1`, then rejects missing
-host-reference PASS output, missing or failed PDI CQ/trace records, missing
-successful `GRAPH_DONE`, trace overflow, a non-advancing `graph_done_seq`, an
-incompatible protocol-v4 capability/platform identity, or latched terminal
-errors.
+The script forces `VRT_RP1_TRACE=1` and `VRT_RP1_RESULT=1`. It validates every
+sequence-tagged result as a clean `SUCCESS` with a known image, completed
+operations, ordered graph/publication timing, a non-empty trace, and zero
+quiescence. It also rejects missing host-reference PASS output, too few
+successful PDI trace records, missing successful `GRAPH_DONE`, trace overflow,
+a result sequence that disagrees with the following read-only dump, a
+non-advancing `graph_done_seq`, an incompatible protocol-v5
+capability/platform identity, or terminal error/recovery evidence.
+`UNREACHED_NODES` is allowed on success because an unchosen conditional branch
+legitimately remains pending; the runtime's lifecycle sentinel proves that all
+intended leaves joined.
 
 Per-case logs, RP1 snapshots, escaped commands, source revision/dirty status,
 input binary/vbin hashes, and final artifact hashes are written under
@@ -78,8 +84,8 @@ controls are documented by:
 
 The acceptance harness itself has a hardware-free test. It creates all fake
 executables and vbins under the repository's ignored `tmp/` directory and
-checks the success, missing-PDI, missing-graph-completion, trace-overflow, and
-watchdog paths:
+checks the success, missing/failed-result, missing-PDI,
+missing-graph-completion, trace-overflow, and watchdog paths:
 
 ```bash
 ./scripts/test-graph-hardware-local.sh
