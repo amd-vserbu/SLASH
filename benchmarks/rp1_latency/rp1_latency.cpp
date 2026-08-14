@@ -128,6 +128,16 @@ struct SplitSamples {
 };
 
 /**
+ * @brief Host duration paired with the immutable result returned by RP1.
+ */
+struct TimedGraphResult {
+    /// submitAndWait() wall-clock duration in nanoseconds.
+    std::uint64_t elapsed = 0;
+    /// Typed protocol-v5 result captured before the stop timestamp.
+    vrt::graph::fpga::Rp1GraphResult result;
+};
+
+/**
  * @brief RP1 trace intervals expressed in protocol PMU ticks.
  */
 struct TraceIntervals {
@@ -352,6 +362,88 @@ std::uint32_t ringSize(std::size_t entries, std::uint32_t maximum) {
         throw std::runtime_error("requested RP1 ring is too small");
     }
     return size;
+}
+
+/**
+ * @brief Time one complete @c submitAndWait() host round trip.
+ *
+ * The interval includes submitter preflight, staging, polling, result reads,
+ * and protocol consistency validation. Benchmark-specific semantic checks run
+ * after this function returns and remain outside the latency boundary.
+ */
+TimedGraphResult timedSubmission(
+    const std::shared_ptr<vrt::graph::fpga::Rp1Submitter>& submitter,
+    const vrt::graph::fpga::Rp1GraphImage& image) {
+    const Clock::time_point start = Clock::now();
+    vrt::graph::fpga::Rp1GraphResult result =
+        submitter->submitAndWait(image, kRp1Timeout);
+    const Clock::time_point finish = Clock::now();
+    return {
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                finish - start)
+                .count()),
+        std::move(result),
+    };
+}
+
+/**
+ * @brief Require one clean benchmark result with the expected operation count.
+ *
+ * @throws std::runtime_error when terminal, image, timing, trace, or
+ * quiescence evidence is inconsistent with a reusable benchmark device.
+ */
+void validateGraphResult(
+    const vrt::graph::fpga::Rp1GraphResult& result,
+    std::size_t expectedOperations, bool traceExpected) {
+    constexpr std::uint32_t kKnownFlags =
+        RP1_RESULT_RECOVERY_REQUIRED |
+        RP1_RESULT_EFFECTS_MAY_BE_PARTIAL |
+        RP1_RESULT_INFINITE_WORK_REMAINS |
+        RP1_RESULT_TRACE_ENABLED |
+        RP1_RESULT_TRACE_OVERFLOW |
+        RP1_RESULT_UNREACHED_NODES;
+    constexpr std::uint32_t kFailureFlags =
+        RP1_RESULT_RECOVERY_REQUIRED |
+        RP1_RESULT_EFFECTS_MAY_BE_PARTIAL |
+        RP1_RESULT_INFINITE_WORK_REMAINS |
+        RP1_RESULT_TRACE_OVERFLOW |
+        RP1_RESULT_UNREACHED_NODES;
+
+    if (!result.succeeded() || result.terminal ||
+        (result.flags & ~kKnownFlags) != 0u ||
+        (result.flags & kFailureFlags) != 0u) {
+        throw std::runtime_error(
+            "RP1 benchmark received a failed or non-reusable graph result");
+    }
+    const bool traceEnabled =
+        result.hasFlags(RP1_RESULT_TRACE_ENABLED);
+    if (traceEnabled != traceExpected ||
+        (traceExpected && result.traceWriteIndex == 0u) ||
+        (!traceExpected && result.traceWriteIndex != 0u)) {
+        throw std::runtime_error(
+            "RP1 benchmark result has inconsistent trace evidence");
+    }
+    if (result.imageState != vrt::graph::fpga::Rp1ImageState::Known ||
+        result.activeImageId == 0u) {
+        throw std::runtime_error(
+            "RP1 benchmark result does not preserve a known active image");
+    }
+    if (expectedOperations > std::numeric_limits<std::uint32_t>::max() ||
+        result.completedOperations != expectedOperations) {
+        throw std::runtime_error(
+            "RP1 benchmark result has an unexpected completed-operation count");
+    }
+    if (result.publishElapsedTicks < result.graphElapsedTicks) {
+        throw std::runtime_error(
+            "RP1 benchmark result publication precedes graph completion");
+    }
+    if (result.quiescence.finiteDone != 0u ||
+        result.quiescence.finiteTimeout != 0u ||
+        result.quiescence.infinite != 0u) {
+        throw std::runtime_error(
+            "RP1 benchmark result required terminal quiescence");
+    }
 }
 
 /**
@@ -631,23 +723,30 @@ void benchmarkSingleKernel(
 
     vrt::graph::fpga::Rp1GraphImage image =
         device->projectProgram(program);
-    image.cq_size_override = ringSize(
-        image.nodes.size(), RP1_MAX_CQ_ENTRIES);
     const auto submitter = device->submitter();
     for (std::size_t i = 0; i < config.warmup; ++i) {
-        submitter->submitAndWait(image, kRp1Timeout);
-        (void)submitter->drainCq();
+        const vrt::graph::fpga::Rp1GraphResult result =
+            submitter->submitAndWait(image, kRp1Timeout);
+        validateGraphResult(
+            result, image.nodes.size(), /*traceExpected=*/false);
     }
 
     std::vector<std::uint64_t> host;
+    std::vector<std::uint64_t> resultGraph;
     host.reserve(config.iterations);
+    resultGraph.reserve(config.iterations);
     for (std::size_t i = 0; i < config.iterations; ++i) {
-        host.push_back(elapsedNs(
-            [&] { submitter->submitAndWait(image, kRp1Timeout); }));
-        (void)submitter->drainCq();
+        TimedGraphResult sample = timedSubmission(submitter, image);
+        host.push_back(sample.elapsed);
+        validateGraphResult(
+            sample.result, image.nodes.size(), /*traceExpected=*/false);
+        resultGraph.push_back(sample.result.graphElapsedTicks);
     }
     measurements.push_back(
         {"rp1.raw.kernel_graph.submit_wait", "ns", std::move(host)});
+    addTicks(
+        measurements, "rp1.result.kernel.graph_elapsed",
+        std::move(resultGraph), config.r5FrequencyHz);
 
     image.trace_enable = true;
     image.trace_size_override = ringSize(
@@ -658,10 +757,17 @@ void benchmarkSingleKernel(
     std::vector<std::uint64_t> execute;
     std::vector<std::uint64_t> graph;
     for (std::size_t i = 0; i < config.traceIterations; ++i) {
-        submitter->submitAndWait(image, kRp1Timeout);
-        const TraceIntervals intervals =
-            extractTrace(submitter->drainTrace(), 1);
-        (void)submitter->drainCq();
+        const vrt::graph::fpga::Rp1GraphResult result =
+            submitter->submitAndWait(image, kRp1Timeout);
+        validateGraphResult(
+            result, image.nodes.size(), /*traceExpected=*/true);
+        const vrt::graph::fpga::Rp1TraceCapture trace =
+            submitter->drainTrace();
+        if (result.traceWriteIndex != trace.written) {
+            throw std::runtime_error(
+                "RP1 kernel result and trace cursor disagree");
+        }
+        const TraceIntervals intervals = extractTrace(trace, 1);
         dispatch.push_back(intervals.dispatch);
         execute.push_back(intervals.kernelSpan);
         graph.push_back(intervals.graph);
@@ -712,25 +818,33 @@ void benchmarkBatches(
             makeKernelProgram(device->id(), kImageName, batch);
         vrt::graph::fpga::Rp1GraphImage image =
             device->projectProgram(program);
-        image.cq_size_override = ringSize(
-            image.nodes.size(), RP1_MAX_CQ_ENTRIES);
         for (std::size_t i = 0; i < config.warmup; ++i) {
-            submitter->submitAndWait(image, kRp1Timeout);
-            (void)submitter->drainCq();
+            const vrt::graph::fpga::Rp1GraphResult result =
+                submitter->submitAndWait(image, kRp1Timeout);
+            validateGraphResult(
+                result, image.nodes.size(), /*traceExpected=*/false);
         }
 
         std::vector<std::uint64_t> rp1Host;
+        std::vector<std::uint64_t> resultGraph;
         rp1Host.reserve(config.iterations);
+        resultGraph.reserve(config.iterations);
         for (std::size_t i = 0; i < config.iterations; ++i) {
-            rp1Host.push_back(elapsedNs(
-                [&] { submitter->submitAndWait(image, kRp1Timeout); }));
-            (void)submitter->drainCq();
+            TimedGraphResult sample = timedSubmission(submitter, image);
+            rp1Host.push_back(sample.elapsed);
+            validateGraphResult(
+                sample.result, image.nodes.size(), /*traceExpected=*/false);
+            resultGraph.push_back(sample.result.graphElapsedTicks);
         }
         measurements.push_back({
             "rp1.raw.batch." + suffix + ".submit_wait",
             "ns",
             std::move(rp1Host),
         });
+        addTicks(
+            measurements,
+            "rp1.result.batch." + suffix + ".graph_elapsed",
+            std::move(resultGraph), config.r5FrequencyHz);
 
         image.trace_enable = true;
         image.trace_size_override = ringSize(
@@ -744,10 +858,18 @@ void benchmarkBatches(
         std::vector<std::uint64_t> handoffGapsExcludingFlush;
         std::vector<std::uint64_t> flushDurations;
         for (std::size_t i = 0; i < config.traceIterations; ++i) {
-            submitter->submitAndWait(image, kRp1Timeout);
+            const vrt::graph::fpga::Rp1GraphResult result =
+                submitter->submitAndWait(image, kRp1Timeout);
+            validateGraphResult(
+                result, image.nodes.size(), /*traceExpected=*/true);
+            const vrt::graph::fpga::Rp1TraceCapture trace =
+                submitter->drainTrace();
+            if (result.traceWriteIndex != trace.written) {
+                throw std::runtime_error(
+                    "RP1 batch result and trace cursor disagree");
+            }
             const TraceIntervals intervals =
-                extractTrace(submitter->drainTrace(), batch);
-            (void)submitter->drainCq();
+                extractTrace(trace, batch);
             dispatch.push_back(intervals.dispatch);
             kernelSpan.push_back(intervals.kernelSpan);
             graph.push_back(intervals.graph);
@@ -850,8 +972,10 @@ void benchmarkTransfers(
 
         vrt::graph::fpga::Rp1GraphImage image = makeDmaImage(bytes);
         for (std::size_t i = 0; i < config.warmup; ++i) {
-            submitter->submitAndWait(image, kRp1Timeout);
-            (void)submitter->drainCq();
+            const vrt::graph::fpga::Rp1GraphResult result =
+                submitter->submitAndWait(image, kRp1Timeout);
+            validateGraphResult(
+                result, image.nodes.size(), /*traceExpected=*/false);
         }
 
         std::vector<std::uint64_t> rp1Host;
@@ -869,14 +993,11 @@ void benchmarkTransfers(
                                : std::uint8_t{0xa5});
             window->writeAt(
                 kScratchSourceOffset, source.data(), source.size());
-            rp1Host.push_back(elapsedNs(
-                [&] { submitter->submitAndWait(image, kRp1Timeout); }));
-            const std::vector<rp1_cq_entry_t> cq = submitter->drainCq();
-            if (cq.size() != 1 || cq.front().node_index != 0) {
-                throw std::runtime_error(
-                    "RP1 DMA benchmark received an unexpected CQ");
-            }
-            rp1Device.push_back(cq.front().timestamp);
+            TimedGraphResult sample = timedSubmission(submitter, image);
+            rp1Host.push_back(sample.elapsed);
+            validateGraphResult(
+                sample.result, image.nodes.size(), /*traceExpected=*/false);
+            rp1Device.push_back(sample.result.graphElapsedTicks);
             window->readAt(
                 kScratchDestinationOffset,
                 destination.data(), destination.size());
@@ -895,7 +1016,7 @@ void benchmarkTransfers(
         });
         addTicks(
             measurements,
-            "rp1.transfer." + suffix + ".graph_start_to_cq",
+            "rp1.transfer." + suffix + ".graph_elapsed",
             std::move(rp1Device), config.r5FrequencyHz);
     }
 }

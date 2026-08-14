@@ -30,7 +30,7 @@
  *
  *  - The sentinel slot gets the expected magic written once the graph
  *    finishes (the trailing-SIGNAL completion contract).
- *  - The CQ contains one entry per kernel + the sentinel signal node.
+ *  - One committed graph result describes terminal and image state.
  *  - Barrier masks and arg packing are correct for the diamond DAG.
  *  - Non-kernel Rp1Command variants (e.g. CompiledBridgeOpNode that
  *    the compiler splices for cross-device buffers) cause compileProgram
@@ -107,8 +107,6 @@ struct DdrView {
     rp1_ctrl_t&        ctrl()      { return *reinterpret_cast<rp1_ctrl_t*>(base + kWindowOff); }
     rp1_node_t*        nodes()     { return reinterpret_cast<rp1_node_t*>(
                                          base + kWindowOff + RP1_DEFAULT_NODE_ARRAY_OFFSET); }
-    rp1_cq_entry_t*    cq()        { return reinterpret_cast<rp1_cq_entry_t*>(
-                                         base + kWindowOff + RP1_DEFAULT_CQ_OFFSET); }
     std::uint32_t*     args()      { return reinterpret_cast<std::uint32_t*>(
                                          base + kWindowOff + RP1_DEFAULT_ARG_BUF_OFFSET); }
     rp1_signal_slot_t* signals()   { return reinterpret_cast<rp1_signal_slot_t*>(
@@ -137,25 +135,88 @@ const rp1_node_t* findDispatch(DdrView ddr, std::uint32_t r5Address) {
     return nullptr;
 }
 
+/**
+ * @brief Publish one committed terminal result in protocol-v5 order.
+ *
+ * The fake writes payload, commit magic, terminal state, then graph_done_seq.
+ * This mirrors the release contract consumed by Rp1Submitter.
+ */
+void publishFakeGraphResult(
+    DdrView ddr, std::uint32_t sequence, std::uint32_t outcome,
+    std::uint32_t errorCode, std::uint32_t terminalNode,
+    std::uint32_t terminalOpcode, std::uint32_t completedOperations,
+    std::uint32_t activeImageId, std::uint32_t imageState,
+    std::uint32_t extraFlags = 0u) {
+    rp1_ctrl_t& ctrl = ddr.ctrl();
+    rp1_graph_result_t& result = ctrl.result;
+    result.magic = 0u;
+    result.graph_seq = sequence;
+    result.outcome = outcome;
+    result.flags = extraFlags |
+        (outcome == RP1_GRAPH_RESULT_SUCCESS
+             ? 0u
+             : RP1_RESULT_EFFECTS_MAY_BE_PARTIAL |
+                   RP1_RESULT_UNREACHED_NODES);
+    result.error_code = errorCode;
+    result.terminal_node = terminalNode;
+    result.terminal_opcode = terminalOpcode;
+    result.error_detail = errorCode;
+    result.error_aux = 0u;
+    result.active_image_id = activeImageId;
+    result.image_state = imageState;
+    result.completed_operations = completedOperations;
+    result.graph_elapsed_ticks = 100u;
+    result.publish_elapsed_ticks = 120u;
+    result.trace_write_idx = ctrl.trace_write_idx;
+    result.quiescence = 0u;
+    ctrl.rp1_error_code = errorCode;
+    ctrl.terminal_error_node = terminalNode;
+    ctrl.terminal_error_detail = errorCode;
+    ctrl.terminal_error_aux = 0u;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    result.magic = RP1_GRAPH_RESULT_MAGIC;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    ctrl.rp1_state =
+        outcome == RP1_GRAPH_RESULT_FAILED
+            ? RP1_STATE_ERROR
+            : outcome == RP1_GRAPH_RESULT_HALTED
+                  ? RP1_STATE_HALTED
+                  : RP1_STATE_READY;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    ctrl.graph_done_seq = sequence;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+/**
+ * @brief Minimal fail-fast RP1 model for FpgaDevicePlan lifecycle tests.
+ *
+ * The optional failure callback selects one fatal node. Successful PDI_LOAD
+ * operations update persistent image state, while a failed PDI_LOAD publishes
+ * UNKNOWN so host-side reconciliation can be tested after terminal failure.
+ */
 class FakeRp1 {
    public:
-    using CompletionFn = std::function<
-        std::optional<std::pair<std::uint32_t, std::uint32_t>>(
+    /// Return a fatal @c RP1_ERR_* code for a selected node, or no failure.
+    using FailureFn = std::function<
+        std::optional<std::uint32_t>(
             std::uint32_t, const rp1_node_t&)>;
 
+    /// Start a publisher that may fail one node selected by @p failure.
     explicit FakeRp1(
         DdrView ddr, bool writeSignals = true,
-        CompletionFn completion = {})
+        FailureFn failure = {}, std::uint32_t resultFlags = 0u)
         : ddr_(ddr), writeSignals_(writeSignals),
-          completion_(std::move(completion)) {
+          failure_(std::move(failure)), resultFlags_(resultFlags) {
         thread_ = std::thread([this] { run(); });
     }
+    /// Stop the worker before the caller releases its backing mapping.
     ~FakeRp1() {
         stop_.store(true, std::memory_order_relaxed);
         if (thread_.joinable()) thread_.join();
     }
 
    private:
+    /// Evaluate one protocol condition against a shared signal value.
     static bool conditionSatisfied(
         std::uint32_t signal, std::uint16_t operation,
         std::uint32_t value) {
@@ -172,29 +233,39 @@ class FakeRp1 {
         return false;
     }
 
+    /// Watch graph_seq and publish one terminal result per accepted graph.
     void run() {
         while (!stop_.load(std::memory_order_relaxed)) {
             auto& c = ddr_.ctrl();
             if (c.graph_seq != c.graph_done_seq) {
+                const std::uint32_t sequence = c.graph_seq;
                 c.rp1_state = RP1_STATE_RUNNING;
+                terminalNode_ = RP1_TERMINAL_ERROR_NODE_NONE;
+                terminalOpcode_ = RP1_TERMINAL_OPCODE_NONE;
+                terminalCode_ = 0u;
+                completedOperations_ = 0u;
                 const bool failed = processGraph();
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                c.rp1_state =
-                    failed ? RP1_STATE_ERROR
-                           : RP1_STATE_READY;
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                c.graph_done_seq = c.graph_seq;
-                std::atomic_thread_fence(std::memory_order_seq_cst);
+                publishFakeGraphResult(
+                    ddr_, sequence,
+                    failed ? RP1_GRAPH_RESULT_FAILED
+                           : RP1_GRAPH_RESULT_SUCCESS,
+                    terminalCode_, terminalNode_, terminalOpcode_,
+                    completedOperations_, activeImageId_,
+                    activeImageState_,
+                    resultFlags_ |
+                        (terminalCode_ == RP1_ERR_PDI_TIMEOUT
+                             ? RP1_RESULT_RECOVERY_REQUIRED
+                             : 0u));
             }
             c.heartbeat = c.heartbeat + 1;
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
     }
 
+    /// Execute immediate node effects and stop at the first selected failure.
     bool processGraph() {
         auto& c = ddr_.ctrl();
-        const std::uint32_t count   = c.node_count;
-        const std::uint32_t cq_size = c.cq_size;
+        const std::uint32_t count = c.node_count;
         for (std::uint32_t i = 0; i < count; ++i) {
             rp1_node_t& n = ddr_.nodes()[i];
             if (n.opcode == RP1_OP_WAIT) {
@@ -207,7 +278,9 @@ class FakeRp1 {
                     wait.condition_op, wait.condition_value)) {
                     if (std::chrono::steady_clock::now() >
                         deadline) {
-                        c.rp1_error_code = RP1_ERR_KERNEL_TIMEOUT;
+                        terminalCode_ = RP1_ERR_KERNEL_TIMEOUT;
+                        terminalNode_ = i;
+                        terminalOpcode_ = n.opcode;
                         return true;
                     }
                     std::this_thread::sleep_for(
@@ -239,54 +312,59 @@ class FakeRp1 {
                     }
                 }
             }
+            const std::optional<std::uint32_t> failure =
+                failure_ ? failure_(i, n) : std::nullopt;
+            if (failure) {
+                terminalCode_ = *failure;
+                terminalNode_ = i;
+                terminalOpcode_ = n.opcode;
+                if (n.opcode == RP1_OP_PDI_LOAD) {
+                    activeImageId_ = 0u;
+                    activeImageState_ = RP1_IMAGE_STATE_UNKNOWN;
+                }
+                return true;
+            }
+            if (n.opcode == RP1_OP_PDI_LOAD) {
+                activeImageId_ = n.payload.pdi_load.image_id;
+                activeImageState_ =
+                    activeImageId_ == 0u
+                        ? RP1_IMAGE_STATE_NONE
+                        : RP1_IMAGE_STATE_KNOWN;
+            }
             if (n.opcode == RP1_OP_SIGNAL && writeSignals_) {
                 const auto& pl = n.payload.signal;
                 ddr_.signals()[pl.target_slot].value = pl.value;
                 ddr_.signals()[pl.target_slot].last_writer_node = i;
             }
-            const auto completion =
-                completion_
-                    ? completion_(i, n)
-                    : std::optional<std::pair<
-                          std::uint32_t, std::uint32_t>>(
-                          std::make_pair(
-                              static_cast<std::uint32_t>(
-                                  RP1_CQ_OK),
-                              0u));
-            if ((n.flags & RP1_FLAG_SILENT) == 0u &&
-                completion) {
-                while (!stop_.load(std::memory_order_relaxed) &&
-                       c.cq_write_idx - c.cq_read_idx == cq_size) {
-                    std::this_thread::sleep_for(
-                        std::chrono::microseconds(50));
-                }
-                if (stop_.load(std::memory_order_relaxed))
-                    return true;
-                const std::uint32_t idx = c.cq_write_idx & (cq_size - 1u);
-                rp1_cq_entry_t& e = ddr_.cq()[idx];
-                e.node_index   = i;
-                e.status       = completion->first;
-                e.error_detail = completion->second;
-                e.timestamp    = 0;
-                ++c.cq_write_idx;
-            }
             n.status = RP1_NODE_DONE;
-            if (completion &&
-                completion->first != RP1_CQ_OK) {
-                c.rp1_error_code = completion->second;
-                c.terminal_error_node = i;
-                c.terminal_error_detail = completion->second;
-                c.terminal_error_aux = 0u;
-                return true;
-            }
+            ++completedOperations_;
         }
         return false;
     }
 
+    /// Shared fake-DDR view; non-owning.
     DdrView           ddr_;
+    /// Whether SIGNAL operations update the shared array.
     bool              writeSignals_;
-    CompletionFn      completion_;
+    /// Optional fatal-node selector.
+    FailureFn         failure_;
+    /// Extra terminal flags published for every fake result.
+    std::uint32_t     resultFlags_ = 0u;
+    /// Cooperative worker-stop flag.
     std::atomic<bool> stop_{false};
+    /// Persistent numeric image id known by the fake firmware.
+    std::uint32_t     activeImageId_ = 0u;
+    /// Persistent @c RP1_IMAGE_STATE_* classification.
+    std::uint32_t     activeImageState_ = RP1_IMAGE_STATE_NONE;
+    /// First terminal @c RP1_ERR_* code for the current graph.
+    std::uint32_t     terminalCode_ = 0u;
+    /// First terminal node for the current graph.
+    std::uint32_t     terminalNode_ = RP1_TERMINAL_ERROR_NODE_NONE;
+    /// Opcode at @c terminalNode_.
+    std::uint32_t     terminalOpcode_ = RP1_TERMINAL_OPCODE_NONE;
+    /// Successful operation executions before terminal publication.
+    std::uint32_t     completedOperations_ = 0u;
+    /// Background firmware-emulation thread.
     std::thread       thread_;
 };
 
@@ -336,12 +414,14 @@ class FaithfulRp1 {
         while (!stop_.load(std::memory_order_relaxed)) {
             auto& c = ddr_.ctrl();
             if (c.graph_seq != c.graph_done_seq) {
+                const std::uint32_t sequence = c.graph_seq;
                 c.rp1_state = RP1_STATE_RUNNING;
                 processGraph();
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                c.rp1_state      = RP1_STATE_READY;
-                c.graph_done_seq = c.graph_seq;
-                std::atomic_thread_fence(std::memory_order_seq_cst);
+                publishFakeGraphResult(
+                    ddr_, sequence, RP1_GRAPH_RESULT_SUCCESS,
+                    0u, RP1_TERMINAL_ERROR_NODE_NONE,
+                    RP1_TERMINAL_OPCODE_NONE, c.node_count,
+                    activeImageId_, activeImageState_);
             }
             c.heartbeat = c.heartbeat + 1;
             std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -471,7 +551,16 @@ class FaithfulRp1 {
                         progress = true;
                         break;
                     }
-                    default:  // NOP / PDI_LOAD / SCALAR_* -> immediate
+                    case RP1_OP_PDI_LOAD:
+                        activeImageId_ = n.payload.pdi_load.image_id;
+                        activeImageState_ =
+                            activeImageId_ == 0u
+                                ? RP1_IMAGE_STATE_NONE
+                                : RP1_IMAGE_STATE_KNOWN;
+                        setDone(i);
+                        progress = true;
+                        break;
+                    default:  // NOP / SCALAR_* -> immediate
                         setDone(i);
                         progress = true;
                         break;
@@ -505,6 +594,11 @@ class FaithfulRp1 {
     std::mutex                             mtx_;
     std::map<std::uint32_t, std::uint32_t> dispatchCount_;
     std::map<std::uint32_t, std::uint32_t> scalarReadCount_;
+    /// Persistent numeric image id after successful PDI_LOAD operations.
+    std::uint32_t                          activeImageId_ = 0u;
+    /// Persistent @c RP1_IMAGE_STATE_* classification.
+    std::uint32_t                          activeImageState_ =
+        RP1_IMAGE_STATE_NONE;
 
    public:
     std::uint32_t scalarCopyTo(std::uint32_t addr) {
@@ -522,8 +616,11 @@ void primeAsReady(DdrView ddr) {
     c.version      = RP1_PROTOCOL_VERSION;
     c.capabilities = RP1_REQUIRED_CAPABILITIES;
     c.pdi_ipi_platform_id = 0x51454D55u;
+    c.graph_seq     = 0u;
+    c.graph_done_seq = 0u;
     c.rp1_state    = RP1_STATE_READY;
     c.heartbeat    = 1;
+    c.result.magic = 0u;
     c.magic        = RP1_CTRL_MAGIC;
 }
 
@@ -715,7 +812,7 @@ TEST_F(FpgaDeviceFixture, ImageNumericIdIsStableOneBasedAndZeroForUnguarded) {
     EXPECT_EQ(dev.imageNumericId(""), 0u);
 }
 
-TEST_F(FpgaDeviceFixture, CqDiagnosticReportsRetainedCompletions) {
+TEST_F(FpgaDeviceFixture, GraphResultDiagnosticReportsTerminalSnapshot) {
     auto dev = std::make_shared<FpgaDevice>(
         "fpga:0", window_, makeDiamondLookup());
 
@@ -730,15 +827,15 @@ TEST_F(FpgaDeviceFixture, CqDiagnosticReportsRetainedCompletions) {
     auto plan = dev->compileProgram(program);
     ASSERT_NE(plan, nullptr);
 
-    ScopedEnv cqTrace("VRT_RP1_CQ", std::string("1"));
+    ScopedEnv resultTrace("VRT_RP1_RESULT", std::string("1"));
     testing::internal::CaptureStderr();
     EXPECT_NO_THROW(plan->launch());
     EXPECT_NO_THROW(plan->wait());
     const std::string diagnostics = testing::internal::GetCapturedStderr();
 
-    EXPECT_NE(diagnostics.find("[rp1-cq] entries="), std::string::npos);
+    EXPECT_NE(diagnostics.find("[rp1-result] seq=1"), std::string::npos);
     EXPECT_NE(
-        diagnostics.find("opcode=KERNEL_DISPATCH status=OK(0)"),
+        diagnostics.find("outcome=SUCCESS(1)"),
         std::string::npos);
 }
 
@@ -1579,15 +1676,11 @@ TEST_F(FpgaDeviceFixture,
     rp1_ = std::make_unique<FakeRp1>(
         ddr_, true,
         [](std::uint32_t, const rp1_node_t& node)
-            -> std::optional<
-                std::pair<std::uint32_t, std::uint32_t>> {
+            -> std::optional<std::uint32_t> {
             if (node.opcode == RP1_OP_KERNEL_DISPATCH) {
-                return std::make_pair(
-                    static_cast<std::uint32_t>(RP1_CQ_ERROR),
-                    0x55u);
+                return 0x55u;
             }
-            return std::make_pair(
-                static_cast<std::uint32_t>(RP1_CQ_OK), 0u);
+            return std::nullopt;
         });
     auto dev = std::make_shared<FpgaDevice>(
         "fpga:0", window_, makeImageRuntimeSpec(),
@@ -1611,7 +1704,17 @@ TEST_F(FpgaDeviceFixture,
 
     auto plan = dev->compileProgram(program);
     plan->launch();
-    EXPECT_THROW(plan->wait(), std::runtime_error);
+    try {
+        plan->wait();
+        FAIL() << "expected determinate graph failure";
+    } catch (const std::runtime_error& error) {
+        const std::string message = error.what();
+        EXPECT_NE(message.find("returned FAILED"), std::string::npos);
+        EXPECT_NE(message.find("error_code=85"), std::string::npos);
+        EXPECT_NE(message.find("image_state=KNOWN"), std::string::npos);
+        EXPECT_EQ(message.find("lifecycle sentinel"), std::string::npos)
+            << "failure must be surfaced before success-only sentinel validation";
+    }
     plan.reset();
 
     fpga::Rp1GraphImage projected;
@@ -1630,16 +1733,51 @@ TEST_F(FpgaDeviceFixture, FailedPdiMakesActiveImageUnknown) {
     rp1_ = std::make_unique<FakeRp1>(
         ddr_, true,
         [](std::uint32_t, const rp1_node_t& node)
-            -> std::optional<
-                std::pair<std::uint32_t, std::uint32_t>> {
+            -> std::optional<std::uint32_t> {
             if (node.opcode == RP1_OP_PDI_LOAD) {
-                return std::make_pair(
-                    static_cast<std::uint32_t>(RP1_CQ_ERROR),
-                    static_cast<std::uint32_t>(
-                        RP1_ERR_PDI_FAILED));
+                return RP1_ERR_PDI_FAILED;
             }
-            return std::make_pair(
-                static_cast<std::uint32_t>(RP1_CQ_OK), 0u);
+            return std::nullopt;
+        });
+    auto dev = std::make_shared<FpgaDevice>(
+        "fpga:0", window_, makeImageRuntimeSpec(),
+        "imageA");
+
+    Rp1QueueProgram program;
+    program.device = DeviceId("fpga:0");
+    Rp1ReprogramCommand load;
+    load.id = "load_b";
+    load.deviceId = "fpga:0";
+    load.imageId = "imageB";
+    program.commands.emplace_back(load);
+
+    auto plan = dev->compileProgram(program);
+    plan->launch();
+    try {
+        plan->wait();
+        FAIL() << "expected PDI failure";
+    } catch (const std::runtime_error& error) {
+        const std::string message = error.what();
+        EXPECT_NE(message.find("error_code=5"), std::string::npos);
+        EXPECT_NE(message.find("image_state=UNKNOWN"), std::string::npos);
+    }
+    plan.reset();
+
+    EXPECT_THROW(
+        dev->projectProgram(makeImplicitImageProgram()),
+        std::runtime_error);
+}
+
+TEST_F(FpgaDeviceFixture, PdiRecoveryResultPoisonsDeviceReuse) {
+    rp1_.reset();
+    rp1_ = std::make_unique<FakeRp1>(
+        ddr_, true,
+        [](std::uint32_t, const rp1_node_t& node)
+            -> std::optional<std::uint32_t> {
+            if (node.opcode == RP1_OP_PDI_LOAD) {
+                return RP1_ERR_PDI_TIMEOUT;
+            }
+            return std::nullopt;
         });
     auto dev = std::make_shared<FpgaDevice>(
         "fpga:0", window_, makeImageRuntimeSpec(),
@@ -1656,11 +1794,33 @@ TEST_F(FpgaDeviceFixture, FailedPdiMakesActiveImageUnknown) {
     auto plan = dev->compileProgram(program);
     plan->launch();
     EXPECT_THROW(plan->wait(), std::runtime_error);
+    EXPECT_TRUE(dev->executionPoisoned());
+    EXPECT_TRUE(dev->submitter()->poisoned());
     plan.reset();
 
     EXPECT_THROW(
-        dev->projectProgram(makeImplicitImageProgram()),
+        dev->leaseResources({RendezvousId(0)}, {}),
         std::runtime_error);
+}
+
+TEST_F(FpgaDeviceFixture, InfiniteWorkResultPoisonsDeviceReuse) {
+    rp1_.reset();
+    rp1_ = std::make_unique<FakeRp1>(
+        ddr_, true, FakeRp1::FailureFn{},
+        RP1_RESULT_INFINITE_WORK_REMAINS);
+    auto dev = std::make_shared<FpgaDevice>(
+        "fpga:0", window_, makeImageRuntimeSpec(),
+        "imageA");
+    const Rp1QueueProgram program = makeImplicitImageProgram();
+
+    auto plan = dev->compileProgram(program);
+    plan->launch();
+    EXPECT_NO_THROW(plan->wait());
+    EXPECT_TRUE(dev->executionPoisoned());
+    EXPECT_TRUE(dev->submitter()->poisoned());
+    plan.reset();
+
+    EXPECT_THROW(dev->compileProgram(program), std::runtime_error);
 }
 
 TEST_F(FpgaDeviceFixture,
@@ -1702,55 +1862,6 @@ TEST_F(FpgaDeviceFixture,
     dev.reset();
     EXPECT_FALSE(quarantinedDevice.expired())
         << "poison quarantine must retain the device and its DMA/PDI pins";
-}
-
-TEST_F(FpgaDeviceFixture,
-       ImageReconciliationIgnoresPdiWithoutCqEvidence) {
-    const auto spec = makeImageRuntimeSpec();
-    const std::uint32_t imageAId = 1u;
-    rp1_.reset();
-    rp1_ = std::make_unique<FakeRp1>(
-        ddr_, true,
-        [imageAId](
-            std::uint32_t, const rp1_node_t& node)
-            -> std::optional<
-                std::pair<std::uint32_t, std::uint32_t>> {
-            if (node.opcode == RP1_OP_PDI_LOAD &&
-                node.payload.pdi_load.image_id == imageAId) {
-                return std::nullopt;
-            }
-            return std::make_pair(
-                static_cast<std::uint32_t>(RP1_CQ_OK), 0u);
-        });
-    auto dev = std::make_shared<FpgaDevice>(
-        "fpga:0", window_, spec, std::string{});
-
-    Rp1QueueProgram program;
-    program.device = DeviceId("fpga:0");
-    Rp1ReprogramCommand loadB;
-    loadB.id = "load_b";
-    loadB.deviceId = "fpga:0";
-    loadB.imageId = "imageB";
-    program.commands.emplace_back(loadB);
-    Rp1ReprogramCommand skippedA;
-    skippedA.id = "skipped_a";
-    skippedA.deviceId = "fpga:0";
-    skippedA.imageId = "imageA";
-    skippedA.dependsOn = {loadB.id};
-    program.commands.emplace_back(skippedA);
-
-    auto plan = dev->compileProgram(program);
-    ASSERT_NO_THROW(plan->launch());
-    ASSERT_NO_THROW(plan->wait());
-    plan.reset();
-
-    const fpga::Rp1GraphImage projected =
-        dev->projectProgram(makeImplicitImageProgram());
-    ASSERT_FALSE(projected.nodes.empty());
-    EXPECT_EQ(
-        projected.nodes.front()
-            .payload.kernel_dispatch.kernel_base_addr,
-        kKernelB_R5);
 }
 
 TEST_F(FpgaDeviceFixture,
@@ -1874,8 +1985,9 @@ TEST_F(FpgaDeviceFixture, DiamondGraphCompletesAndSentinelFires) {
     ASSERT_NO_THROW(g.compile().run());
 
     EXPECT_EQ(ddr_.signals()[kDefaultSentinelSlot].value, kDefaultSentinelValue);
-    // 4 kernels + 1 sentinel signal = 5 CQ entries.
-    EXPECT_EQ(ddr_.ctrl().cq_write_idx, 5u);
+    EXPECT_EQ(ddr_.ctrl().result.outcome,
+              static_cast<std::uint32_t>(RP1_GRAPH_RESULT_SUCCESS));
+    EXPECT_EQ(ddr_.ctrl().result.completed_operations, 5u);
 }
 
 TEST_F(FpgaDeviceFixture, MissingLifecycleSentinelRejectsCompletion) {
@@ -1933,10 +2045,10 @@ TEST_F(FpgaDeviceFixture, DiamondBarrierMasksAreCorrect) {
     ASSERT_NE(nc, nullptr);
     ASSERT_NE(nd, nullptr);
 
-    EXPECT_NE(na->flags & RP1_FLAG_HALT_ON_ERROR, 0u);
-    EXPECT_NE(nb->flags & RP1_FLAG_HALT_ON_ERROR, 0u);
-    EXPECT_NE(nc->flags & RP1_FLAG_HALT_ON_ERROR, 0u);
-    EXPECT_NE(nd->flags & RP1_FLAG_HALT_ON_ERROR, 0u);
+    EXPECT_EQ(na->flags, 0u);
+    EXPECT_EQ(nb->flags, 0u);
+    EXPECT_EQ(nc->flags, 0u);
+    EXPECT_EQ(nd->flags, 0u);
     EXPECT_EQ(na->barrier_await_mask, 0u);
     EXPECT_EQ(nb->barrier_await_mask, na->barrier_set_mask);
     EXPECT_EQ(nc->barrier_await_mask, na->barrier_set_mask);
@@ -3564,7 +3676,6 @@ TEST(FpgaCrossQueue, SignalWaitRendezvousAcrossConcurrentQueues) {
     };
     auto submit = [](DdrView ddr, const std::vector<rp1_node_t>& ns) {
         auto& c = ddr.ctrl();
-        c.cq_size    = 64u;
         c.node_count = static_cast<std::uint32_t>(ns.size());
         for (std::size_t i = 0; i < ns.size(); ++i) ddr.nodes()[i] = ns[i];
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -3693,7 +3804,6 @@ TEST(FpgaCrossQueue, PerIterationHandshakeOverNIterations) {
     }
 
     auto& c = ddr.ctrl();
-    c.cq_size = 64u;
     c.node_count = static_cast<std::uint32_t>(q.size());
     for (std::size_t i = 0; i < q.size(); ++i) ddr.nodes()[i] = q[i];
 
@@ -3898,7 +4008,6 @@ TEST(FpgaCrossQueue, WhileLoopTerminatesOnBroadcastPredicate) {
     }
 
     auto& c = ddr.ctrl();
-    c.cq_size = 64u;
     c.node_count = static_cast<std::uint32_t>(q.size());
     for (std::size_t i = 0; i < q.size(); ++i) ddr.nodes()[i] = q[i];
 

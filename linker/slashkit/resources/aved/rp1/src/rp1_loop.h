@@ -11,7 +11,7 @@
 /*
  * A scanner pass activates barrier-ready nodes, polls inflight kernels, then
  * revisits parked WAITs. It repeats while asynchronous or externally signalled
- * work can progress; fatal exits first quiesce all tracked finite kernels.
+ * work can progress; fatal and HALT exits first classify all tracked work.
  */
 #ifdef QEMU_SEMIHOSTING
 

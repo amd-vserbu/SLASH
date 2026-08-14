@@ -22,9 +22,39 @@
 #include "rp1_latency.cpp"
 
 /**
- * @brief Verify flush accounting, PMU wrap, and complete kernel evidence.
+ * @brief Verify result validation, flush accounting, and PMU wrap.
  */
 int main() {
+    vrt::graph::fpga::Rp1GraphResult result;
+    result.flags = RP1_RESULT_TRACE_ENABLED;
+    result.activeImageId = 1u;
+    result.imageState = vrt::graph::fpga::Rp1ImageState::Known;
+    result.completedOperations = 3u;
+    result.graphElapsedTicks = 161u;
+    result.publishElapsedTicks = 170u;
+    result.traceWriteIndex = 10u;
+    try {
+        validateGraphResult(result, 3u, /*traceExpected=*/true);
+    } catch (const std::runtime_error&) {
+        return 1;
+    }
+
+    result.flags |= RP1_RESULT_RECOVERY_REQUIRED;
+    try {
+        validateGraphResult(result, 3u, /*traceExpected=*/true);
+        return 1;
+    } catch (const std::runtime_error&) {
+        result.flags &= ~RP1_RESULT_RECOVERY_REQUIRED;
+    }
+
+    result.flags |= RP1_RESULT_INFINITE_WORK_REMAINS;
+    try {
+        validateGraphResult(result, 3u, /*traceExpected=*/true);
+        return 1;
+    } catch (const std::runtime_error&) {
+        result.flags &= ~RP1_RESULT_INFINITE_WORK_REMAINS;
+    }
+
     vrt::graph::fpga::Rp1TraceCapture capture;
     const auto add = [&](std::uint16_t event, std::uint16_t node,
                          std::uint32_t timestamp) {

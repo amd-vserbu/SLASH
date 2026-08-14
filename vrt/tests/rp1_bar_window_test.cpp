@@ -68,10 +68,10 @@ TEST(Rp1BarWindowProtocol, WireSizesMatchHeader) {
     // mirroring them in a runtime test makes regressions easy to spot in CI.
     EXPECT_EQ(sizeof(rp1_node_t),        std::size_t{64});
     EXPECT_EQ(sizeof(rp1_ctrl_t),        std::size_t{0x1000});
+    EXPECT_EQ(sizeof(rp1_graph_result_t), std::size_t{64});
     EXPECT_EQ(sizeof(rp1_signal_slot_t), std::size_t{16});
-    EXPECT_EQ(sizeof(rp1_cq_entry_t),    std::size_t{16});
     EXPECT_EQ(sizeof(rp1_trace_entry_t), std::size_t{16});
-    EXPECT_EQ(RP1_PROTOCOL_VERSION, 4u);
+    EXPECT_EQ(RP1_PROTOCOL_VERSION, 5u);
     EXPECT_EQ(offsetof(rp1_ctrl_t, capabilities), std::size_t{0x64});
     EXPECT_EQ(offsetof(rp1_ctrl_t, pdi_ipi_platform_id),
               std::size_t{0x68});
@@ -81,6 +81,7 @@ TEST(Rp1BarWindowProtocol, WireSizesMatchHeader) {
               std::size_t{0x70});
     EXPECT_EQ(offsetof(rp1_ctrl_t, terminal_error_aux),
               std::size_t{0x74});
+    EXPECT_EQ(offsetof(rp1_ctrl_t, result), std::size_t{0x80});
 }
 
 TEST_F(WindowFixture, MappedLengthAndWindowOffsetExposed) {
@@ -101,9 +102,7 @@ TEST_F(WindowFixture, ControlBlockReadWriteRoundTrip) {
     out.magic            = RP1_CTRL_MAGIC;
     out.version          = RP1_PROTOCOL_VERSION;
     out.node_count       = 5;
-    out.cq_size          = 64;
     out.node_base_lo     = 0x30001000u;
-    out.cq_base_lo       = 0x30041000u;
     out.arg_buf_base_lo  = 0x30051000u;
     out.sig_array_base_lo = 0x30151000u;
     out.graph_seq        = 1;
@@ -112,6 +111,9 @@ TEST_F(WindowFixture, ControlBlockReadWriteRoundTrip) {
     out.capabilities     = RP1_REQUIRED_CAPABILITIES;
     out.pdi_ipi_platform_id = RP1_PDI_IPI_PLATFORM_UNKNOWN;
     out.terminal_error_node = RP1_TERMINAL_ERROR_NODE_NONE;
+    out.result.magic = RP1_GRAPH_RESULT_MAGIC;
+    out.result.graph_seq = 1u;
+    out.result.outcome = RP1_GRAPH_RESULT_SUCCESS;
 
     window_->writeCtrl(out);
 
@@ -125,11 +127,13 @@ TEST_F(WindowFixture, ControlBlockReadWriteRoundTrip) {
     rp1_ctrl_t roundtrip{};
     window_->readCtrl(roundtrip);
     EXPECT_EQ(roundtrip.magic, RP1_CTRL_MAGIC);
-    EXPECT_EQ(roundtrip.cq_size, 64u);
     EXPECT_EQ(roundtrip.sig_array_base_lo, 0x30151000u);
     EXPECT_EQ(roundtrip.capabilities, RP1_REQUIRED_CAPABILITIES);
     EXPECT_EQ(roundtrip.terminal_error_node,
               RP1_TERMINAL_ERROR_NODE_NONE);
+    EXPECT_EQ(roundtrip.result.magic, RP1_GRAPH_RESULT_MAGIC);
+    EXPECT_EQ(roundtrip.result.outcome,
+              static_cast<std::uint32_t>(RP1_GRAPH_RESULT_SUCCESS));
 }
 
 TEST_F(WindowFixture, SingleWordHotPathAccessors) {
@@ -218,21 +222,30 @@ TEST_F(WindowFixture, ClearAndReadSignalSlot) {
     EXPECT_EQ(out.flags, 0u);
 }
 
-TEST_F(WindowFixture, ReadCqEntryAtIndex) {
-    rp1_cq_entry_t entry{};
-    entry.node_index   = 4;
-    entry.status       = RP1_CQ_OK;
-    entry.error_detail = 0;
-    entry.timestamp    = 0xABCDu;
-    std::memcpy(backing_.data() + kWindowOff + RP1_DEFAULT_CQ_OFFSET
-                    + 7 * sizeof(rp1_cq_entry_t),
-                &entry, sizeof(entry));
+TEST_F(WindowFixture, ReadGraphResultTakesOneTypedSnapshot) {
+    rp1_graph_result_t result{};
+    result.magic = RP1_GRAPH_RESULT_MAGIC;
+    result.graph_seq = 9u;
+    result.outcome = RP1_GRAPH_RESULT_FAILED;
+    result.flags = RP1_RESULT_RECOVERY_REQUIRED;
+    result.error_code = RP1_ERR_PDI_FAILED;
+    result.terminal_node = 4u;
+    result.terminal_opcode = RP1_OP_PDI_LOAD;
+    result.active_image_id = 2u;
+    result.image_state = RP1_IMAGE_STATE_KNOWN;
+    std::memcpy(
+        backing_.data() + kWindowOff + offsetof(rp1_ctrl_t, result),
+        &result, sizeof(result));
 
-    rp1_cq_entry_t out{};
-    window_->readCq(/*idx*/ 7, out);
-    EXPECT_EQ(out.node_index, 4u);
-    EXPECT_EQ(out.status,     static_cast<std::uint32_t>(RP1_CQ_OK));
-    EXPECT_EQ(out.timestamp,  0xABCDu);
+    rp1_graph_result_t out{};
+    window_->readGraphResult(out);
+    EXPECT_EQ(out.magic, RP1_GRAPH_RESULT_MAGIC);
+    EXPECT_EQ(out.graph_seq, 9u);
+    EXPECT_EQ(out.outcome,
+              static_cast<std::uint32_t>(RP1_GRAPH_RESULT_FAILED));
+    EXPECT_EQ(out.terminal_opcode,
+              static_cast<std::uint32_t>(RP1_OP_PDI_LOAD));
+    EXPECT_EQ(out.active_image_id, 2u);
 }
 
 TEST_F(WindowFixture, ReadTraceEntryAtIndex) {

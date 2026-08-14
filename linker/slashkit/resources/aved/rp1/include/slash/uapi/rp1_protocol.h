@@ -19,7 +19,7 @@
  *   - Opcodes, flags, status codes, and condition operators
  *   - The 64-byte node packet and its 48-byte payload union
  *   - The 4 KB control block at the base of the host-visible BAR window
- *   - The 16-byte signal slot and 16-byte completion-queue entry
+ *   - The 16-byte signal slot, 64-byte graph result, and trace entry
  *   - The in-flight kernel tracking table
  *   - Recommended default layout offsets within the BAR window
  *
@@ -62,7 +62,7 @@ extern "C" {
 #define RP1_CTRL_WINDOW_SIZE            0x04000000UL  /* 64 MB aperture */
 
 #define RP1_DEFAULT_NODE_ARRAY_OFFSET   0x00001000UL  /* 256 KB */
-#define RP1_DEFAULT_CQ_OFFSET           0x00041000UL  /*  64 KB */
+#define RP1_RESERVED_CQ_OFFSET          0x00041000UL  /* legacy v4 CQ gap */
 #define RP1_DEFAULT_ARG_BUF_OFFSET      0x00051000UL  /*   1 MB */
 #define RP1_DEFAULT_SIG_ARRAY_OFFSET    0x00151000UL  /*   4 KB */
 #define RP1_DEFAULT_TRACE_OFFSET        0x00152000UL  /* trace ring */
@@ -92,8 +92,8 @@ typedef enum {
  * Universal node flags (rp1_node_t.flags)
  * ====================================================================== */
 
-#define RP1_FLAG_HALT_ON_ERROR  (1u << 0)
-#define RP1_FLAG_SILENT         (1u << 1)
+#define RP1_FLAG_RESERVED_0     (1u << 0)
+#define RP1_FLAG_RESERVED_1     (1u << 1)
 #define RP1_FLAG_INFINITE       (1u << 2)   /* KERNEL_DISPATCH: node DONE immediately */
 
 /* =========================================================================
@@ -120,19 +120,10 @@ typedef enum {
 #define RP1_ERR_PDI_FAILED      5u  /* PLM rejected a partial-PDI load command   */
 #define RP1_ERR_INVALID_CONFIG  6u  /* invalid shared control-block configuration */
 #define RP1_ERR_INVALID_NODE    7u  /* malformed node packet                      */
-#define RP1_ERR_CQ_CORRUPT      8u  /* CQ producer/consumer cursors are invalid   */
-
-/* ORed into rp1_error_code when terminal recovery requires an RP1/card reset
- * because one or more launched kernels could not be proven quiescent. */
-#define RP1_ERR_RECOVERY_REQUIRED  (1u << 31)
-#define RP1_ERR_CODE_MASK           (~RP1_ERR_RECOVERY_REQUIRED)
-
 /* terminal_error_detail values for RP1_ERR_INVALID_CONFIG. */
 #define RP1_CONFIG_NODE_COUNT       1u
 #define RP1_CONFIG_NODE_BASE        2u
-#define RP1_CONFIG_CQ_SIZE          3u
-#define RP1_CONFIG_CQ_BASE          4u
-#define RP1_CONFIG_CQ_CURSORS       5u
+#define RP1_CONFIG_RESERVED_CQ      3u
 #define RP1_CONFIG_ARG_BASE         6u
 #define RP1_CONFIG_SIGNAL_BASE      7u
 #define RP1_CONFIG_TRACE            8u
@@ -144,7 +135,6 @@ typedef enum {
 #define RP1_NODE_BAD_TARGET         4u
 #define RP1_NODE_BAD_OPERATION      5u
 #define RP1_NODE_BAD_ARGUMENTS      6u
-#define RP1_NODE_PDI_WITHOUT_CQ     7u
 
 /* =========================================================================
  * Condition operators (used by LOOP and COND)
@@ -187,6 +177,64 @@ typedef enum {
     RP1_STATE_ERROR   = 3,
     RP1_STATE_HALTED  = 4,
 } rp1_state_t;
+
+/* =========================================================================
+ * Terminal graph result (protocol v5)
+ * ====================================================================== */
+
+#define RP1_GRAPH_RESULT_MAGIC  0x52534C54UL  /* "RSLT" */
+#define RP1_TERMINAL_OPCODE_NONE 0xFFFFFFFFu
+
+typedef enum {
+    RP1_GRAPH_RESULT_NONE    = 0,
+    RP1_GRAPH_RESULT_SUCCESS = 1,
+    RP1_GRAPH_RESULT_FAILED  = 2,
+    RP1_GRAPH_RESULT_HALTED  = 3,
+} rp1_graph_outcome_t;
+
+typedef enum {
+    RP1_IMAGE_STATE_NONE    = 0,
+    RP1_IMAGE_STATE_KNOWN   = 1,
+    RP1_IMAGE_STATE_UNKNOWN = 2,
+} rp1_image_state_t;
+
+#define RP1_RESULT_RECOVERY_REQUIRED    (1u << 0)
+#define RP1_RESULT_EFFECTS_MAY_BE_PARTIAL (1u << 1)
+#define RP1_RESULT_INFINITE_WORK_REMAINS  (1u << 2)
+#define RP1_RESULT_TRACE_ENABLED          (1u << 3)
+#define RP1_RESULT_TRACE_OVERFLOW         (1u << 4)
+#define RP1_RESULT_UNREACHED_NODES        (1u << 5)
+
+#define RP1_QUIESCE_FINITE_DONE_SHIFT      0u
+#define RP1_QUIESCE_FINITE_TIMEOUT_SHIFT   8u
+#define RP1_QUIESCE_INFINITE_SHIFT        16u
+#define RP1_QUIESCE_COUNT_MASK             0xFFu
+#define RP1_QUIESCE_PACK(done, timeout, infinite)                       \
+    ((((uint32_t)(done) & RP1_QUIESCE_COUNT_MASK)                       \
+      << RP1_QUIESCE_FINITE_DONE_SHIFT) |                               \
+     (((uint32_t)(timeout) & RP1_QUIESCE_COUNT_MASK)                    \
+      << RP1_QUIESCE_FINITE_TIMEOUT_SHIFT) |                            \
+     (((uint32_t)(infinite) & RP1_QUIESCE_COUNT_MASK)                   \
+      << RP1_QUIESCE_INFINITE_SHIFT))
+
+typedef struct {
+    volatile uint32_t magic;               /* Written last: RP1_GRAPH_RESULT_MAGIC */
+    volatile uint32_t graph_seq;           /* Accepted graph sequence               */
+    volatile uint32_t outcome;             /* rp1_graph_outcome_t                    */
+    volatile uint32_t flags;               /* RP1_RESULT_*                           */
+    volatile uint32_t error_code;          /* First terminal RP1_ERR_* code          */
+    volatile uint32_t terminal_node;        /* Failing or HALT node                   */
+    volatile uint32_t terminal_opcode;      /* Opcode at terminal_node                */
+    volatile uint32_t error_detail;         /* Error-specific primary detail          */
+    volatile uint32_t error_aux;            /* Error-specific auxiliary detail        */
+    volatile uint32_t active_image_id;      /* Final known image id, or 0             */
+    volatile uint32_t image_state;          /* rp1_image_state_t                      */
+    volatile uint32_t completed_operations; /* Successful node executions             */
+    volatile uint32_t graph_elapsed_ticks;  /* Graph work through GRAPH_DONE          */
+    volatile uint32_t publish_elapsed_ticks;/* Includes final trace/result preparation */
+    volatile uint32_t trace_write_idx;      /* Final monotonic trace producer cursor  */
+    volatile uint32_t quiescence;           /* RP1_QUIESCE_PACK counts                */
+} rp1_graph_result_t;
 
 /* =========================================================================
  * Trace events (optional trace ring)
@@ -422,20 +470,21 @@ typedef struct {
 
 #define RP1_CTRL_MAGIC  0x53515231UL  /* "SQR1" */
 
-/* Protocol-v4 firmware capabilities.  These bits describe support for the
- * reserved v4 contracts; host code must reject firmware missing any bit in
+/* Protocol-v5 firmware capabilities.  These bits describe support for the
+ * reserved v5 contracts; host code must reject firmware missing any bit in
  * RP1_REQUIRED_CAPABILITIES. */
 #define RP1_CAP_PLATFORM_PDI_IPI_CONFIG   (1u << 0)
 #define RP1_CAP_PMU_CYCLE_TIMEOUTS        (1u << 1)
-#define RP1_CAP_CQ_FLOW_CONTROL           (1u << 2)
 #define RP1_CAP_STRUCTURED_PDI_RESPONSE   (1u << 3)
 #define RP1_CAP_LATCHED_TERMINAL_ERRORS   (1u << 4)
 #define RP1_CAP_BTCM_TRACE_STAGING        (1u << 5)
+#define RP1_CAP_GRAPH_RESULT              (1u << 6)
 
 #define RP1_REQUIRED_CAPABILITIES                                      \
     (RP1_CAP_PLATFORM_PDI_IPI_CONFIG | RP1_CAP_PMU_CYCLE_TIMEOUTS |   \
-     RP1_CAP_CQ_FLOW_CONTROL | RP1_CAP_STRUCTURED_PDI_RESPONSE |      \
-     RP1_CAP_LATCHED_TERMINAL_ERRORS | RP1_CAP_BTCM_TRACE_STAGING)
+     RP1_CAP_STRUCTURED_PDI_RESPONSE |                                \
+     RP1_CAP_LATCHED_TERMINAL_ERRORS | RP1_CAP_BTCM_TRACE_STAGING |   \
+     RP1_CAP_GRAPH_RESULT)
 
 #define RP1_PDI_IPI_PLATFORM_UNKNOWN  0u
 #define RP1_TERMINAL_ERROR_NODE_NONE  0xFFFFFFFFu
@@ -446,17 +495,16 @@ typedef struct {
     volatile uint32_t version;          /* 0x04: protocol version                */
     /* Host writes, RP1 reads */
     volatile uint32_t node_count;       /* 0x08: nodes in this graph             */
-    volatile uint32_t cq_size;          /* 0x0C: power of 2, <= MAX_CQ_ENTRIES   */
+    volatile uint32_t _reserved_cq_size;/* 0x0C: must be zero in protocol v5     */
     volatile uint32_t node_base_lo;     /* 0x10: node array base (low 32 bits)   */
     volatile uint32_t node_base_hi;     /* 0x14: node array base (high 32 bits)  */
-    volatile uint32_t cq_base_lo;       /* 0x18: CQ base (low 32 bits)           */
-    volatile uint32_t cq_base_hi;       /* 0x1C: CQ base (high 32 bits)          */
+    volatile uint32_t _reserved_cq_base_lo; /* 0x18: must be zero in v5           */
+    volatile uint32_t _reserved_cq_base_hi; /* 0x1C: must be zero in v5           */
     volatile uint32_t graph_seq;        /* 0x20: host increments per graph        */
     /* RP1 writes */
     volatile uint32_t graph_done_seq;   /* 0x24: last completed graph             */
-    volatile uint32_t cq_write_idx;     /* 0x28: next CQ write position          */
-    /* Host writes */
-    volatile uint32_t cq_read_idx;      /* 0x2C: next unread CQ position         */
+    volatile uint32_t _reserved_cq_write_idx; /* 0x28: zero in protocol v5         */
+    volatile uint32_t _reserved_cq_read_idx;  /* 0x2C: zero in protocol v5         */
     /* RP1 writes */
     volatile uint32_t rp1_state;        /* 0x30: rp1_state_t                     */
     volatile uint32_t rp1_error_code;   /* 0x34: last error code                 */
@@ -472,13 +520,15 @@ typedef struct {
     volatile uint32_t trace_base_hi;    /* 0x58: trace ring base (high 32 bits)  */
     volatile uint32_t trace_size;       /* 0x5C: trace entries (power of 2)      */
     volatile uint32_t trace_write_idx;  /* 0x60: next trace write position       */
-    /* RP1 writes: protocol-v4 contract publication and diagnostics */
+    /* RP1 writes: protocol-v5 contract publication and diagnostics */
     volatile uint32_t capabilities;          /* 0x64: RP1_CAP_*                    */
     volatile uint32_t pdi_ipi_platform_id;   /* 0x68: selected IPI/platform config */
     volatile uint32_t terminal_error_node;   /* 0x6C: latched failing node         */
     volatile uint32_t terminal_error_detail; /* 0x70: structured error detail      */
     volatile uint32_t terminal_error_aux;    /* 0x74: structured auxiliary detail  */
-    uint8_t _reserved[0x1000 - 0x78];
+    uint32_t _reserved_result_align[2];      /* 0x78-0x7F                       */
+    rp1_graph_result_t result;               /* 0x80-0xBF: committed graph result */
+    uint8_t _reserved[0x1000 - 0xC0];
 } rp1_ctrl_t;
 
 /* =========================================================================
@@ -493,23 +543,6 @@ typedef struct {
     volatile uint32_t last_writer_node; /* Node that last wrote               */
     volatile uint32_t flags;            /* RP1_SIG_FLAG_*                     */
 } rp1_signal_slot_t;
-
-/* =========================================================================
- * Completion queue entry -- 16 bytes
- * ====================================================================== */
-
-typedef enum {
-    RP1_CQ_OK      = 0,
-    RP1_CQ_ERROR   = 1,
-    RP1_CQ_TIMEOUT = 2,
-} rp1_cq_status_t;
-
-typedef struct {
-    volatile uint32_t node_index;    /* Which node completed               */
-    volatile uint32_t status;        /* rp1_cq_status_t                    */
-    volatile uint32_t error_detail;  /* Opcode-specific error code         */
-    volatile uint32_t timestamp;     /* PMU ticks since graph start        */
-} rp1_cq_entry_t;
 
 /* =========================================================================
  * Trace queue entry -- 16 bytes
@@ -544,17 +577,16 @@ typedef struct {
  * ====================================================================== */
 
 #define RP1_MAX_NODES          4096
-#define RP1_MAX_CQ_ENTRIES     4096
 #define RP1_MAX_TRACE_ENTRIES  4096
 #define RP1_MAX_LOOPS            64
 #define RP1_MAX_INFLIGHT         32
 #define RP1_MAX_SIGNALS         256
 #define RP1_MAX_BUCKETS          32
 
-#define RP1_PROTOCOL_VERSION  4u
+#define RP1_PROTOCOL_VERSION  5u
 
 /* Cortex-R5 PMCCNTR is configured with PMCR.D, so one protocol PMU tick is
- * exactly 64 R5 core cycles. timeout_cycles and trace/CQ timestamps use this
+ * exactly 64 R5 core cycles. timeout_cycles and trace/result timestamps use this
  * unit. Hardware defaults are derived from the generated R5 clock frequency. */
 #define RP1_PMU_CYCLE_DIVISOR             64u
 #define RP1_DEFAULT_KERNEL_TIMEOUT_MS    1000u
@@ -616,13 +648,13 @@ RP1_STATIC_ASSERT(sizeof(rp1_ctrl_t) == 0x1000,
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, magic)              == 0x00, "ctrl.magic offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, version)            == 0x04, "ctrl.version offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, node_count)         == 0x08, "ctrl.node_count offset");
-RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, cq_size)            == 0x0C, "ctrl.cq_size offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, _reserved_cq_size)  == 0x0C, "ctrl.reserved_cq_size offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, node_base_lo)       == 0x10, "ctrl.node_base_lo offset");
-RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, cq_base_lo)         == 0x18, "ctrl.cq_base_lo offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, _reserved_cq_base_lo) == 0x18, "ctrl.reserved_cq_base offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, graph_seq)          == 0x20, "ctrl.graph_seq offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, graph_done_seq)     == 0x24, "ctrl.graph_done_seq offset");
-RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, cq_write_idx)       == 0x28, "ctrl.cq_write_idx offset");
-RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, cq_read_idx)        == 0x2C, "ctrl.cq_read_idx offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, _reserved_cq_write_idx) == 0x28, "ctrl.reserved_cq_write offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, _reserved_cq_read_idx) == 0x2C, "ctrl.reserved_cq_read offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, rp1_state)          == 0x30, "ctrl.rp1_state offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, heartbeat)          == 0x3C, "ctrl.heartbeat offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, arg_buf_base_lo)    == 0x40, "ctrl.arg_buf_base_lo offset");
@@ -637,12 +669,13 @@ RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, pdi_ipi_platform_id)== 0x68, "ctrl.pdi_ip
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, terminal_error_node)== 0x6C, "ctrl.terminal_error_node offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, terminal_error_detail) == 0x70, "ctrl.terminal_error_detail offset");
 RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, terminal_error_aux) == 0x74, "ctrl.terminal_error_aux offset");
+RP1_STATIC_ASSERT(offsetof(rp1_ctrl_t, result)             == 0x80, "ctrl.result offset");
 
-/* Signal slot, CQ entry, inflight tracker sizes. */
+/* Result, signal slot, trace entry, and inflight tracker sizes. */
+RP1_STATIC_ASSERT(sizeof(rp1_graph_result_t) == 64,
+                  "rp1_graph_result_t must be 64 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_signal_slot_t) == 16,
                   "rp1_signal_slot_t must be 16 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_cq_entry_t) == 16,
-                  "rp1_cq_entry_t must be 16 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_trace_entry_t) == 16,
                   "rp1_trace_entry_t must be 16 bytes");
 RP1_STATIC_ASSERT(sizeof(rp1_inflight_t) == 24,
@@ -651,14 +684,6 @@ RP1_STATIC_ASSERT(offsetof(rp1_inflight_t, timeout_start) == 0x0C,
                   "inflight timeout_start offset");
 RP1_STATIC_ASSERT(offsetof(rp1_inflight_t, timeout_cycles) == 0x10,
                   "inflight timeout_cycles offset");
-RP1_STATIC_ASSERT(RP1_DEFAULT_CQ_OFFSET +
-                      RP1_MAX_CQ_ENTRIES * sizeof(rp1_cq_entry_t) <=
-                  RP1_DEFAULT_ARG_BUF_OFFSET,
-                  "maximum default CQ must not overlap argument buffer");
-RP1_STATIC_ASSERT(RP1_MAX_CQ_ENTRIES != 0 &&
-                      (RP1_MAX_CQ_ENTRIES &
-                       (RP1_MAX_CQ_ENTRIES - 1)) == 0,
-                  "maximum CQ entries must be a power of two");
 
 #ifdef __cplusplus
 }  /* extern "C" */

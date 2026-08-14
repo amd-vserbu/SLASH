@@ -31,14 +31,22 @@ uint32_t      g_inflight_count             BTCM_SECTION;
 uint32_t      g_graph_start_cycles         BTCM_SECTION;
 uint32_t      g_trace_size                 BTCM_SECTION;
 uint32_t      g_trace_enable               BTCM_SECTION;
+uint32_t      g_completed_operations       BTCM_SECTION;
+uint32_t      g_operation_started          BTCM_SECTION;
+uint32_t      g_quiesce_finite_done         BTCM_SECTION;
+uint32_t      g_quiesce_finite_timeout      BTCM_SECTION;
+uint32_t      g_quiesce_infinite            BTCM_SECTION;
+uint32_t      g_recovery_required           BTCM_SECTION;
+uint32_t      g_terminal_opcode             BTCM_SECTION;
 /* Fixed on-chip trace page; only explicit flushes touch the DDR trace ring. */
 static rp1_trace_entry_t
     g_trace_staging[RP1_TRACE_STAGING_ENTRIES] BTCM_SECTION;
 /* Number of valid entries at the front of g_trace_staging. */
 static uint32_t g_trace_staging_count       BTCM_SECTION;
 
-/* Persists across graphs (physical reconfig state); zeroed only at boot. */
+/* Persistent physical reconfiguration state; zeroed only at boot. */
 uint32_t      g_active_image_id            BTCM_SECTION;
+uint32_t      g_active_image_state         BTCM_SECTION;
 
 _Static_assert(sizeof(g_trace_staging) == RP1_TRACE_STAGING_BYTES,
                "BTCM trace staging must occupy exactly 4 KB");
@@ -49,7 +57,6 @@ _Static_assert(sizeof(g_trace_staging) == RP1_TRACE_STAGING_BYTES,
 
 rp1_ctrl_t       *g_ctrl    = (rp1_ctrl_t *)RP1_CTRL_PHYS_ADDR;
 rp1_node_t       *g_nodes   = NULL;
-rp1_cq_entry_t   *g_cq      = NULL;
 rp1_signal_slot_t *g_signals = NULL;
 uint32_t         *g_arg_buf  = NULL;
 rp1_trace_entry_t *g_trace   = NULL;
@@ -131,14 +138,13 @@ static void trace_flush_staged(void)
  * ---------------------------------------------------------------------- */
 
 /*
- * Configuration validation has three classes: bounded counts/ring shape,
- * monotonic CQ occupancy, and aligned ranges wholly inside the shared window.
- * No host-provided address becomes a pointer until every class has passed.
+ * Configuration validation checks bounded counts and aligned ranges wholly
+ * inside the shared window. No host address becomes a pointer until every
+ * field needed by the scanner has passed.
  */
 int rp1_store_init(uint32_t *detail, uint32_t *aux)
 {
     uint32_t node_count = g_ctrl->node_count;
-    uint32_t cq_size = g_ctrl->cq_size;
 
     *detail = 0u;
     *aux = 0u;
@@ -147,26 +153,21 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux)
         *aux = node_count;
         return -1;
     }
+    uint32_t reserved_cq =
+        (g_ctrl->_reserved_cq_size != 0u ? 1u << 0 : 0u) |
+        (g_ctrl->_reserved_cq_base_lo != 0u ? 1u << 1 : 0u) |
+        (g_ctrl->_reserved_cq_base_hi != 0u ? 1u << 2 : 0u) |
+        (g_ctrl->_reserved_cq_write_idx != 0u ? 1u << 3 : 0u) |
+        (g_ctrl->_reserved_cq_read_idx != 0u ? 1u << 4 : 0u);
+    if (reserved_cq != 0u) {
+        *detail = RP1_CONFIG_RESERVED_CQ;
+        *aux = reserved_cq;
+        return -1;
+    }
     if (!valid_window_range(g_ctrl->node_base_lo, g_ctrl->node_base_hi,
                             node_count * (uint32_t)sizeof(rp1_node_t), 64u)) {
         *detail = RP1_CONFIG_NODE_BASE;
         *aux = g_ctrl->node_base_lo;
-        return -1;
-    }
-    if (!is_power_of_two(cq_size) || cq_size > RP1_MAX_CQ_ENTRIES) {
-        *detail = RP1_CONFIG_CQ_SIZE;
-        *aux = cq_size;
-        return -1;
-    }
-    if (!valid_window_range(g_ctrl->cq_base_lo, g_ctrl->cq_base_hi,
-                            cq_size * (uint32_t)sizeof(rp1_cq_entry_t), 16u)) {
-        *detail = RP1_CONFIG_CQ_BASE;
-        *aux = g_ctrl->cq_base_lo;
-        return -1;
-    }
-    if ((uint32_t)(g_ctrl->cq_write_idx - g_ctrl->cq_read_idx) > cq_size) {
-        *detail = RP1_CONFIG_CQ_CURSORS;
-        *aux = g_ctrl->cq_write_idx - g_ctrl->cq_read_idx;
         return -1;
     }
     if (!valid_window_range(g_ctrl->arg_buf_base_lo,
@@ -203,8 +204,6 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux)
      */
     g_nodes   = (rp1_node_t *)
                     (uintptr_t)make64(g_ctrl->node_base_lo, g_ctrl->node_base_hi);
-    g_cq      = (rp1_cq_entry_t *)
-                    (uintptr_t)make64(g_ctrl->cq_base_lo, g_ctrl->cq_base_hi);
     g_signals = (rp1_signal_slot_t *)
                     (uintptr_t)make64(g_ctrl->sig_array_base_lo, g_ctrl->sig_array_base_hi);
     g_arg_buf = (uint32_t *)
@@ -217,8 +216,8 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux)
     g_trace_staging_count = 0u;
 
     /*
-     * Phase 3: reset only per-graph state and status. The active image id is
-     * physical reconfiguration state and deliberately survives submissions.
+     * Phase 3: reset per-graph state. Initialize the legacy DDR status field
+     * once; every later transition remains private to the BTCM state cache.
      */
     rp1_store_reset_graph();
     for (uint32_t i = 0; i < node_count; i++)
@@ -232,7 +231,14 @@ void rp1_store_reset_graph(void)
     memzero(g_node_status, sizeof(g_node_status));
     memzero(g_loop_iters,  sizeof(g_loop_iters));
     memzero(g_inflight,    sizeof(g_inflight));
-    g_inflight_count = 0;
+    g_inflight_count = 0u;
+    g_completed_operations = 0u;
+    g_operation_started = 0u;
+    g_quiesce_finite_done = 0u;
+    g_quiesce_finite_timeout = 0u;
+    g_quiesce_infinite = 0u;
+    g_recovery_required = 0u;
+    g_terminal_opcode = RP1_TERMINAL_OPCODE_NONE;
 }
 
 /*
@@ -272,26 +278,28 @@ void rp1_clear_error_latch(void)
     g_ctrl->terminal_error_node = RP1_TERMINAL_ERROR_NODE_NONE;
     g_ctrl->terminal_error_detail = 0u;
     g_ctrl->terminal_error_aux = 0u;
+    g_terminal_opcode = RP1_TERMINAL_OPCODE_NONE;
 }
 
 /*
- * The first base error owns node/detail/aux for the whole graph. Later
- * quiescence may only OR recovery-required, preserving the original cause
- * while telling the host that reset is mandatory.
+ * The first error owns node/opcode/detail/aux for the whole graph. Quiescence
+ * records recovery separately so it cannot alter the initiating cause.
  */
 void rp1_latch_error(uint32_t code, uint32_t node,
                      uint32_t detail, uint32_t aux)
 {
-    if ((g_ctrl->rp1_error_code & RP1_ERR_CODE_MASK) != 0u)
+    if (g_ctrl->rp1_error_code != 0u)
         return;
-    g_ctrl->rp1_error_code =
-        (g_ctrl->rp1_error_code & RP1_ERR_RECOVERY_REQUIRED) | code;
+    g_ctrl->rp1_error_code = code;
     g_ctrl->terminal_error_node = node;
     g_ctrl->terminal_error_detail = detail;
     g_ctrl->terminal_error_aux = aux;
+    if (node != RP1_TERMINAL_ERROR_NODE_NONE &&
+        g_nodes != NULL && node < g_ctrl->node_count)
+        g_terminal_opcode = g_nodes[node].opcode;
 }
 
 void rp1_mark_recovery_required(void)
 {
-    g_ctrl->rp1_error_code |= RP1_ERR_RECOVERY_REQUIRED;
+    g_recovery_required = 1u;
 }

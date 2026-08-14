@@ -49,12 +49,11 @@ static int test_struct_sizes(void)
     CHECK_EQ32(offsetof(rp1_node_t, payload), 16,  "payload offset");
     CHECK_EQ32(sizeof(rp1_ctrl_t),         0x1000, "rp1_ctrl_t size");
     CHECK_EQ32(sizeof(rp1_signal_slot_t),  16,     "signal slot size");
-    CHECK_EQ32(sizeof(rp1_cq_entry_t),     16,     "cq entry size");
+    CHECK_EQ32(sizeof(rp1_graph_result_t),  64,     "graph result size");
     CHECK_EQ32(sizeof(rp1_trace_entry_t),  16,     "trace entry size");
     CHECK_EQ32(sizeof(rp1_inflight_t),     24,     "inflight entry size");
-    CHECK_EQ32(RP1_PROTOCOL_VERSION,       4,      "protocol version");
-    CHECK_EQ32(RP1_REQUIRED_CAPABILITIES,  0x3F,   "required capabilities");
-    CHECK_EQ32(RP1_MAX_CQ_ENTRIES,         4096,   "maximum CQ entries");
+    CHECK_EQ32(RP1_PROTOCOL_VERSION,       5,      "protocol version");
+    CHECK_EQ32(RP1_REQUIRED_CAPABILITIES,  0x7B,   "required capabilities");
     CHECK_EQ32(RP1_PMU_CYCLE_DIVISOR,      64,     "PMU tick divisor");
     CHECK(RP1_PLATFORM_ID != RP1_PDI_IPI_PLATFORM_UNKNOWN,
           "platform id must be explicit");
@@ -94,6 +93,10 @@ static int test_ctrl_offsets(void)
     CHECK_EQ32(offsetof(rp1_ctrl_t, node_count),       0x08, "ctrl.node_count offset");
     CHECK_EQ32(offsetof(rp1_ctrl_t, graph_seq),        0x20, "ctrl.graph_seq offset");
     CHECK_EQ32(offsetof(rp1_ctrl_t, graph_done_seq),   0x24, "ctrl.graph_done_seq offset");
+    CHECK_EQ32(offsetof(rp1_ctrl_t, _reserved_cq_write_idx),
+               0x28, "ctrl.reserved_cq_write offset");
+    CHECK_EQ32(offsetof(rp1_ctrl_t, _reserved_cq_read_idx),
+               0x2C, "ctrl.reserved_cq_read offset");
     CHECK_EQ32(offsetof(rp1_ctrl_t, rp1_state),        0x30, "ctrl.rp1_state offset");
     CHECK_EQ32(offsetof(rp1_ctrl_t, heartbeat),        0x3C, "ctrl.heartbeat offset");
     CHECK_EQ32(offsetof(rp1_ctrl_t, arg_buf_base_lo),  0x40, "ctrl.arg_buf_base_lo offset");
@@ -112,6 +115,8 @@ static int test_ctrl_offsets(void)
                0x70, "ctrl.terminal_error_detail offset");
     CHECK_EQ32(offsetof(rp1_ctrl_t, terminal_error_aux),
                0x74, "ctrl.terminal_error_aux offset");
+    CHECK_EQ32(offsetof(rp1_ctrl_t, result),
+               0x80, "ctrl.result offset");
     CHECK_EQ32(offsetof(rp1_inflight_t, timeout_start),
                0x0C, "inflight.timeout_start offset");
     CHECK_EQ32(offsetof(rp1_inflight_t, timeout_cycles),
@@ -134,6 +139,15 @@ static int test_store_reset(void)
         g_inflight[i].node_index = i;
     }
     g_inflight_count = 99;
+    g_completed_operations = 99u;
+    g_operation_started = 1u;
+    g_quiesce_finite_done = 1u;
+    g_quiesce_finite_timeout = 2u;
+    g_quiesce_infinite = 3u;
+    g_recovery_required = 1u;
+    g_terminal_opcode = RP1_OP_HALT;
+    g_active_image_id = 17u;
+    g_active_image_state = RP1_IMAGE_STATE_KNOWN;
 
     rp1_store_reset_graph();
 
@@ -146,6 +160,20 @@ static int test_store_reset(void)
     for (uint32_t i = 0; i < RP1_MAX_INFLIGHT; i++)
         CHECK_EQ32(g_inflight[i].base_addr, 0, "inflight not zeroed");
     CHECK_EQ32(g_inflight_count, 0, "inflight_count not zeroed");
+    CHECK_EQ32(g_completed_operations, 0u, "operation count not zeroed");
+    CHECK_EQ32(g_operation_started, 0u, "operation-start state not zeroed");
+    CHECK_EQ32(g_quiesce_finite_done, 0u, "quiesce done not zeroed");
+    CHECK_EQ32(g_quiesce_finite_timeout, 0u,
+               "quiesce timeout not zeroed");
+    CHECK_EQ32(g_quiesce_infinite, 0u, "quiesce infinite not zeroed");
+    CHECK_EQ32(g_recovery_required, 0u, "recovery state not zeroed");
+    CHECK_EQ32(g_terminal_opcode, RP1_TERMINAL_OPCODE_NONE,
+               "terminal opcode not reset");
+    CHECK_EQ32(g_active_image_id, 17u, "active image id did not persist");
+    CHECK_EQ32(g_active_image_state, RP1_IMAGE_STATE_KNOWN,
+               "active image state did not persist");
+    g_active_image_id = 0u;
+    g_active_image_state = RP1_IMAGE_STATE_NONE;
     return 0;
 }
 
@@ -336,7 +364,8 @@ static int test_node_header(void)
     for (uint32_t i = 0; i < sizeof(node); i++) ((uint8_t *)&node)[i] = 0;
 
     node.opcode               = RP1_OP_KERNEL_DISPATCH;
-    node.flags                = RP1_FLAG_HALT_ON_ERROR | RP1_FLAG_INFINITE;
+    node.flags                = RP1_FLAG_RESERVED_0 | RP1_FLAG_RESERVED_1 |
+                                RP1_FLAG_INFINITE;
     node.barrier_await_mask   = 0x00000003u;
     node.barrier_set_mask     = 0x00000004u;
     node.barrier_await_bucket = 0;
@@ -344,7 +373,8 @@ static int test_node_header(void)
     node.status               = RP1_NODE_PENDING;
 
     CHECK_EQ32(node.opcode,               RP1_OP_KERNEL_DISPATCH,         "opcode");
-    CHECK_EQ32(node.flags,                RP1_FLAG_HALT_ON_ERROR |
+    CHECK_EQ32(node.flags,                RP1_FLAG_RESERVED_0 |
+                                          RP1_FLAG_RESERVED_1 |
                                           RP1_FLAG_INFINITE,               "flags");
     CHECK_EQ32(node.barrier_await_mask,   0x3u,                            "await_mask");
     CHECK_EQ32(node.barrier_set_mask,     0x4u,                            "set_mask");

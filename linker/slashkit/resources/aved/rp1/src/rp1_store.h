@@ -16,10 +16,11 @@
  *   inflight_count              4 B
  *   trace staging            4096 B   (256 * sizeof(rp1_trace_entry_t))
  *   trace staging count         4 B
+ *   result/image bookkeeping   36 B
  *   stack                    4096 B   (linker script)
  *   code variables           ~1 KB
  *   ─────────────────────────────
- *   Total hot data           ~14.3 KB
+ *   Total hot data           ~14.4 KB
  */
 
 #ifndef RP1_STORE_H
@@ -39,7 +40,7 @@
 /* Flat barrier array: 32 buckets of 32 bits each = 1024 barrier signals. */
 extern uint32_t g_barriers[RP1_MAX_BUCKETS];
 
-/* Per-node status cache: one byte per node, mirrors rp1_node_t.status. */
+/* Authoritative per-node state; DDR node status is initialized but not updated. */
 extern uint8_t g_node_status[RP1_MAX_NODES];
 
 /* Per-loop iteration counter, indexed by loop_id. */
@@ -53,14 +54,21 @@ extern uint32_t       g_inflight_count;
 extern uint32_t g_graph_start_cycles;
 
 /*
- * Image id last installed by a successful PDI_LOAD (0 = none loaded yet).
- * This reflects physical partial-reconfiguration state, so unlike the other
- * BTCM stores it PERSISTS across graph submissions and is deliberately not
- * cleared by rp1_store_reset_graph(); only a PDI_LOAD node changes it. A
- * KERNEL_DISPATCH with a non-zero expected_image_id that does not match this
- * is failed fast instead of poking an absent kernel.
+ * Persistent partial-reconfiguration state. A successful named PDI makes the
+ * image KNOWN; any PDI timeout or rejection makes it UNKNOWN until a later
+ * successful load. Both fields survive graph resets.
  */
 extern uint32_t g_active_image_id;
+extern uint32_t g_active_image_state;
+
+/* Per-graph result counters and terminal metadata, reset before activation. */
+extern uint32_t g_completed_operations;
+extern uint32_t g_operation_started;
+extern uint32_t g_quiesce_finite_done;
+extern uint32_t g_quiesce_finite_timeout;
+extern uint32_t g_quiesce_infinite;
+extern uint32_t g_recovery_required;
+extern uint32_t g_terminal_opcode;
 
 /* -------------------------------------------------------------------------
  * DDR-backed stores (pointers into shared DDR, set at graph init)
@@ -71,9 +79,6 @@ extern rp1_ctrl_t *g_ctrl;
 
 /* Pointer to the node array (from g_ctrl->node_base_lo/hi). */
 extern rp1_node_t *g_nodes;
-
-/* Pointer to the CQ ring (from g_ctrl->cq_base_lo/hi). */
-extern rp1_cq_entry_t *g_cq;
 
 /* Pointer to the signal array (from g_ctrl->sig_array_base_lo/hi). */
 extern rp1_signal_slot_t *g_signals;
@@ -100,8 +105,8 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux);
 
 /*
  * rp1_store_reset_graph() — reset per-graph BTCM state (barriers, node
- * statuses, loop counters, inflight table) without touching the DDR pointers.
- * Called at the start of every new graph submission.
+ * statuses, counters, loop state, and inflight table) without touching DDR
+ * pointers or persistent image state. Called at each graph submission.
  */
 void rp1_store_reset_graph(void);
 
@@ -123,8 +128,8 @@ void rp1_trace_flush_final(void);
 
 /*
  * First-error-wins diagnostic publication for the current graph. Clear only
- * before accepting a graph; fatal quiescence may add recovery-required but
- * must not replace the node/detail/aux that identify the initiating failure.
+ * before accepting a graph; quiescence recovery metadata is tracked
+ * separately and must not replace the initiating failure.
  */
 void rp1_clear_error_latch(void);
 void rp1_latch_error(uint32_t code, uint32_t node,

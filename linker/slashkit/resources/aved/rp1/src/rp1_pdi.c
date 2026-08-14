@@ -61,7 +61,7 @@ rp1_pdi_result_t rp1_pdi_load(uint32_t addr_lo, uint32_t addr_hi,
 
     /*
      * Phase 3: acknowledgement releases both unsigned response words. Preserve
-     * them verbatim so CQ and terminal diagnostics retain PLM-specific detail.
+     * them verbatim so terminal diagnostics retain PLM-specific detail.
      */
     result.status = rp1_mmio_read32(RP1_PDI_IPI_RESPONSE_BASE + 0u);
     result.detail = rp1_mmio_read32(RP1_PDI_IPI_RESPONSE_BASE + 4u);
