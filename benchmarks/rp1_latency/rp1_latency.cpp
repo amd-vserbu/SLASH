@@ -147,6 +147,10 @@ struct TraceIntervals {
     std::uint32_t kernelSpan = 0;
     /// Graph-start to graph-done interval.
     std::uint32_t graph = 0;
+    /// Each kernel launch to its dependent successor's launch.
+    std::vector<std::uint32_t> launchGaps;
+    /// Launch gaps after subtracting any bracketed BTCM-to-DDR flush.
+    std::vector<std::uint32_t> launchGapsExcludingFlush;
     /// Each kernel completion to its dependent successor's launch.
     std::vector<std::uint32_t> handoffGaps;
     /// Handoff gaps after subtracting any bracketed BTCM-to-DDR flush.
@@ -573,20 +577,37 @@ TraceIntervals extractTrace(
      * Protocol timestamps are uint32_t PMU ticks. Unsigned subtraction keeps
      * intervals valid across one counter wrap.
      */
+    const std::size_t adjacentCount =
+        kernelCount > 0 ? kernelCount - 1 : 0;
+    std::vector<std::uint32_t> launchGaps;
+    std::vector<std::uint32_t> launchGapsExcludingFlush;
     std::vector<std::uint32_t> handoffGaps;
     std::vector<std::uint32_t> handoffGapsExcludingFlush;
-    handoffGaps.reserve(kernelCount > 0 ? kernelCount - 1 : 0);
-    handoffGapsExcludingFlush.reserve(
-        kernelCount > 0 ? kernelCount - 1 : 0);
+    launchGaps.reserve(adjacentCount);
+    launchGapsExcludingFlush.reserve(adjacentCount);
+    handoffGaps.reserve(adjacentCount);
+    handoffGapsExcludingFlush.reserve(adjacentCount);
     for (std::size_t i = 0; i + 1 < kernelCount; ++i) {
         if (!completions[i] || !launches[i + 1]) {
             throw std::runtime_error(
                 "RP1 trace is missing an adjacent kernel handoff");
         }
+        const std::uint32_t launchGap =
+            *launches[i + 1] - *launches[i];
         const std::uint32_t gap =
             *launches[i + 1] - *completions[i];
+        std::uint32_t launchFlushTicks = 0;
         std::uint32_t flushTicks = 0;
         for (const auto& [start, end] : flushes) {
+            const std::uint32_t launchStartOffset =
+                start - *launches[i];
+            const std::uint32_t launchEndOffset =
+                end - *launches[i];
+            if (launchStartOffset <= launchGap &&
+                launchEndOffset >= launchStartOffset &&
+                launchEndOffset <= launchGap) {
+                launchFlushTicks += end - start;
+            }
             const std::uint32_t startOffset =
                 start - *completions[i];
             const std::uint32_t endOffset =
@@ -596,10 +617,17 @@ TraceIntervals extractTrace(
                 flushTicks += end - start;
             }
         }
+        if (launchFlushTicks > launchGap) {
+            throw std::runtime_error(
+                "RP1 trace flush exceeds its containing launch interval");
+        }
         if (flushTicks > gap) {
             throw std::runtime_error(
                 "RP1 trace flush exceeds its containing handoff");
         }
+        launchGaps.push_back(launchGap);
+        launchGapsExcludingFlush.push_back(
+            launchGap - launchFlushTicks);
         handoffGaps.push_back(gap);
         handoffGapsExcludingFlush.push_back(gap - flushTicks);
     }
@@ -614,6 +642,8 @@ TraceIntervals extractTrace(
         static_cast<std::uint32_t>(*firstLaunch - *graphStart),
         static_cast<std::uint32_t>(*lastDone - *firstLaunch),
         static_cast<std::uint32_t>(*graphDone - *graphStart),
+        std::move(launchGaps),
+        std::move(launchGapsExcludingFlush),
         std::move(handoffGaps),
         std::move(handoffGapsExcludingFlush),
         std::move(flushDurations),
@@ -814,6 +844,40 @@ void benchmarkBatches(
             std::move(vrtHost),
         });
 
+        /*
+         * Timestamp each returned start call. Adjacent differences approximate
+         * host-issued ap_start to ap_start and include wait(i) plus start(i+1),
+         * matching the RP1 launch-to-next-launch boundary.
+         */
+        std::vector<std::uint64_t> vrtStartGaps;
+        vrtStartGaps.reserve(
+            config.traceIterations * (batch > 0 ? batch - 1 : 0));
+        for (std::size_t sample = 0;
+             sample < config.traceIterations; ++sample) {
+            std::optional<Clock::time_point> previousStart;
+            for (std::size_t i = 0; i < batch; ++i) {
+                kernel.start();
+                const Clock::time_point started = Clock::now();
+                if (previousStart) {
+                    vrtStartGaps.push_back(
+                        static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(
+                                started - *previousStart)
+                                .count()));
+                }
+                previousStart = started;
+                kernel.wait();
+            }
+        }
+        if (!vrtStartGaps.empty()) {
+            measurements.push_back({
+                "vrt.batch." + suffix + ".start_to_next_start",
+                "ns",
+                std::move(vrtStartGaps),
+            });
+        }
+
         const vrt::graph::Rp1QueueProgram program =
             makeKernelProgram(device->id(), kImageName, batch);
         vrt::graph::fpga::Rp1GraphImage image =
@@ -854,6 +918,8 @@ void benchmarkBatches(
         std::vector<std::uint64_t> dispatch;
         std::vector<std::uint64_t> kernelSpan;
         std::vector<std::uint64_t> graph;
+        std::vector<std::uint64_t> launchGaps;
+        std::vector<std::uint64_t> launchGapsExcludingFlush;
         std::vector<std::uint64_t> handoffGaps;
         std::vector<std::uint64_t> handoffGapsExcludingFlush;
         std::vector<std::uint64_t> flushDurations;
@@ -873,6 +939,14 @@ void benchmarkBatches(
             dispatch.push_back(intervals.dispatch);
             kernelSpan.push_back(intervals.kernelSpan);
             graph.push_back(intervals.graph);
+            launchGaps.insert(
+                launchGaps.end(),
+                intervals.launchGaps.begin(),
+                intervals.launchGaps.end());
+            launchGapsExcludingFlush.insert(
+                launchGapsExcludingFlush.end(),
+                intervals.launchGapsExcludingFlush.begin(),
+                intervals.launchGapsExcludingFlush.end());
             handoffGaps.insert(
                 handoffGaps.end(),
                 intervals.handoffGaps.begin(),
@@ -895,6 +969,19 @@ void benchmarkBatches(
         addTicks(
             measurements, "rp1.trace.batch." + suffix + ".graph",
             std::move(graph), config.r5FrequencyHz);
+        if (!launchGaps.empty()) {
+            addTicks(
+                measurements,
+                "rp1.trace.batch." + suffix +
+                    ".launch_to_next_launch",
+                std::move(launchGaps), config.r5FrequencyHz);
+            addTicks(
+                measurements,
+                "rp1.trace.batch." + suffix +
+                    ".launch_to_next_launch_excluding_flush",
+                std::move(launchGapsExcludingFlush),
+                config.r5FrequencyHz);
+        }
         if (!handoffGaps.empty()) {
             addTicks(
                 measurements,

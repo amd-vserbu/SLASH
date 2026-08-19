@@ -29,12 +29,16 @@ targets latency and dispatch scaling, not application throughput.
     protocol PMU ticks.
 - Sequential batches of 1, 10, and 100 launches by default:
   - Legacy VRT performs `start()`/`wait()` for each launch.
+  - `vrt.batch.<N>.start_to_next_start` measures adjacent returned
+    `Kernel::start()` calls with the host monotonic clock.
   - RP1 submits one dependency chain and executes it without host intervention.
   - `rp1.result.batch.<N>.graph_elapsed` reports the graph-result timing without
     enabling tracing.
+  - `rp1.trace.batch.10.launch_to_next_launch` measures all nine adjacent
+    `KERNEL_LAUNCH(i)` to `KERNEL_LAUNCH(i+1)` intervals directly.
   - `rp1.trace.batch.10.done_to_next_launch` summarizes all nine adjacent
     `KERNEL_DONE(i)` to `KERNEL_LAUNCH(i+1)` handoffs per traced submission.
-  - `done_to_next_launch_excluding_flush` subtracts any bracketed
+  - The corresponding `*_excluding_flush` rows subtract any bracketed
     `TRACE_FLUSH_START` to `TRACE_FLUSH_END` interval, while `trace_flush`
     reports the blocking flush itself.
 - Transfers:

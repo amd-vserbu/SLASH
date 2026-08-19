@@ -81,6 +81,10 @@ int main() {
     if (intervals.dispatch != 10u ||
         intervals.kernelSpan != 141u ||
         intervals.graph != 161u ||
+        intervals.launchGaps !=
+            std::vector<std::uint32_t>({111u, 20u}) ||
+        intervals.launchGapsExcludingFlush !=
+            std::vector<std::uint32_t>({30u, 20u}) ||
         intervals.handoffGaps !=
             std::vector<std::uint32_t>({101u, 10u}) ||
         intervals.handoffGapsExcludingFlush !=
