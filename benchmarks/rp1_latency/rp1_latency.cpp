@@ -68,6 +68,7 @@ constexpr std::uint32_t kScratchSourceOffset = 32u << 20;
 constexpr std::uint32_t kScratchDestinationOffset = 48u << 20;
 /// Maximum transfer size that keeps both scratch ranges disjoint.
 constexpr std::size_t kScratchCapacity = 8u << 20;
+static_assert(kScratchCapacity <= RP1_DMA_LENGTH_MASK);
 /// Largest chain supported by the lowering's 31-by-31 barrier-bit budget.
 constexpr std::size_t kMaxBatchSize = 961;
 static_assert(kMaxBatchSize + 1 <= RP1_MAX_NODES);
@@ -133,7 +134,7 @@ struct SplitSamples {
 struct TimedGraphResult {
     /// submitAndWait() wall-clock duration in nanoseconds.
     std::uint64_t elapsed = 0;
-    /// Typed protocol-v5 result captured before the stop timestamp.
+    /// Typed protocol-v6 result captured before the stop timestamp.
     vrt::graph::fpga::Rp1GraphResult result;
 };
 
@@ -496,18 +497,21 @@ vrt::graph::Rp1QueueProgram makeKernelProgram(
  * @brief Build one raw phase-1 DDR-to-DDR software-copy graph image.
  */
 vrt::graph::fpga::Rp1GraphImage makeDmaImage(std::size_t bytes) {
+    if (bytes > RP1_DMA_LENGTH_MASK) {
+        throw std::invalid_argument(
+            "RP1 DMA_COPY length exceeds the protocol-v6 28-bit field");
+    }
     vrt::graph::fpga::Rp1GraphImage image;
     image.nodes.resize(1);
     rp1_node_t& node = image.nodes.front();
-    node.opcode = RP1_OP_DMA_COPY;
-    node.status = RP1_NODE_PENDING;
+    rp1_node_set_opcode(&node, RP1_OP_DMA_COPY);
+    rp1_node_set_status(&node, RP1_NODE_PENDING);
     node.payload.dma_copy.src_addr_lo =
         RP1_CTRL_PHYS_ADDR + kScratchSourceOffset;
     node.payload.dma_copy.dst_addr_lo =
         RP1_CTRL_PHYS_ADDR + kScratchDestinationOffset;
-    node.payload.dma_copy.length = static_cast<std::uint32_t>(bytes);
-    node.payload.dma_copy.src_type = 0;
-    node.payload.dma_copy.dst_type = 0;
+    node.payload.dma_copy.length_types = rp1_dma_pack(
+        static_cast<std::uint32_t>(bytes), 0u, 0u);
     return image;
 }
 
@@ -845,16 +849,21 @@ void benchmarkBatches(
         });
 
         /*
-         * Timestamp each returned start call. Adjacent differences approximate
-         * host-issued ap_start to ap_start and include wait(i) plus start(i+1),
-         * matching the RP1 launch-to-next-launch boundary.
+         * Timestamp each returned start and wait call. Adjacent start
+         * differences approximate host-issued ap_start to ap_start, while
+         * wait(i) return to start(i+1) return matches RP1's observed-completion
+         * to next-launch boundary.
          */
         std::vector<std::uint64_t> vrtStartGaps;
+        std::vector<std::uint64_t> vrtHandoffGaps;
         vrtStartGaps.reserve(
+            config.traceIterations * (batch > 0 ? batch - 1 : 0));
+        vrtHandoffGaps.reserve(
             config.traceIterations * (batch > 0 ? batch - 1 : 0));
         for (std::size_t sample = 0;
              sample < config.traceIterations; ++sample) {
             std::optional<Clock::time_point> previousStart;
+            std::optional<Clock::time_point> previousDone;
             for (std::size_t i = 0; i < batch; ++i) {
                 kernel.start();
                 const Clock::time_point started = Clock::now();
@@ -866,8 +875,17 @@ void benchmarkBatches(
                                 started - *previousStart)
                                 .count()));
                 }
+                if (previousDone) {
+                    vrtHandoffGaps.push_back(
+                        static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(
+                                started - *previousDone)
+                                .count()));
+                }
                 previousStart = started;
                 kernel.wait();
+                previousDone = Clock::now();
             }
         }
         if (!vrtStartGaps.empty()) {
@@ -875,6 +893,13 @@ void benchmarkBatches(
                 "vrt.batch." + suffix + ".start_to_next_start",
                 "ns",
                 std::move(vrtStartGaps),
+            });
+        }
+        if (!vrtHandoffGaps.empty()) {
+            measurements.push_back({
+                "vrt.batch." + suffix + ".done_to_next_start",
+                "ns",
+                std::move(vrtHandoffGaps),
             });
         }
 

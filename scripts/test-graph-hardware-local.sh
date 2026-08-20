@@ -203,7 +203,7 @@ fi
 cat <<DUMP
 RP1 control block @ R5 0x30000000 (BAR4 + 0x4000000):
   magic            = 0x53515231 (SQR1)
-  version          = 5
+  version          = 6
   capabilities     = 0x0000007b
   required_capabilities = 0x0000007b
   missing_capabilities  = 0x00000000

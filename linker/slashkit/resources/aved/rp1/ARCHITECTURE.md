@@ -2,7 +2,7 @@
 
 ## Status and source of truth
 
-This document describes the implemented **protocol-v5** RP1 command processor.
+This document describes the implemented **protocol-v6** RP1 command processor.
 RP1 is Cortex-R5 core 1 on the AMD Alveo V80. It executes a host-built graph
 from shared DDR and publishes one rich, sequence-tagged result for the whole
 graph.
@@ -21,10 +21,12 @@ python3 scripts/stage-rp1-protocol-header.py --check
 The header is freestanding and shared by firmware, VRT, SMI, and tests.
 Compile-time assertions fix every structure size and critical offset.
 
-Protocol v5 makes these deliberate choices:
+Protocol v6 makes these deliberate choices:
 
 - There is one graph in flight per RP1.
 - Dependency scheduling is private to RP1 and uses BTCM barriers.
+- The active node prefix is snapshotted into BTCM before packet validation or
+  execution; DDR node packets are never read or written on the execution path.
 - There is **no per-node completion queue**.
 - Every node error is fail-fast and stops new activation.
 - Firmware publishes one 64-byte `rp1_graph_result_t` per accepted graph.
@@ -45,8 +47,9 @@ The execution model has four important guarantees:
 
 1. **Explicit parallelism.** Every barrier-ready node is eligible in the next
    scanner pass. Independent kernels can be in flight together.
-2. **Static graph storage.** Nodes and argument data belong to firmware from
-   the `graph_seq` doorbell until exact-sequence completion.
+2. **Static graph storage.** Firmware takes one immutable BTCM node snapshot;
+   shared arguments and other graph data remain firmware-owned from the
+   `graph_seq` doorbell until exact-sequence completion.
 3. **Fail-fast errors.** The first validation, dispatch, timeout, image, or PDI
    error stops all later activation and starts terminal quiescence.
 4. **Non-transactional effects.** Kernels, DMA, scalar writes, signals, and PDI
@@ -112,8 +115,8 @@ The host-visible RP1 aperture is 64 MiB at RP1 physical address
 RP1 address       Size       Purpose
 ----------------  ---------  --------------------------------------------
 0x3000_0000       4 KiB      Control block
-0x3000_1000       256 KiB    4096 fixed-size node packets
-0x3004_1000       64 KiB     Reserved legacy-v4 gap; unused by v5
+0x3000_1000       256 KiB    Reserved node region; v6 uses at most 32 KiB
+0x3004_1000       64 KiB     Reserved legacy-v4 gap; unused by v6
 0x3005_1000       1 MiB      Packed kernel argument records
 0x3015_1000       4 KiB      256 host-visible signal slots
 0x3015_2000       up to 64K  Optional 4096-entry (64 KiB) trace ring
@@ -122,10 +125,10 @@ RP1 address       Size       Purpose
 The corresponding `RP1_DEFAULT_*_OFFSET` values are conventions. Host code may
 choose other aligned ranges inside the aperture and program the control block,
 but firmware validates all shared ranges before converting them to pointers.
-The legacy gap is intentionally not reclaimed in v5, so argument, signal, and
+The legacy gap is intentionally not reclaimed in v6, so argument, signal, and
 trace offsets remain stable.
 
-## Protocol-v5 control block
+## Protocol-v6 control block
 
 `rp1_ctrl_t` occupies exactly 4 KiB. Ownership is per field:
 
@@ -133,7 +136,7 @@ trace offsets remain stable.
 Offset  Field                         Writer       Meaning
 ------  ----------------------------  -----------  -----------------------------
 0x00    magic                         RP1          Boot contract commit "SQR1"
-0x04    version                       RP1          Must be 5
+0x04    version                       RP1          Must be 6
 0x08    node_count                    Host         Submitted packet count
 0x0c    _reserved_cq_size             Host         Must be zero
 0x10    node_base_lo/hi               Host         Node-array address
@@ -162,7 +165,7 @@ Offset  Field                         Writer       Meaning
 0xc0    reserved                      —            Rest of the 4 KiB block
 ```
 
-The host must zero all v5 reserved words. Non-zero legacy words fail
+The host must zero all v6 reserved words. Non-zero legacy words fail
 configuration validation with `RP1_ERR_INVALID_CONFIG` and
 `RP1_CONFIG_RESERVED_CQ`.
 
@@ -174,9 +177,9 @@ Firmware advertises the exact required behavior with
 - structured PDI responses;
 - first-error-wins terminal diagnostics;
 - BTCM-staged trace events; and
-- the protocol-v5 graph result.
+- the sequence-tagged graph result.
 
-VRT and SMI reject missing capability bits, a version other than 5, or a zero
+VRT and SMI reject missing capability bits, a version other than 6, or a zero
 platform identity.
 
 ## Graph result ABI
@@ -267,56 +270,98 @@ trace drain and result preparation, but not the later commit-magic, state, and
 
 ## Node packets
 
-Every node is a naturally aligned 64-byte `rp1_node_t`:
+Every node is a naturally four-byte-aligned 32-byte `rp1_node_t`:
 
 ```text
 Offset  Size  Field
 ------  ----  ----------------------------------------------------------
-0x00    2     opcode
-0x02    2     flags
+0x00    2     packed control
+0x02    1     barrier_await_bucket
+0x03    1     barrier_set_bucket
 0x04    4     barrier_await_mask
 0x08    4     barrier_set_mask
-0x0c    1     barrier_await_bucket
-0x0d    1     barrier_set_bucket
-0x0e    2     legacy DDR status, initialized to PENDING
-0x10    48    opcode-specific payload
+0x0c    20    opcode-specific payload union
 ```
 
-Authoritative node state is a one-byte BTCM array. Firmware initializes the DDR
-status field at graph start but does not mirror hot-path transitions back to
-DDR. Optional tracing and the final result provide diagnostics.
+The control word has four nibbles:
 
-Protocol-v5 flag bits 0 and 1 are reserved. Bit 2 is
+```text
+Bits   Meaning
+-----  ------------------------------------------------------------
+0-3    Dense opcode
+4-7    Flags
+8-11   Status: PENDING=0, DISPATCHED=1, DONE=2, WAITING=3, ERROR=4
+12-15  Reserved
+```
+
+The shared header provides C/C++-safe mask/shift helpers; the ABI uses no
+compiler bitfields. Flag bit 0 is
 `RP1_FLAG_INFINITE` for `KERNEL_DISPATCH`: the node becomes complete
 immediately after launch and does not block natural graph completion. RP1 still
 tracks the kernel while the graph runs so an observed `ap_done` can remove it.
-There is no per-node error policy flag; all errors terminate the graph.
+Flag bits 1-3 are reserved. There is no per-node error policy flag; all errors
+terminate the graph. Packet validation rejects non-zero reserved control or
+flag bits and rejects `INFINITE` on every opcode except `KERNEL_DISPATCH`.
+
+After validating `node_count` and the complete DDR source range, firmware
+executes a barrier and copies the active prefix word-by-word into the
+authoritative `rp1_node_t g_nodes[1024]` array in BTCM. It then resets each
+packed BTCM status to `PENDING`. Packet validation, LOOP/COND/RERUN re-arming,
+wait polling, quiescence, and error reporting use only that snapshot. Firmware
+does not reread or write any DDR node word during execution.
 
 Defined opcodes are:
 
 ```text
-0x0000  NOP
-0x0001  WAIT
-0x0002  SIGNAL
-0x0010  KERNEL_DISPATCH
-0x0011  SCALAR_WRITE
-0x0012  SCALAR_READ
-0x0013  SCALAR_COPY
-0x0020  DMA_COPY
-0x0021  DMA_FILL
-0x0030  PDI_LOAD
-0x0040  LOOP
-0x0041  COND
-0x0042  RERUN
-0x00ff  HALT
+0   NOP
+1   WAIT
+2   SIGNAL
+3   KERNEL_DISPATCH
+4   SCALAR_WRITE
+5   SCALAR_READ
+6   SCALAR_COPY
+7   DMA_COPY
+8   DMA_FILL
+9   PDI_LOAD
+10  LOOP
+11  COND
+12  RERUN
+13  HALT
 ```
 
 Unknown opcodes fail whole-graph validation with `RP1_ERR_INVALID_NODE`; they
 are never executed as no-ops.
 
+Payload layouts are naturally aligned within the 20-byte union:
+
+```text
+Opcode             Payload fields in byte order
+-----------------  -----------------------------------------------------------
+KERNEL_DISPATCH    base u32, arg offset u32, arg count u16, ctrl flags u8,
+                   reserved u8, timeout u32, expected image u32
+SCALAR_WRITE       two {address u32, value u32} pairs, reserved[4]
+SCALAR_READ        source u32, target slot u8, reserved[3]
+SCALAR_COPY        destination u32, source slot u8, reserved[3]
+SIGNAL             value u32, target slot u8, operation u8, reserved[2]
+WAIT               condition value u32, signal u8, operation u8, reserved[2]
+DMA_COPY           source lo/hi u32, destination lo/hi u32, length/types u32
+DMA_FILL           destination lo/hi u32, length u32, pattern u32,
+                   destination type u8, reserved[3]
+PDI_LOAD           address lo/hi u32, timeout u32, image u32, reserved[4]
+LOOP               body start/end u16, max u32, value u32, signal/op/clear
+                   start/clear end/loop id u8, reserved[3]
+COND               value u32, done mask u32, body start/end u16,
+                   signal/op/clear start/clear end/done bucket u8, reserved[3]
+RERUN              target u16, flags u8, loop id u8, reserved[16]
+```
+
+`DMA_COPY.length_types` uses bits 0-27 for byte length, bits 28-29 for source
+type, and bits 30-31 for destination type. Shared helpers pack, read, and
+replace each field without bitfields.
+
 ### Kernel dispatch
 
-The 48-byte payload carries:
+The 20-byte payload carries:
 
 - R5-visible AXI-Lite base address;
 - byte offset into the shared argument buffer;
@@ -340,7 +385,7 @@ absent hardware design.
 - `NOP` has no side effect beyond completion and barrier publication.
 - `SIGNAL` applies SET, ADD, OR, or AND to one signal slot and records the
   writing node.
-- `SCALAR_WRITE` performs up to six address/value writes, stopping at address
+- `SCALAR_WRITE` performs up to two address/value writes, stopping at address
   zero.
 - `SCALAR_READ` reads one AXI-Lite register into a signal slot.
 - `SCALAR_COPY` writes one signal-slot value to an AXI-Lite register.
@@ -540,18 +585,21 @@ ordering, handles `uint32_t` wrap.
 
 ### Firmware result commit
 
-After observing a new sequence, firmware snapshots it and:
+After observing a new sequence, firmware snapshots the sequence and node count,
+then:
 
 1. Clears `result.magic`, barriers, resets per-graph BTCM/error state, and
    enters `RUNNING`.
-2. Validates and executes or classifies the graph.
-3. Emits `GRAPH_DONE` and captures `graph_elapsed_ticks`.
-4. Flushes the final partial trace page.
-5. Fills every result payload word, ending with
+2. Validates every shared range, executes a barrier, and copies the active DDR
+   node words once into BTCM.
+3. Validates the BTCM packets and executes or classifies the graph.
+4. Emits `GRAPH_DONE` and captures `graph_elapsed_ticks`.
+5. Flushes the final partial trace page.
+6. Fills every result payload word, ending with
    `publish_elapsed_ticks`.
-6. Barriers, writes `RP1_GRAPH_RESULT_MAGIC`, and barriers.
-7. Writes terminal `READY`, `ERROR`, or `HALTED`, and barriers.
-8. Writes the exact accepted sequence to `graph_done_seq`, and barriers.
+7. Barriers, writes `RP1_GRAPH_RESULT_MAGIC`, and barriers.
+8. Writes terminal `READY`, `ERROR`, or `HALTED`, and barriers.
+9. Writes the exact accepted sequence to `graph_done_seq`, and barriers.
 
 The host must not use visible result magic or terminal state as an early
 completion signal. It polls until `graph_done_seq == wanted`, fences, then
@@ -601,7 +649,7 @@ flush-adjusted handoff:
 
 ### Rp1Submitter
 
-`vrt::graph::fpga::Rp1Submitter` is the mechanical v5 adapter. It stages an
+`vrt::graph::fpga::Rp1Submitter` is the mechanical v6 adapter. It stages an
 `Rp1GraphImage`, writes the sequence doorbell, waits by exact equality, and
 returns a host-owned `Rp1GraphResult`.
 
@@ -648,7 +696,7 @@ mock/test construction may use a kernel-address lookup and image id zero.
 
 ### SMI and acceptance
 
-`v80-smi debug rp1-dump` prints the v5 control contract and all graph-result
+`v80-smi debug rp1-dump` prints the v6 control contract and all graph-result
 fields without mutating the device. `rp1-ping` validates one untraced SIGNAL
 result; `rp1-trace-ping` validates the same result with tracing and prints the
 trace ring.
@@ -665,7 +713,7 @@ Current protocol limits:
 ```text
 Resource                         Limit
 -------------------------------  -------------------------------------
-Packets per graph                4096
+Packets per graph                1024
 Barrier bits                     1024 (32 buckets x 32)
 Direct fan-in per packet         32 bits from one bucket
 In-flight kernels                32
@@ -687,7 +735,7 @@ Not yet implemented:
 - automatic proof that a PDI reconfiguration boundary drained the region.
 
 If multiple outstanding graphs are added later, completion needs a
-graph-granularity transport. Protocol v5 deliberately avoids reintroducing
+graph-granularity transport. Protocol v6 deliberately avoids reintroducing
 per-node publication into the dispatch hot path.
 
 ## Verification
@@ -695,9 +743,9 @@ per-node publication into the dispatch hot path.
 The migration is covered at several layers:
 
 - static ABI size/offset assertions in the shared header;
-- RP1 unit and QEMU graph tests for success, fatal errors, HALT, sequence wrap,
-  PDI image state, partial effects, quiescence, trace finalization, and result
-  publication;
+- RP1 unit and QEMU graph tests for the exact 1024-node maximum, immutable BTCM
+  snapshots, success, fatal errors, HALT, sequence wrap, PDI image state,
+  partial effects, quiescence, trace finalization, and result publication;
 - VRT mock-BAR tests for result validation, state/outcome agreement, image
   reconciliation, sentinel checks, timeout poisoning, and diagnostics;
 - SMI compilation plus the read-only/result-aware probes;

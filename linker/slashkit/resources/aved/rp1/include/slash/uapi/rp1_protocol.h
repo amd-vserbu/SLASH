@@ -17,7 +17,7 @@
  * stack (libslash, SMI, VRT FpgaDevice).  It describes:
  *
  *   - Opcodes, flags, status codes, and condition operators
- *   - The 64-byte node packet and its 48-byte payload union
+ *   - The 32-byte node packet and its 20-byte payload union
  *   - The 4 KB control block at the base of the host-visible BAR window
  *   - The 16-byte signal slot, 64-byte graph result, and trace entry
  *   - The in-flight kernel tracking table
@@ -61,7 +61,7 @@ extern "C" {
 #define RP1_CTRL_BAR_OFFSET             0x00000000UL  /* host BAR-relative */
 #define RP1_CTRL_WINDOW_SIZE            0x04000000UL  /* 64 MB aperture */
 
-#define RP1_DEFAULT_NODE_ARRAY_OFFSET   0x00001000UL  /* 256 KB */
+#define RP1_DEFAULT_NODE_ARRAY_OFFSET   0x00001000UL  /* 256 KB reserved */
 #define RP1_RESERVED_CQ_OFFSET          0x00041000UL  /* legacy v4 CQ gap */
 #define RP1_DEFAULT_ARG_BUF_OFFSET      0x00051000UL  /*   1 MB */
 #define RP1_DEFAULT_SIG_ARRAY_OFFSET    0x00151000UL  /*   4 KB */
@@ -72,40 +72,47 @@ extern "C" {
  * ====================================================================== */
 
 typedef enum {
-    RP1_OP_NOP             = 0x0000,
-    RP1_OP_WAIT            = 0x0001,
-    RP1_OP_SIGNAL          = 0x0002,
-    RP1_OP_KERNEL_DISPATCH = 0x0010,
-    RP1_OP_SCALAR_WRITE    = 0x0011,
-    RP1_OP_SCALAR_READ     = 0x0012,
-    RP1_OP_SCALAR_COPY     = 0x0013,
-    RP1_OP_DMA_COPY        = 0x0020,
-    RP1_OP_DMA_FILL        = 0x0021,
-    RP1_OP_PDI_LOAD        = 0x0030,
-    RP1_OP_LOOP            = 0x0040,
-    RP1_OP_COND            = 0x0041,
-    RP1_OP_RERUN           = 0x0042,
-    RP1_OP_HALT            = 0x00FF,
+    RP1_OP_NOP             = 0,
+    RP1_OP_WAIT            = 1,
+    RP1_OP_SIGNAL          = 2,
+    RP1_OP_KERNEL_DISPATCH = 3,
+    RP1_OP_SCALAR_WRITE    = 4,
+    RP1_OP_SCALAR_READ     = 5,
+    RP1_OP_SCALAR_COPY     = 6,
+    RP1_OP_DMA_COPY        = 7,
+    RP1_OP_DMA_FILL        = 8,
+    RP1_OP_PDI_LOAD        = 9,
+    RP1_OP_LOOP            = 10,
+    RP1_OP_COND            = 11,
+    RP1_OP_RERUN           = 12,
+    RP1_OP_HALT            = 13,
 } rp1_opcode_t;
 
 /* =========================================================================
- * Universal node flags (rp1_node_t.flags)
+ * Compact node control word
  * ====================================================================== */
 
-#define RP1_FLAG_RESERVED_0     (1u << 0)
-#define RP1_FLAG_RESERVED_1     (1u << 1)
-#define RP1_FLAG_INFINITE       (1u << 2)   /* KERNEL_DISPATCH: node DONE immediately */
+#define RP1_NODE_OPCODE_SHIFT    0u
+#define RP1_NODE_OPCODE_MASK     0x000Fu
+#define RP1_NODE_FLAGS_SHIFT     4u
+#define RP1_NODE_FLAGS_MASK      0x00F0u
+#define RP1_NODE_STATUS_SHIFT    8u
+#define RP1_NODE_STATUS_MASK     0x0F00u
+#define RP1_NODE_RESERVED_MASK   0xF000u
+
+/* Bit 0 marks an infinite dispatch; flags bits 1-3 are reserved and zero. */
+#define RP1_FLAG_INFINITE        (1u << 0)
 
 /* =========================================================================
- * Node status (written by RP1 into rp1_node_t.status)
+ * Node status (written by RP1 into the node control word)
  * ====================================================================== */
 
 typedef enum {
-    RP1_NODE_PENDING    = 0x0000,
-    RP1_NODE_DISPATCHED = 0x0001,
-    RP1_NODE_DONE       = 0x0002,
-    RP1_NODE_WAITING    = 0x0003,  /* RP1_OP_WAIT: gated on a signal slot      */
-    RP1_NODE_ERROR      = 0x00FF,
+    RP1_NODE_PENDING    = 0,
+    RP1_NODE_DISPATCHED = 1,
+    RP1_NODE_DONE       = 2,
+    RP1_NODE_WAITING    = 3,  /* RP1_OP_WAIT: gated on a signal slot */
+    RP1_NODE_ERROR      = 4,
 } rp1_node_status_t;
 
 /* =========================================================================
@@ -179,7 +186,7 @@ typedef enum {
 } rp1_state_t;
 
 /* =========================================================================
- * Terminal graph result (protocol v5)
+ * Terminal graph result (protocol v6)
  * ====================================================================== */
 
 #define RP1_GRAPH_RESULT_MAGIC  0x52534C54UL  /* "RSLT" */
@@ -258,7 +265,7 @@ typedef enum {
 } rp1_trace_event_t;
 
 /* =========================================================================
- * Payload structures (each 48 bytes, embedded in rp1_node_t)
+ * Payload structures (embedded in the 20-byte rp1_node_t payload)
  * ====================================================================== */
 
 /* Single kernel argument register write -- protocol v2.
@@ -274,7 +281,7 @@ typedef struct {
     uint32_t value;        /* 32-bit value to write                           */
 } rp1_kernel_arg_t;
 
-/* KERNEL_DISPATCH (0x0010)
+/* KERNEL_DISPATCH
  *
  * arg_buffer_offset is the byte offset into the shared argument buffer where
  * this kernel's rp1_kernel_arg_t[] begins; arg_count is the number of
@@ -285,55 +292,55 @@ typedef struct {
     uint32_t kernel_base_addr;   /* AXI-Lite base in R5 address space        */
     uint32_t arg_buffer_offset;  /* Byte offset into argument buffer          */
     uint16_t arg_count;          /* Number of (reg_offset, value) arg pairs   */
-    uint16_t ctrl_flags;         /* Bit 0: auto-restart                       */
+    uint8_t  ctrl_flags;         /* Reserved in phase 1; must be zero          */
+    uint8_t  _reserved;
     uint32_t timeout_cycles;     /* PMU ticks; 0 = firmware default           */
     uint32_t expected_image_id;  /* Image this kernel needs; 0 = no guard.
                                   * If non-zero and != the image last loaded
                                   * by PDI_LOAD, RP1 fails the node fast       */
-    uint8_t  _reserved[28];
 } rp1_payload_kernel_dispatch_t;
 
-/* SCALAR_WRITE (0x0011) -- up to 6 register writes, stop at first addr == 0. */
+/* SCALAR_WRITE -- up to two register writes, stop at first addr == 0. */
 typedef struct {
     uint32_t addr;
     uint32_t value;
 } rp1_write_pair_t;
 
-#define RP1_SCALAR_WRITE_MAX  6
+#define RP1_SCALAR_WRITE_MAX  2
 
 typedef struct {
     rp1_write_pair_t writes[RP1_SCALAR_WRITE_MAX];
+    uint8_t _reserved[4];
 } rp1_payload_scalar_write_t;
 
-/* SCALAR_READ (0x0012) */
+/* SCALAR_READ */
 typedef struct {
     uint32_t source_addr;    /* AXI-Lite address to read            */
-    uint32_t target_slot;    /* Signal array slot index (0-255)     */
-    uint8_t  _reserved[40];
+    uint8_t  target_slot;    /* Signal array slot index (0-255)     */
+    uint8_t  _reserved[3];
 } rp1_payload_scalar_read_t;
 
-/* SCALAR_COPY (0x0013) -- copy a signal slot's value into an AXI-Lite register.
+/* SCALAR_COPY -- copy a signal slot's value into an AXI-Lite register.
  *
  * The slot<->register inverse of SCALAR_READ: writes g_signals[source_slot] to
  * dest_addr.  Used to feed a loop-carried scalar held in a host-visible signal
  * slot into a body kernel's s_axilite input register each iteration, so the
  * carried value can flow through a kernel argument rather than a DDR buffer. */
 typedef struct {
-    uint32_t source_slot;    /* Signal array slot index to read     */
     uint32_t dest_addr;      /* AXI-Lite address to write           */
-    uint8_t  _reserved[40];
+    uint8_t  source_slot;    /* Signal array slot index to read     */
+    uint8_t  _reserved[3];
 } rp1_payload_scalar_copy_t;
 
-/* SIGNAL (0x0002) */
+/* SIGNAL */
 typedef struct {
-    uint32_t target_slot;    /* Signal array slot index (0-255)     */
     uint32_t value;
-    uint16_t operation;      /* rp1_sigop_t                         */
-    uint16_t _reserved0;
-    uint8_t  _reserved1[36];
+    uint8_t  target_slot;    /* Signal array slot index (0-255)     */
+    uint8_t  operation;      /* rp1_sigop_t                         */
+    uint8_t  _reserved[2];
 } rp1_payload_signal_t;
 
-/* WAIT (0x0001) -- block the node until a signal slot satisfies a condition.
+/* WAIT -- block the node until a signal slot satisfies a condition.
  *
  * The cross-queue rendezvous primitive: another command queue (a peer device's
  * RP1 graph, or the host writing over the BAR) raises @c condition_signal via
@@ -345,37 +352,95 @@ typedef struct {
  * outstanding the scanner keeps polling (it does not wfi), so host-written
  * signal updates are observed promptly. */
 typedef struct {
-    uint32_t condition_signal;  /* Signal array slot to poll           */
     uint32_t condition_value;   /* Comparison value                    */
-    uint16_t condition_op;      /* rp1_condop_t                        */
-    uint16_t _reserved0;
-    uint8_t  _reserved1[36];
+    uint8_t  condition_signal;  /* Signal array slot to poll           */
+    uint8_t  condition_op;      /* rp1_condop_t                        */
+    uint8_t  _reserved[2];
 } rp1_payload_wait_t;
 
-/* DMA_COPY (0x0020) */
+/* DMA_COPY */
 typedef struct {
     uint32_t src_addr_lo;
     uint32_t src_addr_hi;
     uint32_t dst_addr_lo;
     uint32_t dst_addr_hi;
-    uint32_t length;
-    uint16_t src_type;   /* 0=DDR, 1=HBM, 2=HOST */
-    uint16_t dst_type;
-    uint8_t  _reserved[24];
+    uint32_t length_types;
 } rp1_payload_dma_copy_t;
 
-/* DMA_FILL (0x0021) */
+#define RP1_DMA_LENGTH_MASK     0x0FFFFFFFu
+#define RP1_DMA_SRC_TYPE_SHIFT  28u
+#define RP1_DMA_DST_TYPE_SHIFT  30u
+#define RP1_DMA_TYPE_MASK       0x3u
+
+/**
+ * Return a packed DMA copy length and endpoint-type word.
+ *
+ * Values outside the 28-bit length and 2-bit type ranges are truncated.
+ */
+static inline uint32_t rp1_dma_pack(uint32_t length, uint8_t src_type,
+                                    uint8_t dst_type)
+{
+    return (length & RP1_DMA_LENGTH_MASK) |
+           (((uint32_t)src_type & RP1_DMA_TYPE_MASK)
+            << RP1_DMA_SRC_TYPE_SHIFT) |
+           (((uint32_t)dst_type & RP1_DMA_TYPE_MASK)
+            << RP1_DMA_DST_TYPE_SHIFT);
+}
+
+/** Return the byte length encoded in a packed DMA copy word. */
+static inline uint32_t rp1_dma_get_length(uint32_t packed)
+{
+    return packed & RP1_DMA_LENGTH_MASK;
+}
+
+/** Return the source memory type encoded in a packed DMA copy word. */
+static inline uint8_t rp1_dma_get_src_type(uint32_t packed)
+{
+    return (uint8_t)((packed >> RP1_DMA_SRC_TYPE_SHIFT) &
+                     RP1_DMA_TYPE_MASK);
+}
+
+/** Return the destination memory type encoded in a packed DMA copy word. */
+static inline uint8_t rp1_dma_get_dst_type(uint32_t packed)
+{
+    return (uint8_t)((packed >> RP1_DMA_DST_TYPE_SHIFT) &
+                     RP1_DMA_TYPE_MASK);
+}
+
+/** Replace the byte length in a packed DMA copy word. */
+static inline uint32_t rp1_dma_set_length(uint32_t packed, uint32_t length)
+{
+    return (packed & ~RP1_DMA_LENGTH_MASK) |
+           (length & RP1_DMA_LENGTH_MASK);
+}
+
+/** Replace the source memory type in a packed DMA copy word. */
+static inline uint32_t rp1_dma_set_src_type(uint32_t packed, uint8_t src_type)
+{
+    return (packed & ~(RP1_DMA_TYPE_MASK << RP1_DMA_SRC_TYPE_SHIFT)) |
+           (((uint32_t)src_type & RP1_DMA_TYPE_MASK)
+            << RP1_DMA_SRC_TYPE_SHIFT);
+}
+
+/** Replace the destination memory type in a packed DMA copy word. */
+static inline uint32_t rp1_dma_set_dst_type(uint32_t packed, uint8_t dst_type)
+{
+    return (packed & ~(RP1_DMA_TYPE_MASK << RP1_DMA_DST_TYPE_SHIFT)) |
+           (((uint32_t)dst_type & RP1_DMA_TYPE_MASK)
+            << RP1_DMA_DST_TYPE_SHIFT);
+}
+
+/* DMA_FILL */
 typedef struct {
     uint32_t dst_addr_lo;
     uint32_t dst_addr_hi;
     uint32_t length;
     uint32_t pattern;
-    uint16_t dst_type;
-    uint16_t _reserved0;
-    uint8_t  _reserved1[28];
+    uint8_t  dst_type;
+    uint8_t  _reserved[3];
 } rp1_payload_dma_fill_t;
 
-/* PDI_LOAD (0x0030) -- partial PDI reconfiguration via PMC IPI.
+/* PDI_LOAD -- partial PDI reconfiguration via PMC IPI.
  *
  * The host pre-stages a partial PDI in DDR at (pdi_addr_hi << 32 | pdi_addr_lo)
  * and submits this node.  When the node fires, RP1 issues the canonical
@@ -391,62 +456,57 @@ typedef struct {
     uint32_t image_id;        /* Image id this PDI installs; recorded as
                                * the active image so KERNEL_DISPATCH can
                                * guard against stale dispatches. 0 = none */
-    uint8_t  _reserved1[32];
+    uint8_t  _reserved[4];
 } rp1_payload_pdi_load_t;
 
-/* LOOP (0x0040) */
+/* LOOP */
 typedef struct {
-    uint32_t body_start;          /* First node index of loop body     */
-    uint32_t body_end;            /* Last node index (inclusive)        */
+    uint16_t body_start;          /* First node index of loop body     */
+    uint16_t body_end;            /* Last node index (inclusive)        */
     uint32_t max_iterations;      /* Hard cap (0 = condition-only)     */
-    uint32_t condition_signal;    /* Signal array slot to check        */
     uint32_t condition_value;     /* Exit when signal matches          */
-    uint16_t condition_op;        /* rp1_condop_t                      */
+    uint8_t  condition_signal;    /* Signal array slot to check        */
+    uint8_t  condition_op;        /* rp1_condop_t                      */
     uint8_t  bucket_clear_start;  /* First bucket to clear per iter    */
     uint8_t  bucket_clear_end;    /* Last bucket to clear (inclusive)  */
     uint8_t  loop_id;             /* Index into loop_iterations[]      */
-    uint8_t  _reserved[23];
+    uint8_t  _reserved[3];
 } rp1_payload_loop_t;
 
-/* COND (0x0041) */
+/* COND */
 typedef struct {
-    uint32_t condition_signal;    /* Signal slot to evaluate           */
     uint32_t condition_value;
-    uint16_t condition_op;        /* rp1_condop_t                      */
+    uint32_t done_mask;
+    uint16_t body_start;          /* First node index (inclusive)      */
+    uint16_t body_end;            /* Last node index (inclusive)       */
+    uint8_t  condition_signal;    /* Signal slot to evaluate           */
+    uint8_t  condition_op;        /* rp1_condop_t                      */
     uint8_t  bucket_clear_start;  /* First bucket to clear (inclusive) */
     uint8_t  bucket_clear_end;    /* Last bucket to clear (inclusive)  */
-    uint32_t body_start;          /* First node index (inclusive)      */
-    uint32_t body_end;            /* Last node index (inclusive)       */
     uint8_t  done_bucket;
-    uint8_t  _reserved0[3];
-    uint32_t done_mask;
-    uint8_t  _reserved1[20];
+    uint8_t  _reserved[3];
 } rp1_payload_cond_t;
 
-/* RERUN (0x0042) */
+/* RERUN */
 typedef struct {
-    uint32_t target_node;    /* Node index to reset DONE -> PENDING  */
-    uint16_t rerun_flags;    /* RP1_RERUN_CLEAR_STATE                */
+    uint16_t target_node;    /* Node index to reset DONE -> PENDING  */
+    uint8_t  rerun_flags;    /* RP1_RERUN_CLEAR_STATE                */
     uint8_t  loop_id;        /* Loop ID to clear (if CLEAR_STATE)    */
-    uint8_t  _reserved0[1];
-    uint8_t  _reserved1[40];
+    uint8_t  _reserved[16];
 } rp1_payload_rerun_t;
 
 /* =========================================================================
- * Node packet -- 64 bytes, 16-byte header + 48-byte payload
+ * Node packet -- 32 bytes, 12-byte header + 20-byte payload
  * ====================================================================== */
 
 typedef struct {
-    /* Header (16 bytes) */
-    uint16_t opcode;               /* rp1_opcode_t                          */
-    uint16_t flags;                /* RP1_FLAG_*                            */
-    uint32_t barrier_await_mask;   /* Which bits in await_bucket must be set */
-    uint32_t barrier_set_mask;     /* Which bits in set_bucket to raise      */
+    uint16_t control;              /* Packed opcode, flags, and status      */
     uint8_t  barrier_await_bucket; /* Which of 32 buckets to check (0-31)   */
     uint8_t  barrier_set_bucket;   /* Which of 32 buckets to write (0-31)   */
-    uint16_t status;               /* rp1_node_status_t, written by RP1     */
+    uint32_t barrier_await_mask;   /* Which bits in await_bucket must be set */
+    uint32_t barrier_set_mask;     /* Which bits in set_bucket to raise      */
 
-    /* Payload (48 bytes) */
+    /* Payload (20 bytes) */
     union {
         rp1_payload_kernel_dispatch_t kernel_dispatch;
         rp1_payload_scalar_write_t    scalar_write;
@@ -460,9 +520,85 @@ typedef struct {
         rp1_payload_loop_t            loop;
         rp1_payload_cond_t            cond;
         rp1_payload_rerun_t           rerun;
-        uint8_t raw[48];
+        uint8_t raw[20];
     } payload;
 } rp1_node_t;
+
+/**
+ * Build a control word from unshifted opcode, flag, and status values.
+ *
+ * Values are truncated to their four-bit fields and reserved bits are zero.
+ */
+static inline uint16_t rp1_node_make_control(uint16_t opcode, uint16_t flags,
+                                             uint16_t status)
+{
+    return (uint16_t)(((opcode << RP1_NODE_OPCODE_SHIFT) &
+                       RP1_NODE_OPCODE_MASK) |
+                      ((flags << RP1_NODE_FLAGS_SHIFT) &
+                       RP1_NODE_FLAGS_MASK) |
+                      ((status << RP1_NODE_STATUS_SHIFT) &
+                       RP1_NODE_STATUS_MASK));
+}
+
+/** Return the complete packed node control word. */
+static inline uint16_t rp1_node_get_control(const rp1_node_t *node)
+{
+    return node->control;
+}
+
+/** Replace the complete packed node control word. */
+static inline void rp1_node_set_control(rp1_node_t *node, uint16_t control)
+{
+    node->control = control;
+}
+
+/** Return the unshifted opcode nibble from a node. */
+static inline uint8_t rp1_node_get_opcode(const rp1_node_t *node)
+{
+    return (uint8_t)((node->control & RP1_NODE_OPCODE_MASK) >>
+                     RP1_NODE_OPCODE_SHIFT);
+}
+
+/** Replace the opcode nibble without changing flags, status, or reserved bits. */
+static inline void rp1_node_set_opcode(rp1_node_t *node, uint16_t opcode)
+{
+    node->control =
+        (uint16_t)((node->control & (uint16_t)~RP1_NODE_OPCODE_MASK) |
+                   ((opcode << RP1_NODE_OPCODE_SHIFT) &
+                    RP1_NODE_OPCODE_MASK));
+}
+
+/** Return the unshifted flags nibble from a node. */
+static inline uint8_t rp1_node_get_flags(const rp1_node_t *node)
+{
+    return (uint8_t)((node->control & RP1_NODE_FLAGS_MASK) >>
+                     RP1_NODE_FLAGS_SHIFT);
+}
+
+/** Replace the flags nibble without changing opcode, status, or reserved bits. */
+static inline void rp1_node_set_flags(rp1_node_t *node, uint16_t flags)
+{
+    node->control =
+        (uint16_t)((node->control & (uint16_t)~RP1_NODE_FLAGS_MASK) |
+                   ((flags << RP1_NODE_FLAGS_SHIFT) &
+                    RP1_NODE_FLAGS_MASK));
+}
+
+/** Return the unshifted status nibble from a node. */
+static inline uint8_t rp1_node_get_status(const rp1_node_t *node)
+{
+    return (uint8_t)((node->control & RP1_NODE_STATUS_MASK) >>
+                     RP1_NODE_STATUS_SHIFT);
+}
+
+/** Replace the status nibble without changing opcode, flags, or reserved bits. */
+static inline void rp1_node_set_status(rp1_node_t *node, uint16_t status)
+{
+    node->control =
+        (uint16_t)((node->control & (uint16_t)~RP1_NODE_STATUS_MASK) |
+                   ((status << RP1_NODE_STATUS_SHIFT) &
+                    RP1_NODE_STATUS_MASK));
+}
 
 /* =========================================================================
  * Control block -- 4 KB DDR region at RP1_CTRL_PHYS_ADDR
@@ -470,8 +606,8 @@ typedef struct {
 
 #define RP1_CTRL_MAGIC  0x53515231UL  /* "SQR1" */
 
-/* Protocol-v5 firmware capabilities.  These bits describe support for the
- * reserved v5 contracts; host code must reject firmware missing any bit in
+/* Protocol-v6 firmware capabilities.  These bits describe support for the
+ * reserved v6 contracts; host code must reject firmware missing any bit in
  * RP1_REQUIRED_CAPABILITIES. */
 #define RP1_CAP_PLATFORM_PDI_IPI_CONFIG   (1u << 0)
 #define RP1_CAP_PMU_CYCLE_TIMEOUTS        (1u << 1)
@@ -495,16 +631,16 @@ typedef struct {
     volatile uint32_t version;          /* 0x04: protocol version                */
     /* Host writes, RP1 reads */
     volatile uint32_t node_count;       /* 0x08: nodes in this graph             */
-    volatile uint32_t _reserved_cq_size;/* 0x0C: must be zero in protocol v5     */
+    volatile uint32_t _reserved_cq_size;/* 0x0C: must be zero in protocol v6     */
     volatile uint32_t node_base_lo;     /* 0x10: node array base (low 32 bits)   */
     volatile uint32_t node_base_hi;     /* 0x14: node array base (high 32 bits)  */
-    volatile uint32_t _reserved_cq_base_lo; /* 0x18: must be zero in v5           */
-    volatile uint32_t _reserved_cq_base_hi; /* 0x1C: must be zero in v5           */
+    volatile uint32_t _reserved_cq_base_lo; /* 0x18: must be zero in v6           */
+    volatile uint32_t _reserved_cq_base_hi; /* 0x1C: must be zero in v6           */
     volatile uint32_t graph_seq;        /* 0x20: host increments per graph        */
     /* RP1 writes */
     volatile uint32_t graph_done_seq;   /* 0x24: last completed graph             */
-    volatile uint32_t _reserved_cq_write_idx; /* 0x28: zero in protocol v5         */
-    volatile uint32_t _reserved_cq_read_idx;  /* 0x2C: zero in protocol v5         */
+    volatile uint32_t _reserved_cq_write_idx; /* 0x28: zero in protocol v6         */
+    volatile uint32_t _reserved_cq_read_idx;  /* 0x2C: zero in protocol v6         */
     /* RP1 writes */
     volatile uint32_t rp1_state;        /* 0x30: rp1_state_t                     */
     volatile uint32_t rp1_error_code;   /* 0x34: last error code                 */
@@ -520,7 +656,7 @@ typedef struct {
     volatile uint32_t trace_base_hi;    /* 0x58: trace ring base (high 32 bits)  */
     volatile uint32_t trace_size;       /* 0x5C: trace entries (power of 2)      */
     volatile uint32_t trace_write_idx;  /* 0x60: next trace write position       */
-    /* RP1 writes: protocol-v5 contract publication and diagnostics */
+    /* RP1 writes: protocol-v6 contract publication and diagnostics */
     volatile uint32_t capabilities;          /* 0x64: RP1_CAP_*                    */
     volatile uint32_t pdi_ipi_platform_id;   /* 0x68: selected IPI/platform config */
     volatile uint32_t terminal_error_node;   /* 0x6C: latched failing node         */
@@ -576,14 +712,14 @@ typedef struct {
  * Compile-time size constants
  * ====================================================================== */
 
-#define RP1_MAX_NODES          4096
+#define RP1_MAX_NODES          1024
 #define RP1_MAX_TRACE_ENTRIES  4096
 #define RP1_MAX_LOOPS            64
 #define RP1_MAX_INFLIGHT         32
 #define RP1_MAX_SIGNALS         256
 #define RP1_MAX_BUCKETS          32
 
-#define RP1_PROTOCOL_VERSION  5u
+#define RP1_PROTOCOL_VERSION  6u
 
 /* Cortex-R5 PMCCNTR is configured with PMCR.D, so one protocol PMU tick is
  * exactly 64 R5 core cycles. timeout_cycles and trace/result timestamps use this
@@ -604,41 +740,109 @@ typedef struct {
 #  define RP1_STATIC_ASSERT(cond, msg) _Static_assert((cond), msg)
 #endif
 
-/* Node packet must be exactly 64 bytes with payload at offset 16. */
-RP1_STATIC_ASSERT(sizeof(rp1_node_t) == 64,
-                  "rp1_node_t must be exactly 64 bytes");
-RP1_STATIC_ASSERT(offsetof(rp1_node_t, payload) == 16,
-                  "rp1_node_t payload must start at byte 16");
+/* Node packet must be exactly 32 bytes with payload at offset 12. */
+RP1_STATIC_ASSERT(sizeof(rp1_node_t) == 32,
+                  "rp1_node_t must be exactly 32 bytes");
+#if defined(__cplusplus)
+RP1_STATIC_ASSERT(alignof(rp1_node_t) == 4,
+                  "rp1_node_t must be naturally four-byte aligned");
+#else
+RP1_STATIC_ASSERT(_Alignof(rp1_node_t) == 4,
+                  "rp1_node_t must be naturally four-byte aligned");
+#endif
+RP1_STATIC_ASSERT(offsetof(rp1_node_t, control) == 0,
+                  "rp1_node_t control must start at byte 0");
+RP1_STATIC_ASSERT(offsetof(rp1_node_t, barrier_await_bucket) == 2,
+                  "rp1_node_t await bucket must start at byte 2");
+RP1_STATIC_ASSERT(offsetof(rp1_node_t, barrier_set_bucket) == 3,
+                  "rp1_node_t set bucket must start at byte 3");
+RP1_STATIC_ASSERT(offsetof(rp1_node_t, barrier_await_mask) == 4,
+                  "rp1_node_t await mask must start at byte 4");
+RP1_STATIC_ASSERT(offsetof(rp1_node_t, barrier_set_mask) == 8,
+                  "rp1_node_t set mask must start at byte 8");
+RP1_STATIC_ASSERT(offsetof(rp1_node_t, payload) == 12,
+                  "rp1_node_t payload must start at byte 12");
 
 /* Kernel argument pair (protocol v2) must be exactly 8 bytes. */
 RP1_STATIC_ASSERT(sizeof(rp1_kernel_arg_t) == 8,
                   "rp1_kernel_arg_t must be exactly 8 bytes");
 
-/* Each payload variant must fit in the 48-byte payload union. */
-RP1_STATIC_ASSERT(sizeof(rp1_payload_kernel_dispatch_t) == 48,
-                  "kernel_dispatch payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_write_t)    == 48,
-                  "scalar_write payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_read_t)     == 48,
-                  "scalar_read payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_copy_t)     == 48,
-                  "scalar_copy payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_signal_t)          == 48,
-                  "signal payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_wait_t)            == 48,
-                  "wait payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_copy_t)        == 48,
-                  "dma_copy payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_fill_t)        == 48,
-                  "dma_fill payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_pdi_load_t)        == 48,
-                  "pdi_load payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_loop_t)            == 48,
-                  "loop payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_cond_t)            == 48,
-                  "cond payload must be 48 bytes");
-RP1_STATIC_ASSERT(sizeof(rp1_payload_rerun_t)           == 48,
-                  "rerun payload must be 48 bytes");
+/* Every payload has its exact protocol-v6 natural size. */
+RP1_STATIC_ASSERT(sizeof(rp1_payload_kernel_dispatch_t) == 20,
+                  "kernel_dispatch payload must be 20 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_write_t)    == 20,
+                  "scalar_write payload must be 20 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_read_t)     == 8,
+                  "scalar_read payload must be 8 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_scalar_copy_t)     == 8,
+                  "scalar_copy payload must be 8 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_signal_t)          == 8,
+                  "signal payload must be 8 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_wait_t)            == 8,
+                  "wait payload must be 8 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_copy_t)        == 20,
+                  "dma_copy payload must be 20 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_dma_fill_t)        == 20,
+                  "dma_fill payload must be 20 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_pdi_load_t)        == 20,
+                  "pdi_load payload must be 20 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_loop_t)            == 20,
+                  "loop payload must be 20 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_cond_t)            == 20,
+                  "cond payload must be 20 bytes");
+RP1_STATIC_ASSERT(sizeof(rp1_payload_rerun_t)           == 20,
+                  "rerun payload must be 20 bytes");
+RP1_STATIC_ASSERT(sizeof(((rp1_node_t *)0)->payload.raw) == 20,
+                  "raw payload must be 20 bytes");
+
+/* Compact payload field offsets are part of the wire ABI. */
+RP1_STATIC_ASSERT(offsetof(rp1_payload_kernel_dispatch_t, arg_count) == 8,
+                  "dispatch arg_count offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_kernel_dispatch_t, ctrl_flags) == 10,
+                  "dispatch ctrl_flags offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_kernel_dispatch_t, timeout_cycles) == 12,
+                  "dispatch timeout offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_kernel_dispatch_t,
+                           expected_image_id) == 16,
+                  "dispatch image offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_scalar_read_t, target_slot) == 4,
+                  "scalar_read target offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_scalar_copy_t, source_slot) == 4,
+                  "scalar_copy source offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_signal_t, target_slot) == 4,
+                  "signal target offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_signal_t, operation) == 5,
+                  "signal operation offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_wait_t, condition_signal) == 4,
+                  "wait signal offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_wait_t, condition_op) == 5,
+                  "wait operation offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_dma_copy_t, length_types) == 16,
+                  "dma_copy packed offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_dma_fill_t, dst_type) == 16,
+                  "dma_fill type offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_pdi_load_t, image_id) == 12,
+                  "pdi_load image offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_loop_t, max_iterations) == 4,
+                  "loop maximum offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_loop_t, condition_value) == 8,
+                  "loop value offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_loop_t, condition_signal) == 12,
+                  "loop signal offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_loop_t, loop_id) == 16,
+                  "loop id offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_cond_t, done_mask) == 4,
+                  "cond done mask offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_cond_t, body_start) == 8,
+                  "cond body offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_cond_t, condition_signal) == 12,
+                  "cond signal offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_cond_t, done_bucket) == 16,
+                  "cond done bucket offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_rerun_t, rerun_flags) == 2,
+                  "rerun flags offset");
+RP1_STATIC_ASSERT(offsetof(rp1_payload_rerun_t, loop_id) == 3,
+                  "rerun loop offset");
 
 /* Control block must be exactly 4 KB. */
 RP1_STATIC_ASSERT(sizeof(rp1_ctrl_t) == 0x1000,

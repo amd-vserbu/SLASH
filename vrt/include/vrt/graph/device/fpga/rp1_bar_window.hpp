@@ -148,7 +148,7 @@ class Rp1BarWindow {
         writeAt(0, &in, sizeof(in));
     }
 
-    /// Copy @p n consecutive 64-byte node packets to the node array at
+    /// Copy @p n consecutive 32-byte node packets to the node array at
     /// @c (RP1_DEFAULT_NODE_ARRAY_OFFSET + index * sizeof(rp1_node_t)).
     /// @p node_array_offset is the window-relative byte offset of the
     /// node array (defaults to @c RP1_DEFAULT_NODE_ARRAY_OFFSET).

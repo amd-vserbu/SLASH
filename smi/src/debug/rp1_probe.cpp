@@ -61,7 +61,7 @@ constexpr auto     kPollInterval    = std::chrono::milliseconds(1);
 constexpr auto     kStallWindow     = std::chrono::milliseconds(500);
 
 /**
- * @brief Stable host snapshot of the protocol-v5 graph result.
+ * @brief Stable host snapshot of the protocol-v6 graph result.
  */
 struct GraphResultSnapshot {
     /// Commit marker written after the result payload.
@@ -476,8 +476,8 @@ constexpr bool contractFieldsCompatible(
 
 static_assert(
     !contractFieldsCompatible(
-        RP1_CTRL_MAGIC, 4u, RP1_REQUIRED_CAPABILITIES, 1u),
-    "protocol-v4 firmware must be rejected");
+        RP1_CTRL_MAGIC, 5u, RP1_REQUIRED_CAPABILITIES, 1u),
+    "protocol-v5 firmware must be rejected");
 
 /// Return true only when the published firmware contract matches this host.
 bool contractCompatible(volatile rp1_ctrl_t* c) {
@@ -516,17 +516,26 @@ void barZero(volatile void* dst, size_t bytes) {
     }
 }
 
+/// Copy @p bytes into a volatile BAR mapping without dropping writes.
+void barWrite(volatile void* dst, const void* src, size_t bytes) {
+    auto* out = static_cast<volatile uint8_t*>(dst);
+    const auto* in = static_cast<const uint8_t*>(src);
+    for (size_t i = 0; i < bytes; ++i) {
+        out[i] = in[i];
+    }
+}
+
 /// Initialize the common header of one staged node packet.
-void nodeSetHeader(volatile rp1_node_t* n, uint16_t opcode,
+void nodeSetHeader(rp1_node_t* n, uint16_t opcode,
                    uint8_t awaitBucket, uint32_t awaitMask,
                    uint8_t setBucket, uint32_t setMask) {
-    n->opcode               = opcode;
-    n->flags                = 0;
+    rp1_node_set_opcode(n, opcode);
+    rp1_node_set_flags(n, 0u);
+    rp1_node_set_status(n, RP1_NODE_PENDING);
     n->barrier_await_mask   = awaitMask;
     n->barrier_set_mask     = setMask;
     n->barrier_await_bucket = awaitBucket;
     n->barrier_set_bucket   = setBucket;
-    n->status               = RP1_NODE_PENDING;
 }
 
 /// Program the control block's base-address fields for a graph of @p nodeCount nodes.
@@ -762,13 +771,14 @@ int Rp1Probe::ping(const Options& options) {
         auto* sigs = reinterpret_cast<volatile rp1_signal_slot_t*>(
             basePtr + RP1_DEFAULT_SIG_ARRAY_OFFSET);
 
-        barZero(&nodes[0], sizeof(rp1_node_t));
+        rp1_node_t node{};
         nodeSetHeader(
-            &nodes[0], RP1_OP_SIGNAL, /*await*/ 0, 0x0,
+            &node, RP1_OP_SIGNAL, /*await*/ 0, 0x0,
             /*set*/ 0, 0x1);
-        nodes[0].payload.signal.target_slot = 0;
-        nodes[0].payload.signal.value       = kSignalMagic;
-        nodes[0].payload.signal.operation   = RP1_SIGOP_SET;
+        node.payload.signal.target_slot = 0;
+        node.payload.signal.value       = kSignalMagic;
+        node.payload.signal.operation   = RP1_SIGOP_SET;
+        barWrite(&nodes[0], &node, sizeof(node));
 
         sigs[0].value            = 0;
         sigs[0].last_writer_node = 0;
@@ -879,13 +889,14 @@ int Rp1Probe::tracePing(const Options& options) {
         auto* traces = reinterpret_cast<volatile rp1_trace_entry_t*>(
             basePtr + RP1_DEFAULT_TRACE_OFFSET);
 
-        barZero(&nodes[0], sizeof(rp1_node_t));
+        rp1_node_t node{};
         nodeSetHeader(
-            &nodes[0], RP1_OP_SIGNAL, /*await*/ 0, 0x0,
+            &node, RP1_OP_SIGNAL, /*await*/ 0, 0x0,
             /*set*/ 0, 0x1);
-        nodes[0].payload.signal.target_slot = 0;
-        nodes[0].payload.signal.value       = kSignalMagic;
-        nodes[0].payload.signal.operation   = RP1_SIGOP_SET;
+        node.payload.signal.target_slot = 0;
+        node.payload.signal.value       = kSignalMagic;
+        node.payload.signal.operation   = RP1_SIGOP_SET;
+        barWrite(&nodes[0], &node, sizeof(node));
 
         sigs[0].value            = 0;
         sigs[0].last_writer_node = 0;

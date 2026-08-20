@@ -63,6 +63,21 @@ bool isValidCondition(std::uint16_t op) noexcept {
     return op <= RP1_COP_AND_Z;
 }
 
+/**
+ * @brief Return whether one phase-1 DMA endpoint fits the 32-bit DDR model.
+ *
+ * Phase 1 supports only word-aligned, low-word addresses. A zero-byte transfer
+ * is valid; non-empty ranges may end at the top of the 32-bit address space
+ * but must not wrap past it.
+ */
+bool isValidPhase1DmaRange(std::uint32_t lo, std::uint32_t hi,
+                           std::uint32_t bytes) noexcept {
+    constexpr std::uint64_t addressSpaceSize =
+        std::uint64_t{1} << 32;
+    return hi == 0u && ((lo | bytes) & 3u) == 0u &&
+           static_cast<std::uint64_t>(lo) + bytes <= addressSpaceSize;
+}
+
 /*
  * Validation is deliberately complete before the doorbell can move. Check the
  * shared header first, then opcode-specific slots and ranges, and reject
@@ -87,17 +102,64 @@ void validateImage(const Rp1GraphImage& image) {
 
     for (std::size_t i = 0; i < image.nodes.size(); ++i) {
         const rp1_node_t& node = image.nodes[i];
+        const std::uint16_t opcode = rp1_node_get_opcode(&node);
+        const std::uint16_t flags = rp1_node_get_flags(&node);
+        if ((rp1_node_get_control(&node) & RP1_NODE_RESERVED_MASK) != 0u) {
+            bad(i, "packed control reserved bits are non-zero");
+        }
+        if (rp1_node_get_status(&node) != RP1_NODE_PENDING) {
+            bad(i, "initial status is not PENDING");
+        }
+        if ((flags & ~RP1_FLAG_INFINITE) != 0u ||
+            ((flags & RP1_FLAG_INFINITE) != 0u &&
+             opcode != RP1_OP_KERNEL_DISPATCH)) {
+            bad(i, "flags are invalid for the opcode");
+        }
         if (node.barrier_await_bucket >= RP1_MAX_BUCKETS ||
             node.barrier_set_bucket >= RP1_MAX_BUCKETS) {
             bad(i, "barrier bucket out of range");
         }
-        switch (node.opcode) {
+        switch (opcode) {
             case RP1_OP_NOP:
-            case RP1_OP_SCALAR_WRITE:
-            case RP1_OP_DMA_COPY:
-            case RP1_OP_DMA_FILL:
             case RP1_OP_HALT:
                 break;
+            case RP1_OP_SCALAR_WRITE: {
+                bool terminated = false;
+                for (const rp1_write_pair_t& write :
+                     node.payload.scalar_write.writes) {
+                    if (write.addr == 0u) {
+                        terminated = true;
+                    } else if (terminated || (write.addr & 3u) != 0u) {
+                        bad(i, "SCALAR_WRITE pair sequence is invalid");
+                    }
+                }
+                break;
+            }
+            case RP1_OP_DMA_COPY: {
+                const auto& dma = node.payload.dma_copy;
+                const std::uint32_t packed =
+                    dma.length_types;
+                const std::uint32_t length =
+                    rp1_dma_get_length(packed);
+                if (rp1_dma_get_src_type(packed) != 0u ||
+                    rp1_dma_get_dst_type(packed) != 0u ||
+                    !isValidPhase1DmaRange(
+                        dma.src_addr_lo, dma.src_addr_hi, length) ||
+                    !isValidPhase1DmaRange(
+                        dma.dst_addr_lo, dma.dst_addr_hi, length)) {
+                    bad(i, "DMA_COPY address, length, or memory type is invalid");
+                }
+                break;
+            }
+            case RP1_OP_DMA_FILL: {
+                const auto& dma = node.payload.dma_fill;
+                if (dma.dst_type != 0u ||
+                    !isValidPhase1DmaRange(
+                        dma.dst_addr_lo, dma.dst_addr_hi, dma.length)) {
+                    bad(i, "DMA_FILL address, length, or memory type is invalid");
+                }
+                break;
+            }
             case RP1_OP_SIGNAL:
                 if (!validSlot(node.payload.signal.target_slot)) {
                     bad(i, "SIGNAL target slot out of range");
@@ -132,6 +194,7 @@ void validateImage(const Rp1GraphImage& image) {
                         sizeof(rp1_kernel_arg_t);
                 if (kernel.kernel_base_addr == 0 ||
                     (kernel.arg_buffer_offset & 7u) != 0u ||
+                    kernel.ctrl_flags != 0u ||
                     argEnd > image.arg_buf.size() * sizeof(std::uint32_t)) {
                     bad(i, "KERNEL_DISPATCH argument range is invalid");
                 }
@@ -173,6 +236,8 @@ void validateImage(const Rp1GraphImage& image) {
             }
             case RP1_OP_RERUN:
                 if (node.payload.rerun.target_node >= image.nodes.size() ||
+                    (node.payload.rerun.rerun_flags &
+                     ~RP1_RERUN_CLEAR_STATE) != 0u ||
                     (((node.payload.rerun.rerun_flags &
                        RP1_RERUN_CLEAR_STATE) != 0u) &&
                      node.payload.rerun.loop_id >= RP1_MAX_LOOPS)) {
@@ -180,7 +245,7 @@ void validateImage(const Rp1GraphImage& image) {
                 }
                 break;
             default:
-                bad(i, "opcode is not defined by protocol v5");
+                bad(i, "opcode is not defined by protocol v6");
         }
     }
 }
@@ -209,7 +274,7 @@ void requireFirmwareContract(Rp1BarWindow& window) {
         RP1_REQUIRED_CAPABILITIES & ~capabilities;
     if (missing != 0u) {
         throw std::runtime_error(
-            "Rp1Submitter: RP1 firmware is missing required protocol-v5 "
+            "Rp1Submitter: RP1 firmware is missing required protocol-v6 "
             "capabilities (firmware mask=" +
             std::to_string(capabilities) + ", required mask=" +
             std::to_string(RP1_REQUIRED_CAPABILITIES) + ", missing mask=" +
@@ -225,6 +290,63 @@ void requireFirmwareContract(Rp1BarWindow& window) {
 }
 
 }  // namespace
+
+void appendScalarWritePackets(
+    Rp1GraphImage& image,
+    const std::vector<rp1_write_pair_t>& writes,
+    std::uint8_t awaitBucket, std::uint32_t awaitMask,
+    std::uint8_t setBucket, std::uint32_t setMask) {
+    if (writes.empty()) {
+        throw std::logic_error(
+            "appendScalarWritePackets: write list is empty");
+    }
+    if (awaitBucket >= RP1_MAX_BUCKETS ||
+        setBucket >= RP1_MAX_BUCKETS) {
+        throw std::logic_error(
+            "appendScalarWritePackets: barrier bucket is out of range");
+    }
+    for (const rp1_write_pair_t& write : writes) {
+        if (write.addr == 0u || (write.addr & 3u) != 0u) {
+            throw std::logic_error(
+                "appendScalarWritePackets: address is zero or unaligned");
+        }
+    }
+
+    const std::size_t packetCount =
+        writes.size() / RP1_SCALAR_WRITE_MAX +
+        (writes.size() % RP1_SCALAR_WRITE_MAX != 0u ? 1u : 0u);
+    if (image.nodes.size() > RP1_MAX_NODES ||
+        packetCount > RP1_MAX_NODES - image.nodes.size()) {
+        throw std::logic_error(
+            "appendScalarWritePackets: image exceeds RP1_MAX_NODES");
+    }
+
+    /*
+     * Every packet shares the original await. Only the final packet publishes
+     * completion, so contiguous flat-scanner order cannot expose a partial
+     * register-write sequence to dependent nodes.
+     */
+    image.nodes.reserve(image.nodes.size() + packetCount);
+    for (std::size_t first = 0; first < writes.size();
+         first += RP1_SCALAR_WRITE_MAX) {
+        rp1_node_t node{};
+        rp1_node_set_opcode(&node, RP1_OP_SCALAR_WRITE);
+        rp1_node_set_flags(&node, 0u);
+        rp1_node_set_status(&node, RP1_NODE_PENDING);
+        node.barrier_await_bucket = awaitBucket;
+        node.barrier_await_mask = awaitMask;
+        const bool final =
+            first + RP1_SCALAR_WRITE_MAX >= writes.size();
+        node.barrier_set_bucket = final ? setBucket : 0u;
+        node.barrier_set_mask = final ? setMask : 0u;
+        for (std::size_t i = 0;
+             i < RP1_SCALAR_WRITE_MAX && first + i < writes.size();
+             ++i) {
+            node.payload.scalar_write.writes[i] = writes[first + i];
+        }
+        image.nodes.push_back(node);
+    }
+}
 
 Rp1Submitter::Rp1Submitter(Rp1BarWindow& window) : window_(&window) {}
 
@@ -267,7 +389,7 @@ void Rp1Submitter::ensureReady(std::chrono::milliseconds timeout) {
     /*
      * Program host-owned words individually. A bulk control-block write would
      * race firmware-owned heartbeat, state, sequence, result, and diagnostics.
-     * Former CQ configuration words are zero-only protocol-v5 reservations.
+     * Former CQ configuration words are zero-only protocol-v6 reservations.
      */
     window_->writeU32(offsetof(rp1_ctrl_t, _reserved_cq_size), 0u);
     window_->writeU32(offsetof(rp1_ctrl_t, node_base_lo),
@@ -623,8 +745,7 @@ Rp1GraphResult Rp1Submitter::readGraphResult(
             }
             if ((wire.flags &
                  (RP1_RESULT_RECOVERY_REQUIRED |
-                  RP1_RESULT_EFFECTS_MAY_BE_PARTIAL |
-                  RP1_RESULT_UNREACHED_NODES)) != 0u) {
+                  RP1_RESULT_EFFECTS_MAY_BE_PARTIAL)) != 0u) {
                 corrupt("SUCCESS carries terminal-only flags=" +
                         std::to_string(wire.flags));
             }

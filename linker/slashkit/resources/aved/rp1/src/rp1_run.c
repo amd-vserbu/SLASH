@@ -36,7 +36,7 @@ static uint32_t has_unreached_nodes(uint32_t node_count, int store_ready)
         return node_count != 0u;
 
     for (uint32_t i = 0u; i < node_count; i++) {
-        uint8_t status = g_node_status[i];
+        uint8_t status = rp1_node_get_status(&g_nodes[i]);
         if (status == RP1_NODE_PENDING ||
             status == RP1_NODE_DISPATCHED ||
             status == RP1_NODE_WAITING)
@@ -71,7 +71,8 @@ static void initialize_result(void)
  * publishes magic only after this function returns and a barrier completes.
  */
 static void populate_result(uint32_t accepted_seq, int result,
-                            int store_ready, uint32_t graph_elapsed)
+                            int store_ready, uint32_t node_count,
+                            uint32_t graph_elapsed)
 {
     uint32_t outcome = result == -1 ? RP1_GRAPH_RESULT_FAILED :
                        result == -2 ? RP1_GRAPH_RESULT_HALTED :
@@ -91,7 +92,7 @@ static void populate_result(uint32_t accepted_seq, int result,
         if (trace_write > g_trace_size)
             flags |= RP1_RESULT_TRACE_OVERFLOW;
     }
-    if (has_unreached_nodes(g_ctrl->node_count, store_ready))
+    if (has_unreached_nodes(node_count, store_ready))
         flags |= RP1_RESULT_UNREACHED_NODES;
 
     g_ctrl->result.graph_seq = accepted_seq;
@@ -140,6 +141,9 @@ int rp1_run(void)
     g_ctrl->version               = RP1_PROTOCOL_VERSION;
     g_ctrl->capabilities          = RP1_REQUIRED_CAPABILITIES;
     g_ctrl->pdi_ipi_platform_id   = RP1_PLATFORM_ID;
+    /* BTCM is NOLOAD, so establish reset-only image state explicitly. */
+    g_active_image_id             = 0u;
+    g_active_image_state          = RP1_IMAGE_STATE_NONE;
     rp1_clear_error_latch();
     /*
      * Firmware owns the doorbell only while magic is invalid. Reset both
@@ -188,6 +192,7 @@ int rp1_run(void)
         }
 
         uint32_t accepted_seq = g_ctrl->graph_seq;
+        uint32_t submitted_node_count = g_ctrl->node_count;
         uint32_t config_detail = 0u;
         uint32_t config_aux = 0u;
         int store_ready = 0;
@@ -213,7 +218,7 @@ int rp1_run(void)
         }
         if (store_ready)
             rp1_trace_emit(RP1_TRACE_GRAPH_START, 0xFFFFu,
-                           accepted_seq, g_ctrl->node_count);
+                           accepted_seq, g_node_count);
 
         /*
          * Phase 2: run only a fully initialized store. Configuration failure
@@ -262,7 +267,9 @@ int rp1_run(void)
          * before graph_done_seq. Exact sequence completion is the host's
          * release point for the committed sequence-tagged result.
          */
-        populate_result(accepted_seq, result, store_ready, graph_elapsed);
+        populate_result(accepted_seq, result, store_ready,
+                        store_ready ? g_node_count : submitted_node_count,
+                        graph_elapsed);
         rp1_barrier();
         g_ctrl->result.magic = RP1_GRAPH_RESULT_MAGIC;
         rp1_barrier();

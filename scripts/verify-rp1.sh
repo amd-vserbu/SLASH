@@ -2,7 +2,7 @@
 # Copyright (c) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 #
-# Verify protocol-v5 firmware liveness and its last committed graph result.
+# Verify protocol-v6 firmware liveness and its last committed graph result.
 # Usage: verify_rp1.sh [control_block_base] [bdf]
 #   control_block_base: DDR base of RP1 control block (default: 0x30000000)
 #   bdf:     PCIe BDF of the device (default: auto-detect)
@@ -54,7 +54,7 @@ is_zero_word() {
 printf 'Checking RP1 control block at 0x%x (result 0x%x, heartbeat 0x%x)...\n' \
     "$CTRL_BASE" "$RESULT_ADDR" "$HEARTBEAT_ADDR"
 
-# Protocol v5 retains five CQ-era words as zero-only ABI reservations.
+# Protocol v6 retains five CQ-era words as zero-only ABI reservations.
 read_words "$(printf '0x%x' "$CTRL_BASE")" 12 "control-block header"
 magic=${WORDS[0],,}
 version=${WORDS[1]}
@@ -71,15 +71,15 @@ printf 'Reserved: [0x0c]=%s [0x18]=%s [0x1c]=%s [0x28]=%s [0x2c]=%s\n' \
     "$reserved_28" "$reserved_2c"
 [[ $magic == 0x53515231 ]] ||
     fail "RP1 control magic is $magic, expected 0x53515231 (SQR1)"
-((version == 5)) ||
-    fail "RP1 protocol is v$((version)), expected v5"
+((version == 6)) ||
+    fail "RP1 protocol is v$((version)), expected v6"
 for offset_and_word in \
     "0x0c:$reserved_0c" "0x18:$reserved_18" "0x1c:$reserved_1c" \
     "0x28:$reserved_28" "0x2c:$reserved_2c"; do
     offset=${offset_and_word%%:*}
     word=${offset_and_word#*:}
     is_zero_word "$word" ||
-        fail "protocol-v5 reserved control word $offset is non-zero: $word"
+        fail "protocol-v6 reserved control word $offset is non-zero: $word"
 done
 
 # Required capabilities and generated IPI identity commit graph-result behavior.
@@ -89,7 +89,7 @@ platform_id=${WORDS[1]}
 printf 'Contract: capabilities=%s platform_id=%s\n' \
     "$capabilities" "$platform_id"
 (( (capabilities & 0x7b) == 0x7b )) ||
-    fail "RP1 is missing required protocol-v5 capabilities: $capabilities"
+    fail "RP1 is missing required protocol-v6 capabilities: $capabilities"
 ! is_zero_word "$platform_id" ||
     fail "RP1 reports an unknown platform/IPI identity"
 
@@ -156,7 +156,7 @@ else
     ((result_outcome == 1)) ||
         fail "last graph outcome is $((result_outcome)), expected SUCCESS (1)"
     (( (result_flags & 0xffffffc0) == 0 )) ||
-        fail "last graph reports unknown protocol-v5 flags: $result_flags"
+        fail "last graph reports unknown protocol-v6 flags: $result_flags"
     (( (result_flags & 0x17) == 0 )) ||
         fail "last graph reports failure/recovery flags: $result_flags"
     if (( (result_flags & 0x08) != 0 )); then
@@ -203,5 +203,5 @@ heartbeat_after=${WORDS[0]}
 ((heartbeat_after != heartbeat_before)) ||
     fail "RP1 heartbeat is unchanged at $((heartbeat_before))"
 
-printf 'PASS: RP1 protocol-v5 result is healthy; heartbeat advanced %u -> %u.\n' \
+printf 'PASS: RP1 protocol-v6 result is healthy; heartbeat advanced %u -> %u.\n' \
     "$((heartbeat_before))" "$((heartbeat_after))"

@@ -2,25 +2,22 @@
  * Copyright (c) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
- * RP1 static storage — BTCM-resident hot data and DDR pointers.
+ * RP1 static storage — BTCM-resident graph data and DDR pointers.
  *
  * All BTCM objects are in a dedicated .btcm section so the linker script
  * can place them there explicitly.  DDR-backed objects are accessed through
  * pointers that are initialised from the control block at startup.
  *
  * BTCM budget (of 64 KB):
- *   completed_barriers[32]    128 B
- *   node_status[4096]        4096 B
- *   loop_iterations[64]       256 B
- *   inflight[32]              768 B   (32 * sizeof(rp1_inflight_t) = 24)
- *   inflight_count              4 B
- *   trace staging            4096 B   (256 * sizeof(rp1_trace_entry_t))
- *   trace staging count         4 B
- *   result/image bookkeeping   36 B
- *   stack                    4096 B   (linker script)
- *   code variables           ~1 KB
+ *   nodes[1024]              32768 B
+ *   completed_barriers[32]     128 B
+ *   loop_iterations[64]        256 B
+ *   inflight[32]               768 B   (32 * sizeof(rp1_inflight_t) = 24)
+ *   trace staging             4096 B   (256 * sizeof(rp1_trace_entry_t))
+ *   stack                     4096 B   (linker script)
+ *   bookkeeping and BSS       ~6 KB
  *   ─────────────────────────────
- *   Total hot data           ~14.4 KB
+ *   Total                    <64 KB (enforced by the linker script)
  */
 
 #ifndef RP1_STORE_H
@@ -40,8 +37,14 @@
 /* Flat barrier array: 32 buckets of 32 bits each = 1024 barrier signals. */
 extern uint32_t g_barriers[RP1_MAX_BUCKETS];
 
-/* Authoritative per-node state; DDR node status is initialized but not updated. */
-extern uint8_t g_node_status[RP1_MAX_NODES];
+/*
+ * Authoritative graph snapshot. The active DDR prefix is copied here once
+ * after validation; payloads and packed status are never read back from DDR.
+ */
+extern rp1_node_t g_nodes[RP1_MAX_NODES];
+
+/* Valid prefix of g_nodes for the accepted graph. */
+extern uint32_t g_node_count;
 
 /* Per-loop iteration counter, indexed by loop_id. */
 extern uint32_t g_loop_iters[RP1_MAX_LOOPS];
@@ -77,9 +80,6 @@ extern uint32_t g_terminal_opcode;
 /* Pointer to the control block (fixed at RP1_DDR_CTRL_BASE). */
 extern rp1_ctrl_t *g_ctrl;
 
-/* Pointer to the node array (from g_ctrl->node_base_lo/hi). */
-extern rp1_node_t *g_nodes;
-
 /* Pointer to the signal array (from g_ctrl->sig_array_base_lo/hi). */
 extern rp1_signal_slot_t *g_signals;
 
@@ -96,17 +96,17 @@ extern uint32_t g_trace_enable;
  * ---------------------------------------------------------------------- */
 
 /*
- * Validate the host-owned control fields, resolve DDR pointers, and zero the
- * per-graph BTCM stores.
+ * Validate host-owned control fields, snapshot the active node prefix into
+ * BTCM, resolve the remaining DDR pointers, and reset per-graph state.
  *
  * @return 0 on success, -1 with protocol detail/aux populated on failure.
  */
 int rp1_store_init(uint32_t *detail, uint32_t *aux);
 
 /*
- * rp1_store_reset_graph() — reset per-graph BTCM state (barriers, node
- * statuses, counters, loop state, and inflight table) without touching DDR
- * pointers or persistent image state. Called at each graph submission.
+ * rp1_store_reset_graph() — reset per-graph BTCM state (barriers, counters,
+ * loop state, and inflight table) without touching the node snapshot, DDR
+ * pointers, or persistent image state. Called before each graph snapshot.
  */
 void rp1_store_reset_graph(void);
 

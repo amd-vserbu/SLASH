@@ -22,9 +22,24 @@
 #include "rp1_latency.cpp"
 
 /**
- * @brief Verify result validation, flush accounting, and PMU wrap.
+ * @brief Verify packed DMA, result validation, flush accounting, and PMU wrap.
  */
 int main() {
+    const auto dmaImage = makeDmaImage(4096u);
+    const rp1_node_t& dmaNode = dmaImage.nodes.front();
+    if (rp1_node_get_opcode(&dmaNode) != RP1_OP_DMA_COPY ||
+        rp1_dma_get_length(dmaNode.payload.dma_copy.length_types) != 4096u ||
+        rp1_dma_get_src_type(dmaNode.payload.dma_copy.length_types) != 0u ||
+        rp1_dma_get_dst_type(dmaNode.payload.dma_copy.length_types) != 0u) {
+        return 1;
+    }
+    try {
+        (void)makeDmaImage(
+            static_cast<std::size_t>(RP1_DMA_LENGTH_MASK) + 1u);
+        return 1;
+    } catch (const std::invalid_argument&) {
+    }
+
     vrt::graph::fpga::Rp1GraphResult result;
     result.flags = RP1_RESULT_TRACE_ENABLED;
     result.activeImageId = 1u;

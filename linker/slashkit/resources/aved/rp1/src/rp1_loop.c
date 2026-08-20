@@ -19,7 +19,7 @@
  * Condition evaluation  (shared with LOOP, COND)
  * ---------------------------------------------------------------------- */
 
-static uint32_t compare(uint32_t sig, uint16_t op, uint32_t val)
+static uint32_t compare(uint32_t sig, uint8_t op, uint32_t val)
 {
     switch (op) {
     case RP1_COP_EQ:     return sig == val;
@@ -49,7 +49,8 @@ static void add_inflight(const rp1_node_t *node, uint32_t node_index)
     slot->timeout_cycles    = kd->timeout_cycles ?
                               kd->timeout_cycles :
                               RP1_DEFAULT_KERNEL_TIMEOUT_TICKS;
-    slot->infinite = (node->flags & RP1_FLAG_INFINITE) ? 1 : 0;
+    slot->infinite =
+        (rp1_node_get_flags(node) & RP1_FLAG_INFINITE) ? 1 : 0;
     slot->settle_polls = 0;
 }
 
@@ -60,9 +61,9 @@ static void remove_inflight(uint32_t idx)
         g_inflight[idx] = g_inflight[g_inflight_count];
 }
 
-static void set_node_status(uint32_t node_index, uint16_t status)
+static void set_node_status(uint32_t node_index, uint8_t status)
 {
-    g_node_status[node_index] = (uint8_t)status;
+    rp1_node_set_status(&g_nodes[node_index], status);
 }
 
 /*
@@ -108,7 +109,7 @@ static void launch_kernel(const rp1_node_t *node)
 
 static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
 {
-    switch (node->opcode) {
+    switch (rp1_node_get_opcode(node)) {
     case RP1_OP_NOP:
         break;
 
@@ -127,7 +128,7 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
 
     case RP1_OP_SCALAR_WRITE: {
         const rp1_payload_scalar_write_t *p = &node->payload.scalar_write;
-#pragma GCC unroll 6
+#pragma GCC unroll 2
         for (uint32_t w = 0; w < RP1_SCALAR_WRITE_MAX; w++) {
             if (!p->writes[w].addr)
                 break;
@@ -156,7 +157,7 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
         /* Phase 1: DDR-DDR software memcpy (32-bit addresses only). */
         uint32_t *src = (uint32_t *)(uintptr_t)p->src_addr_lo;
         uint32_t *dst = (uint32_t *)(uintptr_t)p->dst_addr_lo;
-        uint32_t words = p->length / 4;
+        uint32_t words = rp1_dma_get_length(p->length_types) / 4u;
         for (uint32_t w = 0; w < words; w++)
             dst[w] = src[w];
         rp1_barrier();
@@ -182,7 +183,7 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
  * Packet validation
  * ---------------------------------------------------------------------- */
 
-static uint32_t valid_condition(uint16_t op)
+static uint32_t valid_condition(uint8_t op)
 {
     return op <= RP1_COP_AND_Z;
 }
@@ -190,6 +191,18 @@ static uint32_t valid_condition(uint16_t op)
 static uint32_t valid_signal_slot(uint32_t slot)
 {
     return slot < RP1_MAX_SIGNALS;
+}
+
+/*
+ * Validate one endpoint for the phase-1 software DMA path. Only low-word DDR
+ * addresses are implemented. Word-aligned zero-byte transfers are valid, and
+ * non-empty ranges may reach but must not wrap past the 32-bit address space.
+ */
+static uint32_t valid_phase1_dma_range(uint32_t lo, uint32_t hi,
+                                       uint32_t bytes)
+{
+    return hi == 0u && ((lo | bytes) & 3u) == 0u &&
+           (uint64_t)lo + bytes <= (1ULL << 32);
 }
 
 /*
@@ -205,10 +218,21 @@ static int validate_nodes(uint32_t node_count, uint32_t *bad_node,
 
     for (uint32_t i = 0; i < node_count; i++) {
         const rp1_node_t *node = &g_nodes[i];
+        uint16_t opcode = rp1_node_get_opcode(node);
+        uint8_t flags = rp1_node_get_flags(node);
         /*
-         * Phase 1: every opcode shares barrier buckets, so reject an invalid
-         * header before interpreting its payload union.
+         * Phase 1: reject reserved control bits, opcode-specific flag misuse,
+         * and invalid barrier buckets before interpreting the payload union.
          */
+        if ((rp1_node_get_control(node) & RP1_NODE_RESERVED_MASK) != 0u ||
+            (flags & (uint8_t)~RP1_FLAG_INFINITE) != 0u ||
+            ((flags & RP1_FLAG_INFINITE) != 0u &&
+             opcode != RP1_OP_KERNEL_DISPATCH)) {
+            *bad_node = i;
+            *detail = RP1_NODE_BAD_OPERATION;
+            *aux = rp1_node_get_control(node);
+            return -1;
+        }
         if (node->barrier_await_bucket >= RP1_MAX_BUCKETS ||
             node->barrier_set_bucket >= RP1_MAX_BUCKETS) {
             *bad_node = i;
@@ -222,14 +246,39 @@ static int validate_nodes(uint32_t node_count, uint32_t *bad_node,
          * Phase 2: validate only the active union member. Simple opcodes have
          * no indexed fields; the remaining cases prove every later dereference.
          */
-        switch (node->opcode) {
+        switch (opcode) {
         case RP1_OP_NOP:
         case RP1_OP_SCALAR_WRITE:
-        case RP1_OP_DMA_COPY:
-        case RP1_OP_DMA_FILL:
         case RP1_OP_PDI_LOAD:
         case RP1_OP_HALT:
             break;
+        case RP1_OP_DMA_COPY: {
+            const rp1_payload_dma_copy_t *dma = &node->payload.dma_copy;
+            uint32_t packed = dma->length_types;
+            uint32_t length = rp1_dma_get_length(packed);
+            if (rp1_dma_get_src_type(packed) == 0u &&
+                rp1_dma_get_dst_type(packed) == 0u &&
+                valid_phase1_dma_range(
+                    dma->src_addr_lo, dma->src_addr_hi, length) &&
+                valid_phase1_dma_range(
+                    dma->dst_addr_lo, dma->dst_addr_hi, length))
+                break;
+            *bad_node = i;
+            *detail = RP1_NODE_BAD_ARGUMENTS;
+            *aux = packed;
+            return -1;
+        }
+        case RP1_OP_DMA_FILL: {
+            const rp1_payload_dma_fill_t *dma = &node->payload.dma_fill;
+            if (dma->dst_type == 0u &&
+                valid_phase1_dma_range(
+                    dma->dst_addr_lo, dma->dst_addr_hi, dma->length))
+                break;
+            *bad_node = i;
+            *detail = RP1_NODE_BAD_ARGUMENTS;
+            *aux = dma->dst_type;
+            return -1;
+        }
         case RP1_OP_SIGNAL:
             if (!valid_signal_slot(node->payload.signal.target_slot)) {
                 *detail = RP1_NODE_BAD_SIGNAL_SLOT;
@@ -274,6 +323,7 @@ static int validate_nodes(uint32_t node_count, uint32_t *bad_node,
             uint32_t bytes = (uint32_t)kd->arg_count *
                              (uint32_t)sizeof(rp1_kernel_arg_t);
             if (kd->kernel_base_addr != 0u &&
+                kd->ctrl_flags == 0u &&
                 (kd->arg_buffer_offset & 7u) == 0u &&
                 kd->arg_buffer_offset <= arg_available &&
                 bytes <= arg_available - kd->arg_buffer_offset)
@@ -323,6 +373,8 @@ static int validate_nodes(uint32_t node_count, uint32_t *bad_node,
         }
         case RP1_OP_RERUN:
             if (node->payload.rerun.target_node < node_count &&
+                (node->payload.rerun.rerun_flags &
+                 (uint8_t)~RP1_RERUN_CLEAR_STATE) == 0u &&
                 ((node->payload.rerun.rerun_flags &
                   RP1_RERUN_CLEAR_STATE) == 0u ||
                  node->payload.rerun.loop_id < RP1_MAX_LOOPS))
@@ -334,7 +386,7 @@ static int validate_nodes(uint32_t node_count, uint32_t *bad_node,
         default:
             *bad_node = i;
             *detail = RP1_NODE_BAD_OPERATION;
-            *aux = node->opcode;
+            *aux = opcode;
             return -1;
         }
     }
@@ -405,7 +457,7 @@ static int check_waits(uint32_t node_count)
     int made_progress = 0;
 
     for (uint32_t i = 0; i < node_count; i++) {
-        if (g_node_status[i] != RP1_NODE_WAITING)
+        if (rp1_node_get_status(&g_nodes[i]) != RP1_NODE_WAITING)
             continue;
 
         const rp1_node_t *node = &g_nodes[i];
@@ -438,10 +490,12 @@ static int activate_nodes(uint32_t node_count)
     int made_progress = 0;
 
     for (uint32_t i = 0; i < node_count; i++) {
-        if (g_node_status[i] != RP1_NODE_PENDING)
+        if (rp1_node_get_status(&g_nodes[i]) != RP1_NODE_PENDING)
             continue;
 
         const rp1_node_t *node = &g_nodes[i];
+        uint8_t opcode = rp1_node_get_opcode(node);
+        uint8_t flags = rp1_node_get_flags(node);
 
         if ((g_barriers[node->barrier_await_bucket] & node->barrier_await_mask)
                 != node->barrier_await_mask)
@@ -450,13 +504,13 @@ static int activate_nodes(uint32_t node_count)
         g_ctrl->rp1_current_node = i;
         g_operation_started = 1u;
         rp1_trace_emit(RP1_TRACE_NODE_ACTIVATE, i,
-                       node->opcode, node->flags);
+                       opcode, flags);
 
         /*
          * Phase 1: launch asynchronous fabric work or perform the serialized
          * platform-image transition; both may establish later dispatch state.
          */
-        switch (node->opcode) {
+        switch (opcode) {
 
         case RP1_OP_KERNEL_DISPATCH: {
             /* Expected-image guard: a dispatch that names an image (non-zero)
@@ -482,7 +536,7 @@ static int activate_nodes(uint32_t node_count)
             launch_kernel(node);
             rp1_trace_emit(RP1_TRACE_KERNEL_LAUNCH, i,
                            kd->kernel_base_addr, kd->arg_count);
-            if (node->flags & RP1_FLAG_INFINITE) {
+            if (flags & RP1_FLAG_INFINITE) {
                 complete_node(i);
                 g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
             } else {
@@ -678,7 +732,8 @@ static void quiesce_inflight(void)
             uint32_t control =
                 rp1_mmio_read32(kernel->base_addr + 0x00u);
             if ((control & 0x2u) != 0u) {
-                if (g_node_status[kernel->node_index] != RP1_NODE_ERROR)
+                if (rp1_node_get_status(&g_nodes[kernel->node_index]) !=
+                    RP1_NODE_ERROR)
                     complete_node(kernel->node_index);
                 g_quiesce_finite_done++;
                 rp1_trace_emit(RP1_TRACE_KERNEL_DONE,
@@ -691,7 +746,8 @@ static void quiesce_inflight(void)
             if (rp1_timeout_elapsed(kernel->timeout_start,
                                     kernel->timeout_cycles,
                                     rp1_cycles())) {
-                if (g_node_status[kernel->node_index] != RP1_NODE_ERROR)
+                if (rp1_node_get_status(&g_nodes[kernel->node_index]) !=
+                    RP1_NODE_ERROR)
                     set_node_status(kernel->node_index, RP1_NODE_ERROR);
                 g_quiesce_finite_timeout++;
                 rp1_mark_recovery_required();
@@ -719,7 +775,7 @@ int rp1_loop(const rp1_hooks_t *hooks)
 int rp1_loop(void)
 #endif
 {
-    uint32_t node_count = g_ctrl->node_count;
+    uint32_t node_count = g_node_count;
     uint32_t bad_node = RP1_TERMINAL_ERROR_NODE_NONE;
     uint32_t detail = 0u;
     uint32_t aux = 0u;
@@ -785,7 +841,7 @@ int rp1_loop(void)
             uint32_t has_dispatched = 0;
             uint32_t has_waiting = 0;
             for (uint32_t i = 0; i < node_count; i++) {
-                uint8_t st = g_node_status[i];
+                uint8_t st = rp1_node_get_status(&g_nodes[i]);
                 if (st == RP1_NODE_DISPATCHED) has_dispatched = 1;
                 else if (st == RP1_NODE_WAITING) has_waiting = 1;
             }

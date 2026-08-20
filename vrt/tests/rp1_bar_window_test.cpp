@@ -66,12 +66,15 @@ class WindowFixture : public ::testing::Test {
 TEST(Rp1BarWindowProtocol, WireSizesMatchHeader) {
     // These are also asserted by RP1_STATIC_ASSERT in rp1_protocol.h, but
     // mirroring them in a runtime test makes regressions easy to spot in CI.
-    EXPECT_EQ(sizeof(rp1_node_t),        std::size_t{64});
+    EXPECT_EQ(sizeof(rp1_node_t),        std::size_t{32});
+    EXPECT_EQ(offsetof(rp1_node_t, payload), std::size_t{12});
     EXPECT_EQ(sizeof(rp1_ctrl_t),        std::size_t{0x1000});
     EXPECT_EQ(sizeof(rp1_graph_result_t), std::size_t{64});
     EXPECT_EQ(sizeof(rp1_signal_slot_t), std::size_t{16});
     EXPECT_EQ(sizeof(rp1_trace_entry_t), std::size_t{16});
-    EXPECT_EQ(RP1_PROTOCOL_VERSION, 5u);
+    EXPECT_EQ(RP1_PROTOCOL_VERSION, 6u);
+    EXPECT_EQ(RP1_MAX_NODES, 1024u);
+    EXPECT_EQ(RP1_SCALAR_WRITE_MAX, 2u);
     EXPECT_EQ(offsetof(rp1_ctrl_t, capabilities), std::size_t{0x64});
     EXPECT_EQ(offsetof(rp1_ctrl_t, pdi_ipi_platform_id),
               std::size_t{0x68});
@@ -82,6 +85,17 @@ TEST(Rp1BarWindowProtocol, WireSizesMatchHeader) {
     EXPECT_EQ(offsetof(rp1_ctrl_t, terminal_error_aux),
               std::size_t{0x74});
     EXPECT_EQ(offsetof(rp1_ctrl_t, result), std::size_t{0x80});
+}
+
+TEST(Rp1BarWindowProtocol, PackedControlHelpersRoundTrip) {
+    rp1_node_t node{};
+    rp1_node_set_opcode(&node, RP1_OP_RERUN);
+    rp1_node_set_flags(&node, RP1_FLAG_INFINITE);
+    rp1_node_set_status(&node, RP1_NODE_WAITING);
+
+    EXPECT_EQ(rp1_node_get_opcode(&node), RP1_OP_RERUN);
+    EXPECT_EQ(rp1_node_get_flags(&node), RP1_FLAG_INFINITE);
+    EXPECT_EQ(rp1_node_get_status(&node), RP1_NODE_WAITING);
 }
 
 TEST_F(WindowFixture, MappedLengthAndWindowOffsetExposed) {
@@ -163,7 +177,8 @@ TEST_F(WindowFixture, SingleWordHotPathAccessors) {
 TEST_F(WindowFixture, WriteNodesUsesDefaultNodeArrayOffset) {
     constexpr std::size_t kCount = 3;
     rp1_node_t nodes[kCount] = {};
-    nodes[0].opcode               = RP1_OP_KERNEL_DISPATCH;
+    rp1_node_set_opcode(&nodes[0], RP1_OP_KERNEL_DISPATCH);
+    rp1_node_set_status(&nodes[0], RP1_NODE_PENDING);
     nodes[0].barrier_await_mask   = 0x1;
     nodes[0].barrier_set_mask     = 0x2;
     nodes[0].barrier_await_bucket = 0;
@@ -172,11 +187,13 @@ TEST_F(WindowFixture, WriteNodesUsesDefaultNodeArrayOffset) {
     nodes[0].payload.kernel_dispatch.arg_buffer_offset = 0;
     nodes[0].payload.kernel_dispatch.arg_count         = 3;
 
-    nodes[1].opcode = RP1_OP_SIGNAL;
+    rp1_node_set_opcode(&nodes[1], RP1_OP_SIGNAL);
+    rp1_node_set_status(&nodes[1], RP1_NODE_PENDING);
     nodes[1].payload.signal.target_slot = 1;
     nodes[1].payload.signal.value       = 0xCAFEBABE;
 
-    nodes[2].opcode = RP1_OP_NOP;
+    rp1_node_set_opcode(&nodes[2], RP1_OP_NOP);
+    rp1_node_set_status(&nodes[2], RP1_NODE_PENDING);
 
     window_->writeNodes(nodes, kCount);
 
@@ -184,10 +201,14 @@ TEST_F(WindowFixture, WriteNodesUsesDefaultNodeArrayOffset) {
     std::memcpy(echoed,
                 backing_.data() + kWindowOff + RP1_DEFAULT_NODE_ARRAY_OFFSET,
                 sizeof(echoed));
-    EXPECT_EQ(echoed[0].opcode, RP1_OP_KERNEL_DISPATCH);
+    EXPECT_EQ(rp1_node_get_opcode(&echoed[0]), RP1_OP_KERNEL_DISPATCH);
     EXPECT_EQ(echoed[0].payload.kernel_dispatch.kernel_base_addr, 0x88010000u);
     EXPECT_EQ(echoed[1].payload.signal.value, 0xCAFEBABE);
-    EXPECT_EQ(echoed[2].opcode, RP1_OP_NOP);
+    EXPECT_EQ(rp1_node_get_opcode(&echoed[2]), RP1_OP_NOP);
+    EXPECT_EQ(
+        reinterpret_cast<const std::byte*>(&echoed[1]) -
+            reinterpret_cast<const std::byte*>(&echoed[0]),
+        32);
 }
 
 TEST_F(WindowFixture, WriteArgsLandsAtDefaultArgBuffer) {

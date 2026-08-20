@@ -302,7 +302,7 @@ verify_case_evidence() {
             die "$label result has malformed flags: $flags"
         local flag_value=$((flags))
         (( (flag_value & 0xffffffc0) == 0 )) ||
-            die "$label result reports unknown protocol-v5 flags: $flags"
+            die "$label result reports unknown protocol-v6 flags: $flags"
         (( (flag_value & 0x08) != 0 )) ||
             die "$label result does not report trace-enabled execution"
         (( (flag_value & 0x17) == 0 )) ||
@@ -393,7 +393,7 @@ run_rp1_dump() {
     done_seq=$(field_value "$log" graph_done_seq) ||
         die "$label is missing graph_done_seq"
 
-    [[ $version == 5 ]] || die "$label reports protocol v$version, expected v5"
+    [[ $version == 6 ]] || die "$label reports protocol v$version, expected v6"
     is_zero_value "$missing" || die "$label reports missing capabilities: $missing"
     ! is_zero_value "$platform" || die "$label reports an unknown platform/IPI identity"
     [[ $state == 1 ]] || die "$label reports RP1 state $state, expected READY (1)"
@@ -461,7 +461,7 @@ run_rp1_dump() {
             die "$label has malformed graph-result flags: $result_flags"
         local result_flag_value=$((result_flags))
         (( (result_flag_value & 0xffffffc0) == 0 )) ||
-            die "$label result reports unknown protocol-v5 flags: $result_flags"
+            die "$label result reports unknown protocol-v6 flags: $result_flags"
         (( (result_flag_value & 0x17) == 0 )) ||
             die "$label result reports failure/recovery flags: $result_flags"
         if (( (result_flag_value & 0x08) != 0 )); then

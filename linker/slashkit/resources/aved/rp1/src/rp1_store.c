@@ -24,7 +24,8 @@
 #define BTCM_SECTION __attribute__((section(".btcm")))
 
 uint32_t      g_barriers[RP1_MAX_BUCKETS]  BTCM_SECTION;
-uint8_t       g_node_status[RP1_MAX_NODES] BTCM_SECTION;
+rp1_node_t    g_nodes[RP1_MAX_NODES]       BTCM_SECTION;
+uint32_t      g_node_count                 BTCM_SECTION;
 uint32_t      g_loop_iters[RP1_MAX_LOOPS]  BTCM_SECTION;
 rp1_inflight_t g_inflight[RP1_MAX_INFLIGHT] BTCM_SECTION;
 uint32_t      g_inflight_count             BTCM_SECTION;
@@ -50,13 +51,14 @@ uint32_t      g_active_image_state         BTCM_SECTION;
 
 _Static_assert(sizeof(g_trace_staging) == RP1_TRACE_STAGING_BYTES,
                "BTCM trace staging must occupy exactly 4 KB");
+_Static_assert(sizeof(g_nodes) == 32u * RP1_MAX_NODES,
+               "BTCM node snapshot must occupy exactly 32 KB");
 
 /* -------------------------------------------------------------------------
  * DDR-backed pointer table (set by rp1_store_init)
  * ---------------------------------------------------------------------- */
 
 rp1_ctrl_t       *g_ctrl    = (rp1_ctrl_t *)RP1_CTRL_PHYS_ADDR;
-rp1_node_t       *g_nodes   = NULL;
 rp1_signal_slot_t *g_signals = NULL;
 uint32_t         *g_arg_buf  = NULL;
 rp1_trace_entry_t *g_trace   = NULL;
@@ -90,6 +92,40 @@ static uint32_t valid_window_range(uint32_t lo, uint32_t hi,
     if (alignment != 0u && (lo & (alignment - 1u)) != 0u)
         return 0u;
     return lo - RP1_CTRL_PHYS_ADDR <= RP1_CTRL_WINDOW_SIZE - size;
+}
+
+/*
+ * GCC's may_alias word keeps this hot snapshot defined under -O2 strict
+ * aliasing while preserving one aligned NoC transaction per 32-bit word.
+ */
+typedef uint32_t rp1_alias_u32_t __attribute__((may_alias));
+
+/*
+ * Copy each source word exactly once after the caller validates and orders the
+ * host-owned range. The volatile source prevents later scanner reads from
+ * folding into DDR; all execution subsequently uses the mutable BTCM copy.
+ */
+static void snapshot_nodes(uint32_t source_lo, uint32_t source_hi,
+                           uint32_t node_count)
+{
+    const volatile rp1_alias_u32_t *source =
+        (const volatile rp1_alias_u32_t *)
+            (uintptr_t)make64(source_lo, source_hi);
+    rp1_alias_u32_t *destination = (rp1_alias_u32_t *)(void *)g_nodes;
+    uint32_t words =
+        node_count * (uint32_t)sizeof(rp1_node_t) / sizeof(uint32_t);
+
+    rp1_barrier();
+    for (uint32_t i = 0u; i < words; i++)
+        destination[i] = source[i];
+
+    /*
+     * Node state is firmware-owned. Ignore stale host status while retaining
+     * opcode, flags, and reserved control bits from the submitted snapshot.
+     */
+    for (uint32_t i = 0u; i < node_count; i++)
+        rp1_node_set_status(&g_nodes[i], RP1_NODE_PENDING);
+    rp1_barrier();
 }
 
 /*
@@ -145,9 +181,12 @@ static void trace_flush_staged(void)
 int rp1_store_init(uint32_t *detail, uint32_t *aux)
 {
     uint32_t node_count = g_ctrl->node_count;
+    uint32_t node_base_lo = g_ctrl->node_base_lo;
+    uint32_t node_base_hi = g_ctrl->node_base_hi;
 
     *detail = 0u;
     *aux = 0u;
+    g_node_count = 0u;
     if (node_count == 0u || node_count > RP1_MAX_NODES) {
         *detail = RP1_CONFIG_NODE_COUNT;
         *aux = node_count;
@@ -164,10 +203,10 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux)
         *aux = reserved_cq;
         return -1;
     }
-    if (!valid_window_range(g_ctrl->node_base_lo, g_ctrl->node_base_hi,
-                            node_count * (uint32_t)sizeof(rp1_node_t), 64u)) {
+    if (!valid_window_range(node_base_lo, node_base_hi,
+                            node_count * (uint32_t)sizeof(rp1_node_t), 4u)) {
         *detail = RP1_CONFIG_NODE_BASE;
-        *aux = g_ctrl->node_base_lo;
+        *aux = node_base_lo;
         return -1;
     }
     if (!valid_window_range(g_ctrl->arg_buf_base_lo,
@@ -199,11 +238,10 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux)
     }
 
     /*
-     * Phase 2: all ranges are now proven 32-bit, aligned, and in-window, so
-     * resolving them cannot expose the scanner to a partially valid store.
+     * Phase 2: all ranges are now proven 32-bit, aligned, and in-window.
+     * Resolve non-node stores, reset stale graph state, then take the sole DDR
+     * node read before publishing the valid BTCM prefix.
      */
-    g_nodes   = (rp1_node_t *)
-                    (uintptr_t)make64(g_ctrl->node_base_lo, g_ctrl->node_base_hi);
     g_signals = (rp1_signal_slot_t *)
                     (uintptr_t)make64(g_ctrl->sig_array_base_lo, g_ctrl->sig_array_base_hi);
     g_arg_buf = (uint32_t *)
@@ -215,22 +253,18 @@ int rp1_store_init(uint32_t *detail, uint32_t *aux)
     g_ctrl->trace_write_idx = 0;
     g_trace_staging_count = 0u;
 
-    /*
-     * Phase 3: reset per-graph state. Initialize the legacy DDR status field
-     * once; every later transition remains private to the BTCM state cache.
-     */
     rp1_store_reset_graph();
-    for (uint32_t i = 0; i < node_count; i++)
-        g_nodes[i].status = RP1_NODE_PENDING;
+    snapshot_nodes(node_base_lo, node_base_hi, node_count);
+    g_node_count = node_count;
     return 0;
 }
 
 void rp1_store_reset_graph(void)
 {
     memzero(g_barriers,    sizeof(g_barriers));
-    memzero(g_node_status, sizeof(g_node_status));
     memzero(g_loop_iters,  sizeof(g_loop_iters));
     memzero(g_inflight,    sizeof(g_inflight));
+    g_node_count = 0u;
     g_inflight_count = 0u;
     g_completed_operations = 0u;
     g_operation_started = 0u;
@@ -294,9 +328,8 @@ void rp1_latch_error(uint32_t code, uint32_t node,
     g_ctrl->terminal_error_node = node;
     g_ctrl->terminal_error_detail = detail;
     g_ctrl->terminal_error_aux = aux;
-    if (node != RP1_TERMINAL_ERROR_NODE_NONE &&
-        g_nodes != NULL && node < g_ctrl->node_count)
-        g_terminal_opcode = g_nodes[node].opcode;
+    if (node != RP1_TERMINAL_ERROR_NODE_NONE && node < g_node_count)
+        g_terminal_opcode = rp1_node_get_opcode(&g_nodes[node]);
 }
 
 void rp1_mark_recovery_required(void)

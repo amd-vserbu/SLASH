@@ -21,7 +21,7 @@
 /**
  * @file rp1_submitter_test.cpp
  *
- * Protocol-v5 submitter tests use a heap-backed BAR and a fake RP1 publisher.
+ * Protocol-v6 submitter tests use a heap-backed BAR and a fake RP1 publisher.
  * The fake commits the result payload, magic, terminal state, and exact
  * graph_done_seq in firmware order so publication and corruption paths can be
  * exercised without vrtd or hardware.
@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -51,6 +52,7 @@ using vrt::graph::fpga::Rp1GraphOutcome;
 using vrt::graph::fpga::Rp1ImageState;
 using vrt::graph::fpga::Rp1Submitter;
 using vrt::graph::fpga::Rp1TimeoutError;
+using vrt::graph::fpga::appendScalarWritePackets;
 
 namespace {
 
@@ -100,7 +102,7 @@ struct DdrView {
 };
 
 /**
- * @brief Publish a complete protocol-v5 readiness contract.
+ * @brief Publish a complete protocol-v6 readiness contract.
  */
 void primeAsReady(DdrView ddr) {
     rp1_ctrl_t& ctrl = ddr.ctrl();
@@ -202,13 +204,12 @@ class FakeRp1 {
         std::uint32_t completed = 0u;
         ctrl.trace_write_idx = 0u;
         for (std::uint32_t i = 0; i < ctrl.node_count; ++i) {
-            rp1_node_t& node = ddr_.nodes()[i];
-            if (node.opcode == RP1_OP_SIGNAL) {
+            const rp1_node_t& node = ddr_.nodes()[i];
+            if (rp1_node_get_opcode(&node) == RP1_OP_SIGNAL) {
                 const auto& signal = node.payload.signal;
                 ddr_.signals()[signal.target_slot].value = signal.value;
                 ddr_.signals()[signal.target_slot].last_writer_node = i;
             }
-            node.status = RP1_NODE_DONE;
             ++completed;
         }
         if (ctrl.trace_enable != 0u && ctrl.trace_size != 0u) {
@@ -333,12 +334,23 @@ class SubmitterFixture : public ::testing::Test {
         Rp1GraphImage image;
         image.nodes.resize(1u);
         rp1_node_t& node = image.nodes.front();
-        node.opcode = RP1_OP_SIGNAL;
+        rp1_node_set_opcode(&node, RP1_OP_SIGNAL);
+        rp1_node_set_status(&node, RP1_NODE_PENDING);
         node.barrier_set_mask = 1u;
-        node.payload.signal.target_slot = slot;
+        node.payload.signal.target_slot =
+            static_cast<std::uint8_t>(slot);
         node.payload.signal.value = value;
         node.payload.signal.operation = RP1_SIGOP_SET;
         image.clear_signal_slots.push_back(slot);
+        return image;
+    }
+
+    /// Build one zero-initialized pending node with @p opcode.
+    Rp1GraphImage makeOpcodeGraph(std::uint16_t opcode) {
+        Rp1GraphImage image;
+        image.nodes.resize(1u);
+        rp1_node_set_opcode(&image.nodes.front(), opcode);
+        rp1_node_set_status(&image.nodes.front(), RP1_NODE_PENDING);
         return image;
     }
 
@@ -356,7 +368,7 @@ class SubmitterFixture : public ::testing::Test {
 
 }  // namespace
 
-TEST_F(SubmitterFixture, EnsureReadyProgramsV5Configuration) {
+TEST_F(SubmitterFixture, EnsureReadyProgramsV6Configuration) {
     ddr_.ctrl()._reserved_cq_size = 64u;
     ddr_.ctrl()._reserved_cq_base_lo = 0x30041000u;
     ddr_.ctrl()._reserved_cq_base_hi = 1u;
@@ -394,8 +406,8 @@ TEST_F(SubmitterFixture, MissingMagicTimesOut) {
         Rp1TimeoutError);
 }
 
-TEST_F(SubmitterFixture, ProtocolV4FirmwareIsRejected) {
-    ddr_.ctrl().version = 4u;
+TEST_F(SubmitterFixture, ProtocolV5FirmwareIsRejected) {
+    ddr_.ctrl().version = 5u;
     EXPECT_THROW(
         submitter_->ensureReady(std::chrono::milliseconds(20)),
         std::runtime_error);
@@ -450,6 +462,9 @@ TEST_F(SubmitterFixture, SuccessReturnsTypedResult) {
     EXPECT_EQ(result.quiescence.finiteTimeout, 0u);
     EXPECT_EQ(result.quiescence.infinite, 0u);
     EXPECT_EQ(ddr_.signals()[2].value, 0xDEADBEEFu);
+    EXPECT_EQ(
+        rp1_node_get_status(&ddr_.nodes()[0]),
+        RP1_NODE_PENDING);
     EXPECT_EQ(submitter_->lastGraphSeq(), 1u);
     EXPECT_EQ(submitter_->submissionSerial(), 1u);
 }
@@ -702,14 +717,14 @@ TEST_F(SubmitterFixture, SuccessCannotRequireRecovery) {
     EXPECT_TRUE(submitter_->poisoned());
 }
 
-TEST_F(SubmitterFixture, SuccessCannotLeaveUnreachedNodes) {
+TEST_F(SubmitterFixture, SuccessPreservesUnreachedNodesFlag) {
     FakeResultSpec spec;
     spec.flags = RP1_RESULT_UNREACHED_NODES;
     restartFake(spec);
-    EXPECT_THROW(
-        submitter_->submitAndWait(
-            makeSignalGraph(), std::chrono::milliseconds(500)),
-        std::runtime_error);
+    const auto result = submitter_->submitAndWait(
+        makeSignalGraph(), std::chrono::milliseconds(500));
+    EXPECT_TRUE(result.succeeded());
+    EXPECT_TRUE(result.hasFlags(RP1_RESULT_UNREACHED_NODES));
 }
 
 TEST_F(SubmitterFixture, FailedOutcomeRequiresErrorCode) {
@@ -765,13 +780,117 @@ TEST_F(SubmitterFixture, EmptyGraphIsRejectedBeforeDoorbell) {
     EXPECT_EQ(submitter_->submissionSerial(), 0u);
 }
 
-TEST_F(SubmitterFixture, OversizedGraphIsRejectedBeforeDoorbell) {
+TEST_F(SubmitterFixture, Exactly1024NodesAreAccepted) {
+    static_assert(RP1_MAX_NODES == 1024u);
     Rp1GraphImage image;
-    image.nodes.resize(RP1_MAX_NODES + 1u);
+    image.nodes.resize(RP1_MAX_NODES);
+
+    const auto result = submitter_->submitAndWait(
+        image, std::chrono::milliseconds(500));
+
+    EXPECT_TRUE(result.succeeded());
+    EXPECT_EQ(ddr_.ctrl().node_count, 1024u);
+}
+
+TEST_F(SubmitterFixture, GraphWith1025NodesIsRejectedBeforeDoorbell) {
+    static_assert(RP1_MAX_NODES == 1024u);
+    Rp1GraphImage image;
+    image.nodes.resize(1025u);
     EXPECT_THROW(
         submitter_->submitAndWait(image),
         std::logic_error);
     EXPECT_EQ(ddr_.ctrl().graph_seq, 0u);
+}
+
+TEST_F(SubmitterFixture, AllProtocolV6OpcodesStageWithCompactPayloads) {
+    constexpr rp1_opcode_t opcodes[] = {
+        RP1_OP_NOP, RP1_OP_WAIT, RP1_OP_SIGNAL,
+        RP1_OP_KERNEL_DISPATCH, RP1_OP_SCALAR_WRITE,
+        RP1_OP_SCALAR_READ, RP1_OP_SCALAR_COPY, RP1_OP_DMA_COPY,
+        RP1_OP_DMA_FILL, RP1_OP_PDI_LOAD, RP1_OP_LOOP, RP1_OP_COND,
+        RP1_OP_RERUN, RP1_OP_HALT};
+    Rp1GraphImage image;
+    image.nodes.resize(std::size(opcodes));
+    for (std::size_t i = 0; i < std::size(opcodes); ++i) {
+        rp1_node_set_opcode(&image.nodes[i], opcodes[i]);
+        rp1_node_set_status(&image.nodes[i], RP1_NODE_PENDING);
+    }
+
+    image.nodes[1].payload.wait.condition_signal = 255u;
+    image.nodes[1].payload.wait.condition_op = RP1_COP_EQ;
+    image.nodes[2].payload.signal.target_slot = 254u;
+    image.nodes[2].payload.signal.operation = RP1_SIGOP_SET;
+    image.nodes[3].payload.kernel_dispatch.kernel_base_addr =
+        0x88010000u;
+    image.nodes[3].payload.kernel_dispatch.arg_count = 1u;
+    image.arg_buf = {0x10u, 0x1234u};
+    image.nodes[4].payload.scalar_write.writes[0] =
+        rp1_write_pair_t{0x88010010u, 7u};
+    image.nodes[5].payload.scalar_read.source_addr = 0x88010010u;
+    image.nodes[5].payload.scalar_read.target_slot = 253u;
+    image.nodes[6].payload.scalar_copy.dest_addr = 0x88020010u;
+    image.nodes[6].payload.scalar_copy.source_slot = 253u;
+    image.nodes[7].payload.dma_copy.length_types =
+        rp1_dma_pack(4096u, 0u, 0u);
+    image.nodes[8].payload.dma_fill.length = 4u;
+    image.nodes[10].payload.loop.body_start = 0u;
+    image.nodes[10].payload.loop.body_end = 0u;
+    image.nodes[10].payload.loop.condition_signal = 252u;
+    image.nodes[10].payload.loop.condition_op = RP1_COP_AND_Z;
+    image.nodes[11].payload.cond.body_start = 1u;
+    image.nodes[11].payload.cond.body_end = 0u;
+    image.nodes[11].payload.cond.condition_signal = 251u;
+    image.nodes[11].payload.cond.condition_op = RP1_COP_NE;
+    image.nodes[11].payload.cond.bucket_clear_start = 1u;
+    image.nodes[11].payload.cond.bucket_clear_end = 0u;
+    image.nodes[12].payload.rerun.target_node = 0u;
+
+    EXPECT_NO_THROW(
+        submitter_->submitAndWait(
+            image, std::chrono::milliseconds(500)));
+    ASSERT_EQ(ddr_.ctrl().node_count, std::size(opcodes));
+    for (std::size_t i = 0; i < std::size(opcodes); ++i) {
+        EXPECT_EQ(rp1_node_get_opcode(&ddr_.nodes()[i]), opcodes[i]);
+    }
+    EXPECT_EQ(ddr_.nodes()[1].payload.wait.condition_signal, 255u);
+    EXPECT_EQ(ddr_.nodes()[10].payload.loop.body_end, 0u);
+    EXPECT_EQ(
+        rp1_dma_get_length(
+            ddr_.nodes()[7].payload.dma_copy.length_types),
+        4096u);
+}
+
+TEST_F(SubmitterFixture, ScalarWritesSplitWithoutDroppingPairs) {
+    const std::vector<rp1_write_pair_t> writes = {
+        {0x88010010u, 1u}, {0x88010014u, 2u},
+        {0x88010018u, 3u}, {0x8801001Cu, 4u},
+        {0x88010020u, 5u}};
+    Rp1GraphImage image;
+    appendScalarWritePackets(
+        image, writes, /*awaitBucket=*/2u, /*awaitMask=*/0x10u,
+        /*setBucket=*/3u, /*setMask=*/0x20u);
+
+    ASSERT_EQ(image.nodes.size(), 3u);
+    std::vector<rp1_write_pair_t> lowered;
+    for (std::size_t i = 0; i < image.nodes.size(); ++i) {
+        const rp1_node_t& node = image.nodes[i];
+        EXPECT_EQ(rp1_node_get_opcode(&node), RP1_OP_SCALAR_WRITE);
+        EXPECT_EQ(node.barrier_await_bucket, 2u);
+        EXPECT_EQ(node.barrier_await_mask, 0x10u);
+        EXPECT_EQ(node.barrier_set_mask, i == 2u ? 0x20u : 0u);
+        for (const rp1_write_pair_t& write :
+             node.payload.scalar_write.writes) {
+            if (write.addr != 0u) lowered.push_back(write);
+        }
+    }
+    ASSERT_EQ(lowered.size(), writes.size());
+    for (std::size_t i = 0; i < writes.size(); ++i) {
+        EXPECT_EQ(lowered[i].addr, writes[i].addr);
+        EXPECT_EQ(lowered[i].value, writes[i].value);
+    }
+    EXPECT_NO_THROW(
+        submitter_->submitAndWait(
+            image, std::chrono::milliseconds(500)));
 }
 
 TEST_F(SubmitterFixture, OversizedArgumentBufferIsRejectedBeforeBarMutation) {
@@ -800,13 +919,21 @@ TEST_F(SubmitterFixture, InvalidBarrierBucketIsRejected) {
         std::logic_error);
 }
 
-TEST_F(SubmitterFixture, InvalidSignalSlotIsRejected) {
+TEST_F(SubmitterFixture, NonPendingInitialStatusIsRejected) {
     auto image = makeSignalGraph();
-    image.nodes.front().payload.signal.target_slot =
-        RP1_MAX_SIGNALS;
+    rp1_node_set_status(&image.nodes.front(), RP1_NODE_DONE);
     EXPECT_THROW(
         submitter_->submitAndWait(image),
         std::logic_error);
+}
+
+TEST_F(SubmitterFixture, HighestPackedSignalSlotIsAccepted) {
+    auto image = makeSignalGraph();
+    image.nodes.front().payload.signal.target_slot =
+        static_cast<std::uint8_t>(RP1_MAX_SIGNALS - 1u);
+    EXPECT_NO_THROW(
+        submitter_->submitAndWait(
+            image, std::chrono::milliseconds(500)));
 }
 
 TEST_F(SubmitterFixture, InvalidClearSlotIsRejected) {
@@ -826,13 +953,81 @@ TEST_F(SubmitterFixture, InvalidTraceSizeIsRejectedBeforeDoorbell) {
     EXPECT_EQ(ddr_.ctrl().graph_seq, 0u);
 }
 
-TEST_F(SubmitterFixture, ReservedNodeFlagsAreIgnoredByHostValidation) {
+TEST_F(SubmitterFixture, ReservedNodeFlagsAreRejectedByHostValidation) {
     auto image = makeSignalGraph();
-    image.nodes.front().flags =
-        RP1_FLAG_RESERVED_0 | RP1_FLAG_RESERVED_1;
-    EXPECT_NO_THROW(
-        submitter_->submitAndWait(
-            image, std::chrono::milliseconds(500)));
+    rp1_node_set_flags(&image.nodes.front(), 0x2u);
+    EXPECT_THROW(
+        submitter_->submitAndWait(image),
+        std::logic_error);
+}
+
+TEST_F(SubmitterFixture, ReservedControlBitsAreRejectedByHostValidation) {
+    auto image = makeSignalGraph();
+    rp1_node_set_control(
+        &image.nodes.front(),
+        rp1_node_get_control(&image.nodes.front()) |
+            RP1_NODE_RESERVED_MASK);
+    EXPECT_THROW(
+        submitter_->submitAndWait(image),
+        std::logic_error);
+}
+
+TEST_F(SubmitterFixture, Phase1DmaCopyRejectsUnsupportedEndpoints) {
+    auto image = makeOpcodeGraph(RP1_OP_DMA_COPY);
+    auto& dma = image.nodes.front().payload.dma_copy;
+    dma.src_addr_lo = 0x1000u;
+    dma.dst_addr_lo = 0x2000u;
+    dma.length_types = rp1_dma_pack(8u, 0u, 0u);
+
+    dma.src_addr_hi = 1u;
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    dma.src_addr_hi = 0u;
+
+    dma.length_types = rp1_dma_pack(8u, 1u, 0u);
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    dma.length_types = rp1_dma_pack(8u, 0u, 0u);
+
+    dma.src_addr_lo = 0xFFFFFFFCu;
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    dma.src_addr_lo = 0x1002u;
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    EXPECT_EQ(ddr_.ctrl().graph_seq, 0u);
+}
+
+TEST_F(SubmitterFixture, Phase1DmaFillRejectsUnsupportedEndpoint) {
+    auto image = makeOpcodeGraph(RP1_OP_DMA_FILL);
+    auto& dma = image.nodes.front().payload.dma_fill;
+    dma.dst_addr_lo = 0x2000u;
+    dma.length = 8u;
+
+    dma.dst_addr_hi = 1u;
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    dma.dst_addr_hi = 0u;
+
+    dma.dst_type = 1u;
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    dma.dst_type = 0u;
+
+    dma.dst_addr_lo = 0xFFFFFFFCu;
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    EXPECT_EQ(ddr_.ctrl().graph_seq, 0u);
+}
+
+TEST_F(SubmitterFixture, DispatchControlFlagsAreRejected) {
+    auto image = makeOpcodeGraph(RP1_OP_KERNEL_DISPATCH);
+    auto& dispatch = image.nodes.front().payload.kernel_dispatch;
+    dispatch.kernel_base_addr = 0x88010000u;
+    dispatch.ctrl_flags = 1u;
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    EXPECT_EQ(ddr_.ctrl().graph_seq, 0u);
+}
+
+TEST_F(SubmitterFixture, UnknownRerunFlagsAreRejected) {
+    auto image = makeOpcodeGraph(RP1_OP_RERUN);
+    image.nodes.front().payload.rerun.target_node = 0u;
+    image.nodes.front().payload.rerun.rerun_flags = 0x2u;
+    EXPECT_THROW(submitter_->submitAndWait(image), std::logic_error);
+    EXPECT_EQ(ddr_.ctrl().graph_seq, 0u);
 }
 
 TEST_F(SubmitterFixture, TraceCaptureUsesFinalProducerCursor) {

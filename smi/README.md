@@ -518,7 +518,7 @@ v80-smi debug rp1-dump -d <BDF> [-b <bar>] [--ctrl-offset <offset>]
 | `--ctrl-offset`   | Host BAR offset of the RP1 control block (default `0x4000000`; `0x...` for hex) |
 
 Prints `magic`, `version`, `node_count`, the node/argument/signal base
-addresses, trace configuration, the protocol-v5 capability mask and each named
+addresses, trace configuration, the protocol-v6 capability mask and each named
 capability, required/missing capabilities, the generated platform/IPI identity,
 `graph_seq`/`graph_done_seq`, `rp1_state`, legacy live diagnostics, and
 `heartbeat`. It also decodes the complete committed graph result: commit magic,

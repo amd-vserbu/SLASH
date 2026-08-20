@@ -35,7 +35,7 @@
  *        - Copies the node array, arg buffer, and signal clears into DDR.
  *        - Memory-fences, bumps `graph_seq` by one, memory-fences again.
  *        - Polls `graph_done_seq` by exact sequence equality.
- *        - Reads and validates the committed protocol-v5 graph result.
+ *        - Reads and validates the committed protocol-v6 graph result.
  *
  * The submitter knows nothing about graphs, kernels, or VRT — it is a
  * mechanical adapter between a fully-realised RP1 graph image and the
@@ -92,12 +92,31 @@ struct Rp1GraphImage {
 };
 
 /**
+ * @brief Append a complete SCALAR_WRITE operation as compact packets.
+ *
+ * Protocol v6 carries at most @c RP1_SCALAR_WRITE_MAX pairs per packet.
+ * This helper emits enough contiguous packets for every pair, applies
+ * @p awaitBucket / @p awaitMask to the whole sequence, and publishes
+ * @p setBucket / @p setMask only from the final packet. The flat RP1 scanner
+ * therefore performs every write before dependent work can activate.
+ *
+ * @throws std::logic_error for an empty list, a zero/unaligned address,
+ *         an invalid bucket, or a sequence that would exceed
+ *         @c RP1_MAX_NODES. The image is unchanged on error.
+ */
+void appendScalarWritePackets(
+    Rp1GraphImage& image,
+    const std::vector<rp1_write_pair_t>& writes,
+    std::uint8_t awaitBucket, std::uint32_t awaitMask,
+    std::uint8_t setBucket, std::uint32_t setMask);
+
+/**
  * @brief Default optional trace-ring size programmed by Rp1Submitter.
  */
 constexpr std::uint32_t kDefaultTraceSize = 256u;
 
 /**
- * @brief Valid terminal outcomes returned by protocol-v5 firmware.
+ * @brief Valid terminal outcomes returned by protocol-v6 firmware.
  */
 enum class Rp1GraphOutcome : std::uint32_t {
     /// Every reachable finite operation completed without a fatal error.
@@ -222,7 +241,7 @@ class Rp1TimeoutError : public std::runtime_error {
 };
 
 /**
- * @brief Single-flight protocol-v5 graph submitter over one RP1 BAR window.
+ * @brief Single-flight protocol-v6 graph submitter over one RP1 BAR window.
  *
  * The referenced window must outlive the submitter. A post-doorbell timeout or
  * a terminal result reporting recovery-required or remaining infinite work

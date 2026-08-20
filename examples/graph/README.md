@@ -67,7 +67,7 @@ operations, ordered graph/publication timing, a non-empty trace, and zero
 quiescence. It also rejects missing host-reference PASS output, too few
 successful PDI trace records, missing successful `GRAPH_DONE`, trace overflow,
 a result sequence that disagrees with the following read-only dump, a
-non-advancing `graph_done_seq`, an incompatible protocol-v5
+non-advancing `graph_done_seq`, an incompatible protocol-v6
 capability/platform identity, or terminal error/recovery evidence.
 `UNREACHED_NODES` is allowed on success because an unchosen conditional branch
 legitimately remains pending; the runtime's lifecycle sentinel proves that all

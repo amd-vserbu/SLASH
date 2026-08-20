@@ -31,6 +31,8 @@ targets latency and dispatch scaling, not application throughput.
   - Legacy VRT performs `start()`/`wait()` for each launch.
   - `vrt.batch.<N>.start_to_next_start` measures adjacent returned
     `Kernel::start()` calls with the host monotonic clock.
+  - `vrt.batch.<N>.done_to_next_start` measures a returned `Kernel::wait()`
+    to the following returned `Kernel::start()`.
   - RP1 submits one dependency chain and executes it without host intervention.
   - `rp1.result.batch.<N>.graph_elapsed` reports the graph-result timing without
     enabling tracing.
@@ -44,7 +46,8 @@ targets latency and dispatch scaling, not application throughput.
 - Transfers:
   - Legacy VRT host-to-DDR and DDR-to-host QDMA sync.
   - RP1 phase-1 DDR-to-DDR software `DMA_COPY`, reported both as host round-trip
-    time and graph-result elapsed ticks.
+    time and graph-result elapsed ticks. Protocol v6 packs its byte count into
+    28 bits; this benchmark's 8 MiB scratch ranges impose the smaller limit.
 
 The transfer metrics are intentionally not presented as a speedup ratio. The
 current RP1 firmware only implements local DDR-to-DDR software copies; it does
@@ -82,7 +85,7 @@ The hardware artifact is `rp1_latency_hw.vbin`.
 
 ## Run
 
-The FPGA host must run matching protocol-v5 RP1 firmware and vrtd. No other RP1
+The FPGA host must run matching protocol-v6 RP1 firmware and vrtd. No other RP1
 submitter may use the card concurrently.
 
 ```bash

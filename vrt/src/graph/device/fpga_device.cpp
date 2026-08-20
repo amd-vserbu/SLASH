@@ -69,6 +69,51 @@ constexpr std::uint32_t kKernelBitsPerBucket  = 31u;
 constexpr std::uint32_t kArgBufferWords =
     (RP1_DEFAULT_SIG_ARRAY_OFFSET - RP1_DEFAULT_ARG_BUF_OFFSET) / sizeof(std::uint32_t);
 
+/// Initialize one zeroed packet's packed control word for host submission.
+void initializeNode(rp1_node_t& node, rp1_opcode_t opcode) noexcept {
+    rp1_node_set_opcode(&node, opcode);
+    rp1_node_set_flags(&node, 0u);
+    rp1_node_set_status(&node, RP1_NODE_PENDING);
+}
+
+/// Narrow @p slot to the protocol-v6 signal field or reject it before packing.
+std::uint8_t checkedSignalSlot(std::uint32_t slot, const char* owner) {
+    if (slot >= RP1_MAX_SIGNALS) {
+        throw std::logic_error(
+            std::string("FpgaDevice: ") + owner +
+            " signal slot exceeds RP1_MAX_SIGNALS");
+    }
+    return static_cast<std::uint8_t>(slot);
+}
+
+/// Narrow @p operation to the protocol-v6 SIGNAL field after range validation.
+std::uint8_t checkedSignalOperation(std::uint32_t operation) {
+    if (operation > RP1_SIGOP_AND) {
+        throw std::logic_error(
+            "FpgaDevice: SIGNAL operation is not defined by RP1");
+    }
+    return static_cast<std::uint8_t>(operation);
+}
+
+/// Narrow @p operation to the protocol-v6 condition field after validation.
+std::uint8_t checkedConditionOperation(std::uint32_t operation) {
+    if (operation > RP1_COP_AND_Z) {
+        throw std::logic_error(
+            "FpgaDevice: condition operation is not defined by RP1");
+    }
+    return static_cast<std::uint8_t>(operation);
+}
+
+/// Narrow @p index to a protocol-v6 node index before packet publication.
+std::uint16_t checkedNodeIndex(std::size_t index, const char* owner) {
+    if (index >= RP1_MAX_NODES) {
+        throw std::logic_error(
+            std::string("FpgaDevice: ") + owner +
+            " node index exceeds RP1_MAX_NODES");
+    }
+    return static_cast<std::uint16_t>(index);
+}
+
 constexpr std::uint32_t alignUp(std::uint32_t value, std::uint32_t alignment) {
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
@@ -1306,10 +1351,12 @@ class FpgaDevicePlan : public IBackendExecutable {
         switch (op) {
             case RP1_OP_WAIT:            return "WAIT";
             case RP1_OP_SIGNAL:          return "SIGNAL";
+            case RP1_OP_SCALAR_WRITE:    return "SCALAR_WRITE";
             case RP1_OP_SCALAR_READ:     return "SCALAR_READ";
             case RP1_OP_SCALAR_COPY:     return "SCALAR_COPY";
             case RP1_OP_KERNEL_DISPATCH: return "KERNEL_DISPATCH";
             case RP1_OP_DMA_COPY:        return "DMA_COPY";
+            case RP1_OP_DMA_FILL:        return "DMA_FILL";
             case RP1_OP_PDI_LOAD:        return "PDI_LOAD";
             case RP1_OP_LOOP:            return "LOOP";
             case RP1_OP_COND:            return "COND";
@@ -1324,36 +1371,55 @@ class FpgaDevicePlan : public IBackendExecutable {
         std::cerr << "[rp1-dump] " << image.nodes.size() << " nodes\n";
         for (std::size_t i = 0; i < image.nodes.size(); ++i) {
             const rp1_node_t& n = image.nodes[i];
-            std::cerr << "[rp1-dump] #" << i << " " << opcodeName(n.opcode)
+            const std::uint16_t opcode = rp1_node_get_opcode(&n);
+            std::cerr << "[rp1-dump] #" << i << " " << opcodeName(opcode)
                       << " await(b" << int(n.barrier_await_bucket) << ":0x"
                       << std::hex << n.barrier_await_mask << std::dec << ")"
                       << " set(b" << int(n.barrier_set_bucket) << ":0x"
                       << std::hex << n.barrier_set_mask << std::dec << ")";
-            if (n.opcode == RP1_OP_WAIT) {
-                std::cerr << " wait[sig=" << n.payload.wait.condition_signal
-                          << " op=" << n.payload.wait.condition_op
+            if (opcode == RP1_OP_WAIT) {
+                std::cerr << " wait[sig="
+                          << static_cast<unsigned>(
+                                 n.payload.wait.condition_signal)
+                          << " op="
+                          << static_cast<unsigned>(
+                                 n.payload.wait.condition_op)
                           << " val=" << n.payload.wait.condition_value << "]";
-            } else if (n.opcode == RP1_OP_SIGNAL) {
-                std::cerr << " sig[slot=" << n.payload.signal.target_slot
-                          << " op=" << n.payload.signal.operation
+            } else if (opcode == RP1_OP_SIGNAL) {
+                std::cerr << " sig[slot="
+                          << static_cast<unsigned>(
+                                 n.payload.signal.target_slot)
+                          << " op="
+                          << static_cast<unsigned>(
+                                 n.payload.signal.operation)
                           << " val=" << n.payload.signal.value << "]";
-            } else if (n.opcode == RP1_OP_LOOP) {
+            } else if (opcode == RP1_OP_LOOP) {
                 std::cerr << " loop[body=" << n.payload.loop.body_start << ".."
                           << n.payload.loop.body_end
                           << " maxIter=" << n.payload.loop.max_iterations
-                          << " condSig=" << n.payload.loop.condition_signal
+                          << " condSig="
+                          << static_cast<unsigned>(
+                                 n.payload.loop.condition_signal)
                           << " condVal=" << n.payload.loop.condition_value
-                          << " condOp=" << n.payload.loop.condition_op
+                          << " condOp="
+                          << static_cast<unsigned>(
+                                 n.payload.loop.condition_op)
                           << " clearB=" << int(n.payload.loop.bucket_clear_start) << ".."
                           << int(n.payload.loop.bucket_clear_end) << "]";
-            } else if (n.opcode == RP1_OP_PDI_LOAD) {
+            } else if (opcode == RP1_OP_PDI_LOAD) {
                 std::cerr << " pdi[img=" << n.payload.pdi_load.image_id << "]";
-            } else if (n.opcode == RP1_OP_KERNEL_DISPATCH) {
+            } else if (opcode == RP1_OP_KERNEL_DISPATCH) {
                 std::cerr << " kd[img=" << n.payload.kernel_dispatch.expected_image_id << "]";
-            } else if (n.opcode == RP1_OP_SCALAR_COPY) {
-                std::cerr << " scopy[srcSlot=" << n.payload.scalar_copy.source_slot << "]";
-            } else if (n.opcode == RP1_OP_SCALAR_READ) {
-                std::cerr << " sread[slot=" << n.payload.scalar_read.target_slot << "]";
+            } else if (opcode == RP1_OP_SCALAR_COPY) {
+                std::cerr << " scopy[srcSlot="
+                          << static_cast<unsigned>(
+                                 n.payload.scalar_copy.source_slot)
+                          << "]";
+            } else if (opcode == RP1_OP_SCALAR_READ) {
+                std::cerr << " sread[slot="
+                          << static_cast<unsigned>(
+                                 n.payload.scalar_read.target_slot)
+                          << "]";
             }
             std::cerr << "\n";
         }
@@ -1363,7 +1429,7 @@ class FpgaDevicePlan : public IBackendExecutable {
     static void dumpResolvedKernelArgs(const fpga::Rp1GraphImage& image) {
         for (std::size_t nodeIndex = 0; nodeIndex < image.nodes.size(); ++nodeIndex) {
             const rp1_node_t& node = image.nodes[nodeIndex];
-            if (node.opcode != RP1_OP_KERNEL_DISPATCH) continue;
+            if (rp1_node_get_opcode(&node) != RP1_OP_KERNEL_DISPATCH) continue;
             const auto& dispatch = node.payload.kernel_dispatch;
             std::size_t cursor =
                 dispatch.arg_buffer_offset / sizeof(std::uint32_t);
@@ -1482,18 +1548,19 @@ class FpgaDevicePlan : public IBackendExecutable {
          */
         std::set<std::uint32_t> carried;
         for (const rp1_node_t& n : image.nodes) {
-            if (n.opcode == RP1_OP_SCALAR_COPY) {
+            if (rp1_node_get_opcode(&n) == RP1_OP_SCALAR_COPY) {
                 carried.insert(n.payload.scalar_copy.source_slot);
             }
         }
 
         std::set<std::uint32_t> toClear;
         for (const rp1_node_t& n : image.nodes) {
-            if (n.opcode == RP1_OP_LOOP) {
+            const std::uint16_t opcode = rp1_node_get_opcode(&n);
+            if (opcode == RP1_OP_LOOP) {
                 toClear.insert(n.payload.loop.condition_signal);
-            } else if (n.opcode == RP1_OP_SIGNAL) {
+            } else if (opcode == RP1_OP_SIGNAL) {
                 toClear.insert(n.payload.signal.target_slot);
-            } else if (n.opcode == RP1_OP_WAIT) {
+            } else if (opcode == RP1_OP_WAIT) {
                 toClear.insert(n.payload.wait.condition_signal);
             }
         }
@@ -1811,7 +1878,7 @@ class FpgaDevicePlan : public IBackendExecutable {
         return std::any_of(
             image_.nodes.begin(), image_.nodes.end(),
             [](const rp1_node_t& node) {
-                return node.opcode == RP1_OP_PDI_LOAD;
+                return rp1_node_get_opcode(&node) == RP1_OP_PDI_LOAD;
             });
     }
 
@@ -1980,12 +2047,12 @@ class FpgaDevicePlan : public IBackendExecutable {
                     "' must be in the range 0..UINT32_MAX");
             }
             if (d.nodeIndex >= image_.nodes.size() ||
-                image_.nodes[d.nodeIndex].opcode != RP1_OP_LOOP) {
+                rp1_node_get_opcode(&image_.nodes[d.nodeIndex]) != RP1_OP_LOOP) {
                 throw std::logic_error(
                     "FpgaDevicePlan: deferred trip count points at a non-LOOP node");
             }
             if (d.gateNodeIndex >= image_.nodes.size() ||
-                image_.nodes[d.gateNodeIndex].opcode != RP1_OP_COND) {
+                rp1_node_get_opcode(&image_.nodes[d.gateNodeIndex]) != RP1_OP_COND) {
                 throw std::logic_error(
                     "FpgaDevicePlan: deferred trip count points at a non-COND body gate");
             }
@@ -1994,15 +2061,17 @@ class FpgaDevicePlan : public IBackendExecutable {
                 value == 0 ? 1u : static_cast<std::uint32_t>(value);
             loop.condition_value = fpga::kNeverValue;
             loop.condition_op =
-                value == 0
-                    ? fpga::invertRp1Op(fpga::kNeverOp)
-                    : fpga::kNeverOp;
+                checkedConditionOperation(
+                    value == 0
+                        ? fpga::invertRp1Op(fpga::kNeverOp)
+                        : fpga::kNeverOp);
             auto& gate =
                 image_.nodes[d.gateNodeIndex].payload.cond;
             gate.condition_op =
-                fpga::invertRp1Op(
-                    static_cast<rp1_condop_t>(
-                        loop.condition_op));
+                checkedConditionOperation(
+                    fpga::invertRp1Op(
+                        static_cast<rp1_condop_t>(
+                            loop.condition_op)));
         }
     }
 
@@ -2197,7 +2266,7 @@ class FpgaDevicePlan : public IBackendExecutable {
                     key, std::move(staged)).first;
             }
             if (d.nodeIndex >= image_.nodes.size() ||
-                image_.nodes[d.nodeIndex].opcode != RP1_OP_PDI_LOAD) {
+                rp1_node_get_opcode(&image_.nodes[d.nodeIndex]) != RP1_OP_PDI_LOAD) {
                 throw std::logic_error(
                     "FpgaDevicePlan: deferred PDI fixup points at a non-PDI_LOAD node");
             }
@@ -2489,8 +2558,7 @@ class FpgaDevicePlan : public IBackendExecutable {
             static_cast<std::uint32_t>(image.arg_buf.size()) * sizeof(std::uint32_t);
         const std::uint32_t argCount = packKernelArgs(image, k, skipInputScalars);
         rp1_node_t pkt{};
-        pkt.status               = RP1_NODE_PENDING;
-        pkt.opcode               = RP1_OP_KERNEL_DISPATCH;
+        initializeNode(pkt, RP1_OP_KERNEL_DISPATCH);
         pkt.barrier_await_bucket = awBucket;
         pkt.barrier_await_mask   = awMask;
         pkt.barrier_set_bucket   = setBucket;
@@ -2513,8 +2581,7 @@ class FpgaDevicePlan : public IBackendExecutable {
                                     std::uint8_t awBucket, std::uint32_t awMask,
                                     std::uint8_t setBucket, std::uint32_t setMask) {
         rp1_node_t pkt{};
-        pkt.status               = RP1_NODE_PENDING;
-        pkt.opcode               = RP1_OP_PDI_LOAD;
+        initializeNode(pkt, RP1_OP_PDI_LOAD);
         pkt.barrier_await_bucket = awBucket;
         pkt.barrier_await_mask   = awMask;
         pkt.barrier_set_bucket   = setBucket;
@@ -2593,13 +2660,14 @@ class FpgaDevicePlan : public IBackendExecutable {
                     const std::uint32_t cmask = nodeBitOf(cpos);
 
                     rp1_node_t cp{};
-                    cp.opcode = RP1_OP_SCALAR_COPY;
-                    cp.status = RP1_NODE_PENDING;
+                    initializeNode(cp, RP1_OP_SCALAR_COPY);
                     cp.barrier_await_bucket = copyAwBucket;
                     cp.barrier_await_mask = copyAwMask;
                     cp.barrier_set_bucket = cbucket;
                     cp.barrier_set_mask = cmask;
-                    cp.payload.scalar_copy.source_slot = readyIt->second.slot;
+                    cp.payload.scalar_copy.source_slot =
+                        checkedSignalSlot(
+                            readyIt->second.slot, "SCALAR_COPY");
                     cp.payload.scalar_copy.dest_addr =
                         loc->r5_base_addr + inputOffsets->at(sp.name);
                     image.nodes.push_back(cp);
@@ -2635,14 +2703,14 @@ class FpgaDevicePlan : public IBackendExecutable {
                     const FpgaKernelLocation loc = device_->resolveKernelLocation(k->kernel);
                     const std::uint32_t off = device_->outputScalarRegOffset(k->kernel, sp.name);
                     rp1_node_t sr{};
-                    sr.opcode = RP1_OP_SCALAR_READ;
-                    sr.status = RP1_NODE_PENDING;
+                    initializeNode(sr, RP1_OP_SCALAR_READ);
                     sr.barrier_await_bucket = lastBucket;
                     sr.barrier_await_mask = lastMask;
                     sr.barrier_set_bucket = rbucket;
                     sr.barrier_set_mask = rmask;
                     sr.payload.scalar_read.source_addr = loc.r5_base_addr + off;
-                    sr.payload.scalar_read.target_slot = slot;
+                    sr.payload.scalar_read.target_slot =
+                        checkedSignalSlot(slot, "SCALAR_READ");
                     image.nodes.push_back(sr);
                     if (bindIt != k->ioMap.outputScalars().end()) {
                         scalarSlots_[key] = slot;
@@ -2660,27 +2728,29 @@ class FpgaDevicePlan : public IBackendExecutable {
                 emitReprogramPacket(image, *r, awBucket, awMask, setBucket, setMask);
             } else if (const auto* sg = std::get_if<Rp1SignalCommand>(&n)) {
                 rp1_node_t pkt{};
-                pkt.opcode = RP1_OP_SIGNAL;
-                pkt.status = RP1_NODE_PENDING;
+                initializeNode(pkt, RP1_OP_SIGNAL);
                 pkt.barrier_await_bucket = awBucket;
                 pkt.barrier_await_mask = awMask;
                 pkt.barrier_set_bucket = setBucket;
                 pkt.barrier_set_mask = setMask;
-                pkt.payload.signal.target_slot = sg->slot;
+                pkt.payload.signal.target_slot =
+                    checkedSignalSlot(sg->slot, "SIGNAL");
                 pkt.payload.signal.value = sg->value;
-                pkt.payload.signal.operation = sg->operation;
+                pkt.payload.signal.operation =
+                    checkedSignalOperation(sg->operation);
                 image.nodes.push_back(pkt);
             } else if (const auto* wt = std::get_if<Rp1WaitCommand>(&n)) {
                 rp1_node_t pkt{};
-                pkt.opcode = RP1_OP_WAIT;
-                pkt.status = RP1_NODE_PENDING;
+                initializeNode(pkt, RP1_OP_WAIT);
                 pkt.barrier_await_bucket = awBucket;
                 pkt.barrier_await_mask = awMask;
                 pkt.barrier_set_bucket = setBucket;
                 pkt.barrier_set_mask = setMask;
-                pkt.payload.wait.condition_signal = wt->slot;
+                pkt.payload.wait.condition_signal =
+                    checkedSignalSlot(wt->slot, "WAIT");
                 pkt.payload.wait.condition_value = wt->value;
-                pkt.payload.wait.condition_op = wt->conditionOp;
+                pkt.payload.wait.condition_op =
+                    checkedConditionOperation(wt->conditionOp);
                 image.nodes.push_back(pkt);
             } else {
                 throw std::logic_error(
@@ -2797,8 +2867,7 @@ class FpgaDevicePlan : public IBackendExecutable {
             std::uint32_t j = 0;
             for (const auto& [bucket, bits] : groups) {
                 rp1_node_t agg{};
-                agg.opcode = RP1_OP_NOP;
-                agg.status = RP1_NODE_PENDING;
+                initializeNode(agg, RP1_OP_NOP);
                 agg.barrier_await_bucket = bucket;
                 agg.barrier_await_mask = bits;
                 agg.barrier_set_bucket = cb;
@@ -2832,15 +2901,16 @@ class FpgaDevicePlan : public IBackendExecutable {
         for (const rp1_node_t& agg : aggregators) image.nodes.push_back(agg);
 
         rp1_node_t sentinel{};
-        sentinel.opcode = RP1_OP_SIGNAL;
-        sentinel.status = RP1_NODE_PENDING;
+        initializeNode(sentinel, RP1_OP_SIGNAL);
         sentinel.barrier_await_bucket = sentBucket;
         sentinel.barrier_await_mask = sentMask;
         sentinel.barrier_set_bucket = kSentinelBucket;
         sentinel.barrier_set_mask = kSentinelBit;
-        sentinel.payload.signal.target_slot = sentinelSlot_;
+        sentinel.payload.signal.target_slot =
+            checkedSignalSlot(sentinelSlot_, "sentinel SIGNAL");
         sentinel.payload.signal.value = sentinelValue_;
-        sentinel.payload.signal.operation = RP1_SIGOP_SET;
+        sentinel.payload.signal.operation =
+            checkedSignalOperation(RP1_SIGOP_SET);
         image.nodes.push_back(sentinel);
         image.clear_signal_slots.push_back(sentinelSlot_);
         clearHandshakeSlots(image);
@@ -2868,15 +2938,16 @@ class FpgaDevicePlan : public IBackendExecutable {
             }
         }
         rp1_node_t sentinel{};
-        sentinel.opcode = RP1_OP_SIGNAL;
-        sentinel.status = RP1_NODE_PENDING;
+        initializeNode(sentinel, RP1_OP_SIGNAL);
         sentinel.barrier_await_bucket = kSentinelBucket;
         sentinel.barrier_await_mask = sentinelMask;
         sentinel.barrier_set_bucket = kSentinelBucket;
         sentinel.barrier_set_mask = kSentinelBit;
-        sentinel.payload.signal.target_slot = sentinelSlot_;
+        sentinel.payload.signal.target_slot =
+            checkedSignalSlot(sentinelSlot_, "sentinel SIGNAL");
         sentinel.payload.signal.value = sentinelValue_;
-        sentinel.payload.signal.operation = RP1_SIGOP_SET;
+        sentinel.payload.signal.operation =
+            checkedSignalOperation(RP1_SIGOP_SET);
         image.nodes.push_back(sentinel);
         image.clear_signal_slots.push_back(sentinelSlot_);
         clearHandshakeSlots(image);
@@ -2961,14 +3032,14 @@ class FpgaDevicePlan : public IBackendExecutable {
                     const std::uint32_t off = device_->outputScalarRegOffset(k->kernel, sp.name);
                     const std::uint32_t rbit = allocMainBit();
                     rp1_node_t sr{};
-                    sr.opcode               = RP1_OP_SCALAR_READ;
-                    sr.status               = RP1_NODE_PENDING;
+                    initializeNode(sr, RP1_OP_SCALAR_READ);
                     sr.barrier_await_bucket = 0;
                     sr.barrier_await_mask   = lastBit;
                     sr.barrier_set_bucket   = 0;
                     sr.barrier_set_mask     = rbit;
                     sr.payload.scalar_read.source_addr = loc.r5_base_addr + off;
-                    sr.payload.scalar_read.target_slot = slot;
+                    sr.payload.scalar_read.target_slot =
+                        checkedSignalSlot(slot, "SCALAR_READ");
                     image.nodes.push_back(sr);
                     if (bindIt != k->ioMap.outputScalars().end()) {
                         scalarSlots_[key] = slot;
@@ -2993,30 +3064,32 @@ class FpgaDevicePlan : public IBackendExecutable {
                 const std::uint32_t aw  = awaitMaskFor(sg->dependsOn);
                 const std::uint32_t bit = allocMainBit();
                 rp1_node_t pkt{};
-                pkt.opcode               = RP1_OP_SIGNAL;
-                pkt.status               = RP1_NODE_PENDING;
+                initializeNode(pkt, RP1_OP_SIGNAL);
                 pkt.barrier_await_bucket = 0;
                 pkt.barrier_await_mask   = aw;
                 pkt.barrier_set_bucket   = 0;
                 pkt.barrier_set_mask     = bit;
-                pkt.payload.signal.target_slot = sg->slot;
+                pkt.payload.signal.target_slot =
+                    checkedSignalSlot(sg->slot, "SIGNAL");
                 pkt.payload.signal.value       = sg->value;
-                pkt.payload.signal.operation   = sg->operation;
+                pkt.payload.signal.operation   =
+                    checkedSignalOperation(sg->operation);
                 image.nodes.push_back(pkt);
                 mainBit[sg->id] = bit;
             } else if (const auto* wt = std::get_if<Rp1WaitCommand>(&node)) {
                 const std::uint32_t aw  = awaitMaskFor(wt->dependsOn);
                 const std::uint32_t bit = allocMainBit();
                 rp1_node_t pkt{};
-                pkt.opcode               = RP1_OP_WAIT;
-                pkt.status               = RP1_NODE_PENDING;
+                initializeNode(pkt, RP1_OP_WAIT);
                 pkt.barrier_await_bucket = 0;
                 pkt.barrier_await_mask   = aw;
                 pkt.barrier_set_bucket   = 0;
                 pkt.barrier_set_mask     = bit;
-                pkt.payload.wait.condition_signal = wt->slot;
+                pkt.payload.wait.condition_signal =
+                    checkedSignalSlot(wt->slot, "WAIT");
                 pkt.payload.wait.condition_value  = wt->value;
-                pkt.payload.wait.condition_op     = wt->conditionOp;
+                pkt.payload.wait.condition_op     =
+                    checkedConditionOperation(wt->conditionOp);
                 image.nodes.push_back(pkt);
                 mainBit[wt->id] = bit;
             } else if (std::holds_alternative<Rp1BoundaryCommand>(node)) {
@@ -3095,8 +3168,7 @@ class FpgaDevicePlan : public IBackendExecutable {
             for (const auto& [bucket, mask] : groups) {
                 BarrierRef c = allocBit();
                 rp1_node_t pkt{};
-                pkt.opcode = RP1_OP_NOP;
-                pkt.status = RP1_NODE_PENDING;
+                initializeNode(pkt, RP1_OP_NOP);
                 pkt.barrier_await_bucket = bucket;
                 pkt.barrier_await_mask = mask;
                 pkt.barrier_set_bucket = c.bucket;
@@ -3299,14 +3371,14 @@ class FpgaDevicePlan : public IBackendExecutable {
             const BarrierRef done =
                 domain.define(kernel.id + ".scopy." + port.name);
             rp1_node_t packet{};
-            packet.opcode = RP1_OP_SCALAR_COPY;
-            packet.status = RP1_NODE_PENDING;
+            initializeNode(packet, RP1_OP_SCALAR_COPY);
             packet.barrier_await_bucket = await.bucket;
             packet.barrier_await_mask = await.mask;
             packet.barrier_set_bucket = done.bucket;
             packet.barrier_set_mask = done.mask;
             packet.payload.scalar_copy.source_slot =
-                carriedSlot(imported->second);
+                checkedSignalSlot(
+                    carriedSlot(imported->second), "SCALAR_COPY");
             packet.payload.scalar_copy.dest_addr =
                 location.r5_base_addr + offsets.at(port.name);
             image.nodes.push_back(packet);
@@ -3342,8 +3414,7 @@ class FpgaDevicePlan : public IBackendExecutable {
             const BarrierRef readDone =
                 domain.define(kernel.id + ".sread." + port.name);
             rp1_node_t packet{};
-            packet.opcode = RP1_OP_SCALAR_READ;
-            packet.status = RP1_NODE_PENDING;
+            initializeNode(packet, RP1_OP_SCALAR_READ);
             packet.barrier_await_bucket = lastDone.bucket;
             packet.barrier_await_mask = lastDone.mask;
             packet.barrier_set_bucket = readDone.bucket;
@@ -3352,7 +3423,8 @@ class FpgaDevicePlan : public IBackendExecutable {
                 location.r5_base_addr +
                 device_->outputScalarRegOffset(
                     kernel.kernel, port.name);
-            packet.payload.scalar_read.target_slot = slot;
+            packet.payload.scalar_read.target_slot =
+                checkedSignalSlot(slot, "SCALAR_READ");
             image.nodes.push_back(packet);
             if (!localKey.empty()) scalarSlots_[localKey] = slot;
             lastDone = readDone;
@@ -3391,15 +3463,16 @@ class FpgaDevicePlan : public IBackendExecutable {
             domain.awaitFor(domain.refsFor(signal.dependsOn));
         const BarrierRef done = domain.define(signal.id);
         rp1_node_t packet{};
-        packet.opcode = RP1_OP_SIGNAL;
-        packet.status = RP1_NODE_PENDING;
+        initializeNode(packet, RP1_OP_SIGNAL);
         packet.barrier_await_bucket = await.bucket;
         packet.barrier_await_mask = await.mask;
         packet.barrier_set_bucket = done.bucket;
         packet.barrier_set_mask = done.mask;
-        packet.payload.signal.target_slot = signal.slot;
+        packet.payload.signal.target_slot =
+            checkedSignalSlot(signal.slot, "SIGNAL");
         packet.payload.signal.value = signal.value;
-        packet.payload.signal.operation = signal.operation;
+        packet.payload.signal.operation =
+            checkedSignalOperation(signal.operation);
         image.nodes.push_back(packet);
     }
 
@@ -3410,15 +3483,16 @@ class FpgaDevicePlan : public IBackendExecutable {
             domain.awaitFor(domain.refsFor(wait.dependsOn));
         const BarrierRef done = domain.define(wait.id);
         rp1_node_t packet{};
-        packet.opcode = RP1_OP_WAIT;
-        packet.status = RP1_NODE_PENDING;
+        initializeNode(packet, RP1_OP_WAIT);
         packet.barrier_await_bucket = await.bucket;
         packet.barrier_await_mask = await.mask;
         packet.barrier_set_bucket = done.bucket;
         packet.barrier_set_mask = done.mask;
-        packet.payload.wait.condition_signal = wait.slot;
+        packet.payload.wait.condition_signal =
+            checkedSignalSlot(wait.slot, "WAIT");
         packet.payload.wait.condition_value = wait.value;
-        packet.payload.wait.condition_op = wait.conditionOp;
+        packet.payload.wait.condition_op =
+            checkedConditionOperation(wait.conditionOp);
         image.nodes.push_back(packet);
     }
 
@@ -3437,44 +3511,44 @@ class FpgaDevicePlan : public IBackendExecutable {
 
         const std::uint32_t waited = allocMainBit();
         rp1_node_t wait{};
-        wait.opcode = RP1_OP_WAIT;
-        wait.status = RP1_NODE_PENDING;
+        initializeNode(wait, RP1_OP_WAIT);
         wait.barrier_await_bucket = 0;
         wait.barrier_await_mask = loopAwait;
         wait.barrier_set_bucket = 0;
         wait.barrier_set_mask = waited;
         wait.payload.wait.condition_signal =
-            loop.broadcastReadySlot;
-        wait.payload.wait.condition_op = RP1_COP_AND_NZ;
+            checkedSignalSlot(loop.broadcastReadySlot, "WAIT");
+        wait.payload.wait.condition_op =
+            checkedConditionOperation(RP1_COP_AND_NZ);
         wait.payload.wait.condition_value = 1;
         image.nodes.push_back(wait);
 
         const std::uint32_t cleared = allocMainBit();
         rp1_node_t clear{};
-        clear.opcode = RP1_OP_SIGNAL;
-        clear.status = RP1_NODE_PENDING;
+        initializeNode(clear, RP1_OP_SIGNAL);
         clear.barrier_await_bucket = 0;
         clear.barrier_await_mask = waited;
         clear.barrier_set_bucket = 0;
         clear.barrier_set_mask = cleared;
         clear.payload.signal.target_slot =
-            loop.broadcastReadySlot;
+            checkedSignalSlot(loop.broadcastReadySlot, "SIGNAL");
         clear.payload.signal.value = 0;
-        clear.payload.signal.operation = RP1_SIGOP_SET;
+        clear.payload.signal.operation =
+            checkedSignalOperation(RP1_SIGOP_SET);
         image.nodes.push_back(clear);
 
         const std::uint32_t acknowledged = allocMainBit();
         rp1_node_t acknowledge{};
-        acknowledge.opcode = RP1_OP_SIGNAL;
-        acknowledge.status = RP1_NODE_PENDING;
+        initializeNode(acknowledge, RP1_OP_SIGNAL);
         acknowledge.barrier_await_bucket = 0;
         acknowledge.barrier_await_mask = cleared;
         acknowledge.barrier_set_bucket = 0;
         acknowledge.barrier_set_mask = acknowledged;
         acknowledge.payload.signal.target_slot =
-            loop.broadcastAckSlot;
+            checkedSignalSlot(loop.broadcastAckSlot, "SIGNAL");
         acknowledge.payload.signal.value = 1;
-        acknowledge.payload.signal.operation = RP1_SIGOP_SET;
+        acknowledge.payload.signal.operation =
+            checkedSignalOperation(RP1_SIGOP_SET);
         image.nodes.push_back(acknowledge);
         return acknowledged;
     }
@@ -3493,46 +3567,46 @@ class FpgaDevicePlan : public IBackendExecutable {
         const BarrierRef waited =
             domain.define(loop.id + ".broadcast_wait");
         rp1_node_t wait{};
-        wait.opcode = RP1_OP_WAIT;
-        wait.status = RP1_NODE_PENDING;
+        initializeNode(wait, RP1_OP_WAIT);
         wait.barrier_await_bucket = bodyLeaves.bucket;
         wait.barrier_await_mask = bodyLeaves.mask;
         wait.barrier_set_bucket = waited.bucket;
         wait.barrier_set_mask = waited.mask;
         wait.payload.wait.condition_signal =
-            loop.broadcastReadySlot;
-        wait.payload.wait.condition_op = RP1_COP_AND_NZ;
+            checkedSignalSlot(loop.broadcastReadySlot, "WAIT");
+        wait.payload.wait.condition_op =
+            checkedConditionOperation(RP1_COP_AND_NZ);
         wait.payload.wait.condition_value = 1;
         image.nodes.push_back(wait);
 
         const BarrierRef cleared =
             domain.define(loop.id + ".broadcast_clear");
         rp1_node_t clear{};
-        clear.opcode = RP1_OP_SIGNAL;
-        clear.status = RP1_NODE_PENDING;
+        initializeNode(clear, RP1_OP_SIGNAL);
         clear.barrier_await_bucket = waited.bucket;
         clear.barrier_await_mask = waited.mask;
         clear.barrier_set_bucket = cleared.bucket;
         clear.barrier_set_mask = cleared.mask;
         clear.payload.signal.target_slot =
-            loop.broadcastReadySlot;
+            checkedSignalSlot(loop.broadcastReadySlot, "SIGNAL");
         clear.payload.signal.value = 0;
-        clear.payload.signal.operation = RP1_SIGOP_SET;
+        clear.payload.signal.operation =
+            checkedSignalOperation(RP1_SIGOP_SET);
         image.nodes.push_back(clear);
 
         const BarrierRef acknowledged =
             domain.define(loop.id + ".broadcast_ack");
         rp1_node_t acknowledge{};
-        acknowledge.opcode = RP1_OP_SIGNAL;
-        acknowledge.status = RP1_NODE_PENDING;
+        initializeNode(acknowledge, RP1_OP_SIGNAL);
         acknowledge.barrier_await_bucket = cleared.bucket;
         acknowledge.barrier_await_mask = cleared.mask;
         acknowledge.barrier_set_bucket = acknowledged.bucket;
         acknowledge.barrier_set_mask = acknowledged.mask;
         acknowledge.payload.signal.target_slot =
-            loop.broadcastAckSlot;
+            checkedSignalSlot(loop.broadcastAckSlot, "SIGNAL");
         acknowledge.payload.signal.value = 1;
-        acknowledge.payload.signal.operation = RP1_SIGOP_SET;
+        acknowledge.payload.signal.operation =
+            checkedSignalOperation(RP1_SIGOP_SET);
         image.nodes.push_back(acknowledge);
         return acknowledged;
     }
@@ -3549,18 +3623,20 @@ class FpgaDevicePlan : public IBackendExecutable {
         fpga::LoopIdAllocator& loopIds) {
         auto& payload = image.nodes[loopIndex].payload.loop;
         payload.body_start =
-            static_cast<std::uint32_t>(loopIndex + 1);
+            checkedNodeIndex(loopIndex + 1, "LOOP body start");
         payload.body_end =
-            static_cast<std::uint32_t>(rerunIndex);
+            checkedNodeIndex(rerunIndex, "LOOP body end");
         if (loop.broadcastRole == Rp1SplitRole::Follower) {
             // RP1 uses zero for predicate-governed duration. The authority's
             // broadcast is the only termination source; a local cap would let
             // the follower leave the shared handshake prematurely.
             payload.max_iterations = 0;
             payload.condition_signal =
-                loop.conditionBroadcastSlot;
+                checkedSignalSlot(
+                    loop.conditionBroadcastSlot, "LOOP");
             payload.condition_value = 1;
-            payload.condition_op = RP1_COP_AND_NZ;
+            payload.condition_op =
+                checkedConditionOperation(RP1_COP_AND_NZ);
         } else if (whileLoop) {
             const fpga::Rp1Compare condition =
                 fpga::mapRp1Condition(*loop.condition);
@@ -3573,15 +3649,18 @@ class FpgaDevicePlan : public IBackendExecutable {
                     "produced by the body");
             }
             payload.max_iterations = 0;
-            payload.condition_signal = slot->second;
+            payload.condition_signal =
+                checkedSignalSlot(slot->second, "LOOP");
             payload.condition_value = condition.value;
             payload.condition_op =
-                fpga::invertRp1Op(condition.op);
+                checkedConditionOperation(
+                    fpga::invertRp1Op(condition.op));
         } else {
             payload.max_iterations = 1;
             payload.condition_signal = 0;
             payload.condition_value = fpga::kNeverValue;
-            payload.condition_op = fpga::kNeverOp;
+            payload.condition_op =
+                checkedConditionOperation(fpga::kNeverOp);
         }
         payload.bucket_clear_start = domain.clearStart();
         payload.bucket_clear_end = domain.clearEnd();
@@ -3639,8 +3718,7 @@ class FpgaDevicePlan : public IBackendExecutable {
 
         // LOOP packet (body_start/end backpatched after the body is emitted).
         rp1_node_t loopPkt{};
-        loopPkt.opcode               = RP1_OP_LOOP;
-        loopPkt.status               = RP1_NODE_PENDING;
+        initializeNode(loopPkt, RP1_OP_LOOP);
         loopPkt.barrier_await_bucket = 0;
         loopPkt.barrier_await_mask   = initialLoopAwait;
         loopPkt.barrier_set_bucket   = 0;
@@ -3648,8 +3726,7 @@ class FpgaDevicePlan : public IBackendExecutable {
         const std::size_t loopIdx = image.nodes.size();
         image.nodes.push_back(loopPkt);
         rp1_node_t gate{};
-        gate.opcode = RP1_OP_COND;
-        gate.status = RP1_NODE_PENDING;
+        initializeNode(gate, RP1_OP_COND);
         gate.barrier_set_bucket = 0;
         gate.barrier_set_mask = 0;
         gate.payload.cond.body_start = 1;
@@ -3741,13 +3818,13 @@ class FpgaDevicePlan : public IBackendExecutable {
 
         const BarrierRef rerunBit = bodyDomain.define(loop.id + ".rerun");
         rp1_node_t rerun{};
-        rerun.opcode               = RP1_OP_RERUN;
-        rerun.status               = RP1_NODE_PENDING;
+        initializeNode(rerun, RP1_OP_RERUN);
         rerun.barrier_await_bucket = bodyLeaves.bucket;
         rerun.barrier_await_mask   = bodyLeaves.mask;
         rerun.barrier_set_bucket   = rerunBit.bucket;
         rerun.barrier_set_mask     = rerunBit.mask;
-        rerun.payload.rerun.target_node = static_cast<std::uint32_t>(loopIdx);
+        rerun.payload.rerun.target_node =
+            checkedNodeIndex(loopIdx, "RERUN target");
         const std::size_t rerunIdx = image.nodes.size();
         image.nodes.push_back(rerun);
 
@@ -3767,9 +3844,10 @@ class FpgaDevicePlan : public IBackendExecutable {
         gatePayload.condition_value =
             loopPayload.condition_value;
         gatePayload.condition_op =
-            fpga::invertRp1Op(
-                static_cast<rp1_condop_t>(
-                    loopPayload.condition_op));
+            checkedConditionOperation(
+                fpga::invertRp1Op(
+                    static_cast<rp1_condop_t>(
+                        loopPayload.condition_op)));
         mainBit[loop.id] = exitBit;
     }
 
@@ -3839,15 +3917,16 @@ class FpgaDevicePlan : public IBackendExecutable {
             }
 
             rp1_node_t cnode{};
-            cnode.opcode               = RP1_OP_COND;
-            cnode.status               = RP1_NODE_PENDING;
+            initializeNode(cnode, RP1_OP_COND);
             cnode.barrier_await_bucket = 0;
             cnode.barrier_await_mask   = condAwait;
             cnode.barrier_set_bucket   = 0;
             cnode.barrier_set_mask     = 0;
-            cnode.payload.cond.condition_signal   = condSlot;
+            cnode.payload.cond.condition_signal   =
+                checkedSignalSlot(condSlot, "COND");
             cnode.payload.cond.condition_value    = c.value;
-            cnode.payload.cond.condition_op       = op;
+            cnode.payload.cond.condition_op       =
+                checkedConditionOperation(op);
             cnode.payload.cond.body_start         = 1;  // empty range (start > end):
             cnode.payload.cond.body_end           = 0;  // COND is a pure boolean
             cnode.payload.cond.bucket_clear_start = 1;
@@ -3918,8 +3997,7 @@ class FpgaDevicePlan : public IBackendExecutable {
              */
             const BarrierRef leaves = branchDomain.mutableLeafAwait();
             rp1_node_t join{};
-            join.opcode               = RP1_OP_NOP;
-            join.status               = RP1_NODE_PENDING;
+            initializeNode(join, RP1_OP_NOP);
             join.barrier_await_bucket = leaves.bucket;
             join.barrier_await_mask   = leaves.mask;
             join.barrier_set_bucket   = 0;
