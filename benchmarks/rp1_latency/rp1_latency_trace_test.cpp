@@ -40,6 +40,19 @@ int main() {
     } catch (const std::invalid_argument&) {
     }
 
+    const auto memoryImage = makeMemoryTraceImage(
+        MemoryOperation::DmaCopy, 64u, 4u);
+    if (!memoryImage.trace_enable ||
+        memoryImage.nodes.size() != 4u ||
+        rp1_node_get_opcode(&memoryImage.nodes[0]) != RP1_OP_DMA_COPY ||
+        memoryImage.nodes[0].barrier_await_mask != 0u ||
+        memoryImage.nodes[1].barrier_await_mask != 1u ||
+        memoryImage.nodes[1].barrier_set_mask != 2u ||
+        rp1_dma_get_length(
+            memoryImage.nodes[3].payload.dma_copy.length_types) != 64u) {
+        return 1;
+    }
+
     vrt::graph::fpga::Rp1GraphResult result;
     result.flags = RP1_RESULT_TRACE_ENABLED;
     result.activeImageId = 1u;
@@ -106,6 +119,29 @@ int main() {
             std::vector<std::uint32_t>({20u, 10u}) ||
         intervals.flushDurations !=
             std::vector<std::uint32_t>({81u})) {
+        return 1;
+    }
+
+    vrt::graph::fpga::Rp1TraceCapture activationCapture;
+    const auto addActivation = [&](
+                                   std::uint16_t event, std::uint16_t node,
+                                   std::uint32_t timestamp) {
+        activationCapture.entries.emplace_back();
+        rp1_trace_entry_t& entry = activationCapture.entries.back();
+        entry.event = event;
+        entry.node_index = node;
+        entry.timestamp = timestamp;
+    };
+    addActivation(RP1_TRACE_GRAPH_START, 0xFFFFu, max - 10u);
+    addActivation(RP1_TRACE_NODE_ACTIVATE, 0u, max - 5u);
+    addActivation(RP1_TRACE_NODE_ACTIVATE, 1u, max - 1u);
+    addActivation(RP1_TRACE_NODE_ACTIVATE, 2u, 3u);
+    addActivation(RP1_TRACE_GRAPH_DONE, 0xFFFFu, 4u);
+    if (extractActivationGaps(activationCapture, 3u) !=
+            std::vector<std::uint32_t>({4u, 5u}) ||
+        meanExcessCycles(
+            std::vector<std::uint32_t>({5u, 7u}),
+            std::vector<std::uint32_t>({3u, 3u})) != 192u) {
         return 1;
     }
 

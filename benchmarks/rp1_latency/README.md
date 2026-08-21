@@ -48,6 +48,18 @@ targets latency and dispatch scaling, not application throughput.
   - RP1 phase-1 DDR-to-DDR software `DMA_COPY`, reported both as host round-trip
     time and graph-result elapsed ticks. Protocol v6 packs its byte count into
     28 bits; this benchmark's 8 MiB scratch ranges impose the smaller limit.
+- Differential RP1 memory access tracing:
+  - Chains of 128 immediate nodes execute in one scanner pass, keeping every
+    `NODE_ACTIVATE` interval below the BTCM trace-page flush threshold.
+  - `nop_gap`, `dma_fill_gap`, and `dma_copy_gap` are raw adjacent activation
+    intervals in divided PMU ticks.
+  - `dma_fill_minus_nop` estimates DDR write completion cost.
+  - `dma_copy_minus_nop` estimates combined DDR read/write cost.
+  - `ddr_read_copy_minus_fill` estimates the additional DDR read cost.
+  - Differential rows aggregate the whole chain before dividing and report R5
+    core cycles, recovering sub-80-nanosecond mean resolution.
+  - Four-byte `scalar.write_*` and `scalar.read_*` rows characterize the actual
+    scalar opcodes; SCALAR_READ includes publication to its DDR signal slot.
 
 The transfer metrics are intentionally not presented as a speedup ratio. The
 current RP1 firmware only implements local DDR-to-DDR software copies; it does
@@ -107,6 +119,8 @@ timeout --foreground 300s ./rp1_latency \
   --trace-iterations 20 \
   --batch-sizes 1,10,100 \
   --transfer-sizes 4,64,4096,1048576 \
+  --memory-sizes 4,64,256,4096 \
+  --memory-chain 128 \
   --csv > latency.csv
 ```
 
@@ -165,6 +179,13 @@ dispatch, the software copy, and graph completion. It is not a copy-only
 hardware timer. Programming rows also have intentionally different boundaries,
 as described above, and should not be interpreted as a pure PDI-loader speedup
 ratio.
+
+The memory-trace benchmark uses two private ranges near the end of RP1's
+64 MiB shared window. DMA_FILL and DMA_COPY use identical dependency chains,
+destinations, trace boundaries, and `dsb st` completion semantics. Their
+difference is therefore a practical latency estimate, not a physical DDR
+controller counter. Repeated addresses characterize the hot shared-window path
+used by RP1 telemetry and arguments; they do not model random-address DRAM.
 
 For less noisy host measurements, reserve the machine, pin the process to one
 CPU, use a fixed CPU frequency policy, and repeat the complete run. Programming

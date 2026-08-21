@@ -73,6 +73,38 @@ static_assert(kScratchCapacity <= RP1_DMA_LENGTH_MASK);
 constexpr std::size_t kMaxBatchSize = 961;
 static_assert(kMaxBatchSize + 1 <= RP1_MAX_NODES);
 static_assert(3u * kMaxBatchSize + 4u <= RP1_MAX_TRACE_ENTRIES);
+/// Default immediate-operation chain used to amortize 80 ns PMU ticks.
+constexpr std::size_t kMemoryChainLength = 128;
+/// Entries in firmware's fixed 4 KiB BTCM trace staging page.
+constexpr std::size_t kTraceStagingEntries =
+    4096u / sizeof(rp1_trace_entry_t);
+/// Largest chain whose activation events fit without a trace-page flush.
+constexpr std::size_t kMaxMemoryChainLength =
+    kTraceStagingEntries - 4u;
+static_assert(kMaxMemoryChainLength <= RP1_MAX_NODES);
+/// Signal slot reserved for the SCALAR_READ memory microbenchmark.
+constexpr std::uint8_t kMemorySignalSlot =
+    static_cast<std::uint8_t>(RP1_MAX_SIGNALS - 2u);
+/// Distinct fill pattern used to verify every DMA_FILL graph.
+constexpr std::uint32_t kFillPattern = 0xA5A5A5A5u;
+/// Distinct source pattern used to verify every DMA_COPY graph.
+constexpr std::uint32_t kCopyPattern = 0x5A5A5A5Au;
+
+/**
+ * @brief Immediate operation exercised by one memory-trace chain.
+ */
+enum class MemoryOperation {
+    /// Scanner-only baseline.
+    Nop,
+    /// Repeated DDR stores followed by DSB ST.
+    DmaFill,
+    /// Repeated DDR loads/stores followed by DSB ST.
+    DmaCopy,
+    /// One DDR store followed by DSB ST.
+    ScalarWrite,
+    /// One DDR load followed by signal-slot publication.
+    ScalarRead,
+};
 
 /**
  * @brief User-selected benchmark dimensions and output format.
@@ -98,6 +130,10 @@ struct Config {
     std::vector<std::size_t> batchSizes{1, 10, 100};
     /// Byte counts for VRT sync and RP1 local copies.
     std::vector<std::size_t> transferSizes{4, 64, 4096, 1u << 20};
+    /// Byte counts for differential RP1 DDR tracing.
+    std::vector<std::size_t> memorySizes{4, 64, 256, 4096};
+    /// Immediate nodes in each memory-trace chain.
+    std::size_t memoryChainLength = kMemoryChainLength;
     /// Optional R5 clock for converting 64-cycle PMU ticks.
     std::optional<std::uint64_t> r5FrequencyHz;
     /// Emit machine-readable CSV instead of aligned columns.
@@ -176,6 +212,8 @@ void printUsage(const char* argv0) {
         << "  --trace-iterations N       instrumented RP1 samples (default: 5)\n"
         << "  --batch-sizes N,N,...      sequential kernels per batch\n"
         << "  --transfer-sizes N,N,...   transfer bytes; multiples of four\n"
+        << "  --memory-sizes N,N,...     traced DDR bytes; multiples of four\n"
+        << "  --memory-chain N           immediate nodes per traced graph\n"
         << "  --r5-hz HZ                 also convert PMU ticks to estimated ns\n"
         << "  --csv                       emit CSV summaries\n"
         << "  --help, -h                  show this help\n";
@@ -266,6 +304,12 @@ Config parseArgs(int argc, char** argv) {
         } else if (argument == "--transfer-sizes") {
             config.transferSizes =
                 parseSizeList(need("--transfer-sizes"), "--transfer-sizes");
+        } else if (argument == "--memory-sizes") {
+            config.memorySizes =
+                parseSizeList(need("--memory-sizes"), "--memory-sizes");
+        } else if (argument == "--memory-chain") {
+            config.memoryChainLength =
+                parseSize(need("--memory-chain"), "--memory-chain");
         } else if (argument == "--r5-hz") {
             config.r5FrequencyHz = static_cast<std::uint64_t>(
                 parseSize(need("--r5-hz"), "--r5-hz"));
@@ -301,6 +345,19 @@ Config parseArgs(int argc, char** argv) {
                 "transfer sizes must be multiples of four and no larger than " +
                 std::to_string(kScratchCapacity) + " bytes");
         }
+    }
+    for (std::size_t bytes : config.memorySizes) {
+        if ((bytes & 3u) != 0 || bytes > kScratchCapacity) {
+            throw std::runtime_error(
+                "memory sizes must be multiples of four and no larger than " +
+                std::to_string(kScratchCapacity) + " bytes");
+        }
+    }
+    if (config.memoryChainLength < 2u ||
+        config.memoryChainLength > kMaxMemoryChainLength) {
+        throw std::runtime_error(
+            "memory chain must be in [2, " +
+            std::to_string(kMaxMemoryChainLength) + "]");
     }
     return config;
 }
@@ -516,6 +573,165 @@ vrt::graph::fpga::Rp1GraphImage makeDmaImage(std::size_t bytes) {
 }
 
 /**
+ * @brief Build one dependency chain of identical immediate memory operations.
+ *
+ * Every activation raises a unique barrier consumed by the following node, so
+ * the flat scanner executes the whole chain in one pass. Adjacent
+ * NODE_ACTIVATE timestamps therefore bracket the preceding operation without
+ * heartbeat, WAIT-scan, or outer-pass overhead.
+ */
+vrt::graph::fpga::Rp1GraphImage makeMemoryTraceImage(
+    MemoryOperation operation, std::size_t bytes, std::size_t nodeCount) {
+    if (nodeCount < 2u || nodeCount > kMaxMemoryChainLength) {
+        throw std::invalid_argument("memory trace node count is out of range");
+    }
+    if (bytes == 0u || (bytes & 3u) != 0u ||
+        bytes > kScratchCapacity) {
+        throw std::invalid_argument("memory trace byte count is out of range");
+    }
+    if ((operation == MemoryOperation::ScalarWrite ||
+         operation == MemoryOperation::ScalarRead) &&
+        bytes != sizeof(std::uint32_t)) {
+        throw std::invalid_argument("scalar memory trace must be four bytes");
+    }
+
+    vrt::graph::fpga::Rp1GraphImage image;
+    image.nodes.resize(nodeCount);
+    image.trace_enable = true;
+    image.trace_size_override = ringSize(
+        2u + nodeCount, RP1_MAX_TRACE_ENTRIES);
+
+    for (std::size_t i = 0u; i < nodeCount; ++i) {
+        rp1_node_t& node = image.nodes[i];
+        rp1_node_set_status(&node, RP1_NODE_PENDING);
+        if (i != 0u) {
+            const std::size_t predecessor = i - 1u;
+            node.barrier_await_bucket =
+                static_cast<std::uint8_t>(predecessor / 32u);
+            node.barrier_await_mask =
+                1u << static_cast<std::uint32_t>(predecessor % 32u);
+        }
+        node.barrier_set_bucket =
+            static_cast<std::uint8_t>(i / 32u);
+        node.barrier_set_mask =
+            1u << static_cast<std::uint32_t>(i % 32u);
+
+        switch (operation) {
+        case MemoryOperation::Nop:
+            rp1_node_set_opcode(&node, RP1_OP_NOP);
+            break;
+        case MemoryOperation::DmaFill:
+            rp1_node_set_opcode(&node, RP1_OP_DMA_FILL);
+            node.payload.dma_fill.dst_addr_lo =
+                RP1_CTRL_PHYS_ADDR + kScratchDestinationOffset;
+            node.payload.dma_fill.length =
+                static_cast<std::uint32_t>(bytes);
+            node.payload.dma_fill.pattern = kFillPattern;
+            break;
+        case MemoryOperation::DmaCopy:
+            rp1_node_set_opcode(&node, RP1_OP_DMA_COPY);
+            node.payload.dma_copy.src_addr_lo =
+                RP1_CTRL_PHYS_ADDR + kScratchSourceOffset;
+            node.payload.dma_copy.dst_addr_lo =
+                RP1_CTRL_PHYS_ADDR + kScratchDestinationOffset;
+            node.payload.dma_copy.length_types = rp1_dma_pack(
+                static_cast<std::uint32_t>(bytes), 0u, 0u);
+            break;
+        case MemoryOperation::ScalarWrite:
+            rp1_node_set_opcode(&node, RP1_OP_SCALAR_WRITE);
+            node.payload.scalar_write.writes[0].addr =
+                RP1_CTRL_PHYS_ADDR + kScratchDestinationOffset;
+            node.payload.scalar_write.writes[0].value = kFillPattern;
+            break;
+        case MemoryOperation::ScalarRead:
+            rp1_node_set_opcode(&node, RP1_OP_SCALAR_READ);
+            node.payload.scalar_read.source_addr =
+                RP1_CTRL_PHYS_ADDR + kScratchSourceOffset;
+            node.payload.scalar_read.target_slot = kMemorySignalSlot;
+            break;
+        }
+    }
+    if (operation == MemoryOperation::ScalarRead) {
+        image.clear_signal_slots.push_back(kMemorySignalSlot);
+    }
+    return image;
+}
+
+/**
+ * @brief Extract each adjacent NODE_ACTIVATE interval from one trace capture.
+ *
+ * @throws std::runtime_error for overflow, flush markers, duplicate/missing
+ * activation events, or missing graph lifecycle markers.
+ */
+std::vector<std::uint32_t> extractActivationGaps(
+    const vrt::graph::fpga::Rp1TraceCapture& trace,
+    std::size_t nodeCount) {
+    if (trace.overflow) {
+        throw std::runtime_error(
+            "RP1 memory trace overflowed during benchmark");
+    }
+
+    bool graphStart = false;
+    bool graphDone = false;
+    std::vector<std::optional<std::uint32_t>> activations(nodeCount);
+    for (const rp1_trace_entry_t& entry : trace.entries) {
+        if (entry.event == RP1_TRACE_GRAPH_START) {
+            graphStart = true;
+        } else if (entry.event == RP1_TRACE_GRAPH_DONE) {
+            graphDone = true;
+        } else if (entry.event == RP1_TRACE_FLUSH_START ||
+                   entry.event == RP1_TRACE_FLUSH_END) {
+            throw std::runtime_error(
+                "RP1 memory trace unexpectedly flushed");
+        } else if (entry.event == RP1_TRACE_NODE_ACTIVATE &&
+                   entry.node_index < nodeCount) {
+            if (activations[entry.node_index]) {
+                throw std::runtime_error(
+                    "RP1 memory trace contains duplicate activation");
+            }
+            activations[entry.node_index] = entry.timestamp;
+        }
+    }
+    if (!graphStart || !graphDone) {
+        throw std::runtime_error(
+            "RP1 memory trace is missing graph lifecycle events");
+    }
+
+    std::vector<std::uint32_t> gaps;
+    gaps.reserve(nodeCount - 1u);
+    for (std::size_t i = 0u; i < nodeCount; ++i) {
+        if (!activations[i]) {
+            throw std::runtime_error(
+                "RP1 memory trace is missing node activation " +
+                std::to_string(i));
+        }
+        if (i != 0u) {
+            gaps.push_back(*activations[i] - *activations[i - 1u]);
+        }
+    }
+    return gaps;
+}
+
+/**
+ * @brief Submit one traced immediate chain and return its activation gaps.
+ */
+std::vector<std::uint32_t> runMemoryTrace(
+    const std::shared_ptr<vrt::graph::fpga::Rp1Submitter>& submitter,
+    const vrt::graph::fpga::Rp1GraphImage& image) {
+    const vrt::graph::fpga::Rp1GraphResult result =
+        submitter->submitAndWait(image, kRp1Timeout);
+    validateGraphResult(
+        result, image.nodes.size(), /*traceExpected=*/true);
+    const vrt::graph::fpga::Rp1TraceCapture trace =
+        submitter->drainTrace();
+    if (result.traceWriteIndex != trace.written) {
+        throw std::runtime_error(
+            "RP1 memory result and trace cursor disagree");
+    }
+    return extractActivationGaps(trace, image.nodes.size());
+}
+
+/**
  * @brief Extract wrap-safe kernel intervals from one non-overflowing trace.
  */
 TraceIntervals extractTrace(
@@ -677,6 +893,66 @@ void addTicks(
     }
     measurements.push_back(
         {std::move(name) + ".estimated", "ns", std::move(nanoseconds)});
+}
+
+/**
+ * @brief Add core-cycle samples and an optional clock-derived conversion.
+ */
+void addCoreCycles(
+    std::vector<Measurement>& measurements, std::string name,
+    std::vector<std::uint64_t> cycles,
+    const std::optional<std::uint64_t>& r5FrequencyHz) {
+    measurements.push_back({name, "r5_cycles", cycles});
+    if (!r5FrequencyHz) return;
+
+    std::vector<std::uint64_t> nanoseconds;
+    nanoseconds.reserve(cycles.size());
+    for (std::uint64_t cycle : cycles) {
+        const long double value =
+            static_cast<long double>(cycle) * 1'000'000'000.0L /
+            static_cast<long double>(*r5FrequencyHz);
+        nanoseconds.push_back(
+            static_cast<std::uint64_t>(std::llround(value)));
+    }
+    measurements.push_back(
+        {std::move(name) + ".estimated", "ns", std::move(nanoseconds)});
+}
+
+/**
+ * @brief Append 32-bit PMU intervals to an aggregate measurement vector.
+ */
+void appendTicks(
+    std::vector<std::uint64_t>& destination,
+    const std::vector<std::uint32_t>& source) {
+    destination.insert(destination.end(), source.begin(), source.end());
+}
+
+/**
+ * @brief Return mean per-operation excess in core cycles over a paired chain.
+ *
+ * Aggregating before converting the divided PMU timestamps recovers
+ * sub-80-nanosecond mean resolution without claiming per-access raw timing.
+ */
+std::uint64_t meanExcessCycles(
+    const std::vector<std::uint32_t>& operation,
+    const std::vector<std::uint32_t>& baseline) {
+    if (operation.empty() || operation.size() != baseline.size()) {
+        throw std::runtime_error(
+            "RP1 memory trace gap vectors are incompatible");
+    }
+    std::uint64_t operationTicks = 0u;
+    std::uint64_t baselineTicks = 0u;
+    for (std::size_t i = 0u; i < operation.size(); ++i) {
+        operationTicks += operation[i];
+        baselineTicks += baseline[i];
+    }
+    if (operationTicks < baselineTicks) {
+        throw std::runtime_error(
+            "RP1 memory operation is faster than its NOP baseline");
+    }
+    const std::uint64_t excessTicks = operationTicks - baselineTicks;
+    return (excessTicks * 64u + operation.size() / 2u) /
+           operation.size();
 }
 
 /**
@@ -1030,6 +1306,194 @@ void benchmarkBatches(
 }
 
 /**
+ * @brief Measure differential RP1 DDR access latency with immediate chains.
+ *
+ * NOP, DMA_FILL, and DMA_COPY graphs share identical barrier topology and
+ * trace boundaries. Per-submission aggregate subtraction removes scanner and
+ * trace overhead, while COPY-minus-FILL approximates one additional DDR read.
+ */
+void benchmarkMemoryAccesses(
+    const Config& config,
+    const std::shared_ptr<vrt::graph::FpgaDevice>& device,
+    std::vector<Measurement>& measurements) {
+    const auto submitter = device->submitter();
+    const auto window = device->window();
+
+    for (std::size_t bytes : config.memorySizes) {
+        const std::string prefix =
+            "rp1.trace.memory." + std::to_string(bytes) + "B.";
+        const auto nopImage = makeMemoryTraceImage(
+            MemoryOperation::Nop, bytes, config.memoryChainLength);
+        const auto fillImage = makeMemoryTraceImage(
+            MemoryOperation::DmaFill, bytes, config.memoryChainLength);
+        const auto copyImage = makeMemoryTraceImage(
+            MemoryOperation::DmaCopy, bytes, config.memoryChainLength);
+
+        std::vector<std::uint32_t> source(bytes / sizeof(std::uint32_t),
+                                          kCopyPattern);
+        std::vector<std::uint32_t> readback(source.size(), 0u);
+        window->writeAt(
+            kScratchSourceOffset, source.data(), bytes);
+        window->zeroAt(kScratchDestinationOffset, bytes);
+
+        for (std::size_t i = 0u; i < config.warmup; ++i) {
+            (void)runMemoryTrace(submitter, nopImage);
+            (void)runMemoryTrace(submitter, fillImage);
+            (void)runMemoryTrace(submitter, copyImage);
+        }
+
+        std::vector<std::uint64_t> nopGaps;
+        std::vector<std::uint64_t> fillGaps;
+        std::vector<std::uint64_t> copyGaps;
+        std::vector<std::uint64_t> fillExcess;
+        std::vector<std::uint64_t> copyExcess;
+        std::vector<std::uint64_t> readEstimate;
+        const std::size_t gapSamples =
+            config.traceIterations * (config.memoryChainLength - 1u);
+        nopGaps.reserve(gapSamples);
+        fillGaps.reserve(gapSamples);
+        copyGaps.reserve(gapSamples);
+        fillExcess.reserve(config.traceIterations);
+        copyExcess.reserve(config.traceIterations);
+        readEstimate.reserve(config.traceIterations);
+
+        for (std::size_t i = 0u; i < config.traceIterations; ++i) {
+            const std::vector<std::uint32_t> nop =
+                runMemoryTrace(submitter, nopImage);
+            const std::vector<std::uint32_t> fill =
+                runMemoryTrace(submitter, fillImage);
+            const std::vector<std::uint32_t> copy =
+                runMemoryTrace(submitter, copyImage);
+            appendTicks(nopGaps, nop);
+            appendTicks(fillGaps, fill);
+            appendTicks(copyGaps, copy);
+            fillExcess.push_back(meanExcessCycles(fill, nop));
+            copyExcess.push_back(meanExcessCycles(copy, nop));
+            readEstimate.push_back(meanExcessCycles(copy, fill));
+        }
+
+        /*
+         * Verify each mutating operation with untimed submissions so BAR reads
+         * cannot perturb the paired timing sequence above.
+         */
+        (void)runMemoryTrace(submitter, fillImage);
+        window->readAt(
+            kScratchDestinationOffset, readback.data(), bytes);
+        if (!std::all_of(
+                readback.begin(), readback.end(),
+                [](std::uint32_t value) {
+                    return value == kFillPattern;
+                })) {
+            throw std::runtime_error(
+                "RP1 DMA_FILL memory benchmark verification failed");
+        }
+        (void)runMemoryTrace(submitter, copyImage);
+        window->readAt(
+            kScratchDestinationOffset, readback.data(), bytes);
+        if (readback != source) {
+            throw std::runtime_error(
+                "RP1 DMA_COPY memory benchmark verification failed");
+        }
+
+        addTicks(
+            measurements, prefix + "nop_gap", std::move(nopGaps),
+            config.r5FrequencyHz);
+        addTicks(
+            measurements, prefix + "dma_fill_gap", std::move(fillGaps),
+            config.r5FrequencyHz);
+        addTicks(
+            measurements, prefix + "dma_copy_gap", std::move(copyGaps),
+            config.r5FrequencyHz);
+        addCoreCycles(
+            measurements, prefix + "dma_fill_minus_nop",
+            std::move(fillExcess), config.r5FrequencyHz);
+        addCoreCycles(
+            measurements, prefix + "dma_copy_minus_nop",
+            std::move(copyExcess), config.r5FrequencyHz);
+        addCoreCycles(
+            measurements, prefix + "ddr_read_copy_minus_fill",
+            std::move(readEstimate), config.r5FrequencyHz);
+    }
+
+    /*
+     * Scalar operations have fixed four-byte payloads. Their excess metrics
+     * retain the real SCALAR_READ signal publication rather than pretending it
+     * is a pure load.
+     */
+    const auto nopImage = makeMemoryTraceImage(
+        MemoryOperation::Nop, sizeof(std::uint32_t),
+        config.memoryChainLength);
+    const auto writeImage = makeMemoryTraceImage(
+        MemoryOperation::ScalarWrite, sizeof(std::uint32_t),
+        config.memoryChainLength);
+    const auto readImage = makeMemoryTraceImage(
+        MemoryOperation::ScalarRead, sizeof(std::uint32_t),
+        config.memoryChainLength);
+    window->writeAt(
+        kScratchSourceOffset, &kCopyPattern, sizeof(kCopyPattern));
+    window->zeroAt(
+        kScratchDestinationOffset, sizeof(std::uint32_t));
+
+    for (std::size_t i = 0u; i < config.warmup; ++i) {
+        (void)runMemoryTrace(submitter, nopImage);
+        (void)runMemoryTrace(submitter, writeImage);
+        (void)runMemoryTrace(submitter, readImage);
+    }
+
+    std::vector<std::uint64_t> scalarNopGaps;
+    std::vector<std::uint64_t> scalarWriteGaps;
+    std::vector<std::uint64_t> scalarReadGaps;
+    std::vector<std::uint64_t> scalarWriteExcess;
+    std::vector<std::uint64_t> scalarReadExcess;
+    for (std::size_t i = 0u; i < config.traceIterations; ++i) {
+        const std::vector<std::uint32_t> nop =
+            runMemoryTrace(submitter, nopImage);
+        const std::vector<std::uint32_t> write =
+            runMemoryTrace(submitter, writeImage);
+        const std::vector<std::uint32_t> read =
+            runMemoryTrace(submitter, readImage);
+        appendTicks(scalarNopGaps, nop);
+        appendTicks(scalarWriteGaps, write);
+        appendTicks(scalarReadGaps, read);
+        scalarWriteExcess.push_back(meanExcessCycles(write, nop));
+        scalarReadExcess.push_back(meanExcessCycles(read, nop));
+    }
+
+    (void)runMemoryTrace(submitter, writeImage);
+    std::uint32_t written = 0u;
+    window->readAt(
+        kScratchDestinationOffset, &written, sizeof(written));
+    if (written != kFillPattern) {
+        throw std::runtime_error(
+            "RP1 SCALAR_WRITE memory benchmark verification failed");
+    }
+    (void)runMemoryTrace(submitter, readImage);
+    rp1_signal_slot_t signal{};
+    window->readSignal(kMemorySignalSlot, signal);
+    if (signal.value != kCopyPattern ||
+        signal.last_writer_node != config.memoryChainLength - 1u) {
+        throw std::runtime_error(
+            "RP1 SCALAR_READ memory benchmark verification failed");
+    }
+
+    addTicks(
+        measurements, "rp1.trace.memory.scalar.nop_gap",
+        std::move(scalarNopGaps), config.r5FrequencyHz);
+    addTicks(
+        measurements, "rp1.trace.memory.scalar.write_gap",
+        std::move(scalarWriteGaps), config.r5FrequencyHz);
+    addTicks(
+        measurements, "rp1.trace.memory.scalar.read_gap",
+        std::move(scalarReadGaps), config.r5FrequencyHz);
+    addCoreCycles(
+        measurements, "rp1.trace.memory.scalar.write_minus_nop",
+        std::move(scalarWriteExcess), config.r5FrequencyHz);
+    addCoreCycles(
+        measurements, "rp1.trace.memory.scalar.read_minus_nop",
+        std::move(scalarReadExcess), config.r5FrequencyHz);
+}
+
+/**
  * @brief Measure VRT host-device DMA and RP1 local DDR software copies.
  *
  * These transfer domains are deliberately reported as separate metrics:
@@ -1217,6 +1681,7 @@ int main(int argc, char** argv) try {
 
     benchmarkSingleKernel(config, legacy, device, measurements);
     benchmarkBatches(config, legacy, device, measurements);
+    benchmarkMemoryAccesses(config, device, measurements);
     benchmarkTransfers(config, legacy, device, measurements);
 
     printMeasurements(measurements, config.csv);
