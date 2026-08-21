@@ -485,6 +485,10 @@ static uint32_t s_publication_watch;
 static uint32_t s_publication_started;
 static uint32_t s_publication_phase;
 static uint32_t s_publication_violation;
+/* Optional fake control port whose reads emulate HLS ap_done clear-on-read. */
+static uintptr_t s_watched_kernel_ctrl;
+/* Number of MMIO reads observed at s_watched_kernel_ctrl. */
+static uint32_t s_watched_kernel_ctrl_reads;
 
 static void record_pdi_access(uint32_t kind, uintptr_t address, uint32_t value)
 {
@@ -513,6 +517,14 @@ static uint32_t test_mmio_read32(uintptr_t address, void *context)
         record_pdi_access(PDI_ACCESS_READ, address, s_pdi_detail);
         return s_pdi_detail;
     }
+    if (address == s_watched_kernel_ctrl) {
+        volatile uint32_t *control = (volatile uint32_t *)address;
+        uint32_t value = *control;
+
+        s_watched_kernel_ctrl_reads++;
+        *control = value & ~0x2u;
+        return value;
+    }
     return *(volatile uint32_t *)address;
 }
 
@@ -536,10 +548,10 @@ static void test_mmio_write32(uintptr_t address, uint32_t value, void *context)
     *(volatile uint32_t *)address = value;
 }
 
-static void test_barrier(void *context)
+static void test_barrier(rp1_barrier_kind_t barrier, void *context)
 {
     (void)context;
-    record_pdi_access(PDI_ACCESS_BARRIER, 0u, 0u);
+    record_pdi_access(PDI_ACCESS_BARRIER, 0u, (uint32_t)barrier);
 
     if (!s_publication_watch)
         return;
@@ -596,7 +608,42 @@ static void pdi_override_reset(void)
     s_publication_started = 0u;
     s_publication_phase = 0u;
     s_publication_violation = 0u;
+    s_watched_kernel_ctrl = 0u;
+    s_watched_kernel_ctrl_reads = 0u;
     rp1_hal_set_hooks(&s_hal_hooks);
+}
+
+/*
+ * Count control reads for one fake CU and model the clear-on-read ap_done bit.
+ * The normal scan hook still decides when the fake invocation completes.
+ */
+static void watch_kernel_ctrl(uintptr_t address)
+{
+    s_watched_kernel_ctrl = address;
+    s_watched_kernel_ctrl_reads = 0u;
+}
+
+/* Verify each public barrier primitive preserves its distinct HAL identity. */
+static int test_barrier_variants(void)
+{
+    pdi_override_reset();
+
+    rp1_dsb_st();
+    rp1_dsb_sy();
+    rp1_dmb_st();
+    rp1_dmb_sy();
+    rp1_hal_reset_hooks();
+
+    CHECK_EQ32(s_pdi_access_count, 4u, "barriers: all variants observed");
+    CHECK_EQ32(s_pdi_access[0].value, RP1_BARRIER_DSB_ST,
+               "barriers: dsb st");
+    CHECK_EQ32(s_pdi_access[1].value, RP1_BARRIER_DSB_SY,
+               "barriers: dsb sy");
+    CHECK_EQ32(s_pdi_access[2].value, RP1_BARRIER_DMB_ST,
+               "barriers: dmb st");
+    CHECK_EQ32(s_pdi_access[3].value, RP1_BARRIER_DMB_SY,
+               "barriers: dmb sy");
+    return 0;
 }
 
 /*
@@ -854,6 +901,39 @@ static int test_diamond_dag(void)
         CHECK_EQ32(rp1_node_get_status(&G_NODES[i]), RP1_NODE_PENDING,
                    "diamond: DDR packet remains unchanged");
     }
+    return 0;
+}
+
+/*
+ * Independent dispatches to one CU must serialize. The second invocation
+ * reuses the completion read as its ap_done clear, while a subsequent PDI
+ * transition invalidates that knowledge and restores the first-use clear.
+ */
+static int test_cu_clean_tracking(void)
+{
+    setup_graph(/* node_count */ 4u, /* fake_kernels */ 1u);
+    pdi_override_reset();
+    watch_kernel_ctrl(FAKE_KERNEL(0));
+
+    make_kernel(&G_NODES[0], 0u, 0u, 0u, 0u, 1u, 0u, 0u);
+    make_kernel(&G_NODES[1], 0u, 0u, 0u, 0u, 2u, 0u, 0u);
+    make_pdi_load(&G_NODES[2], 0x10000000u, 0u, 20u,
+                  0u, 0u, 3u, 0u, 4u);
+    make_kernel(&G_NODES[3], 0u, 0u, 4u, 0u, 8u, 0u, 0u);
+
+    int rc = rp1_run(&s_hooks);
+    uint32_t control_reads = s_watched_kernel_ctrl_reads;
+    rp1_hal_reset_hooks();
+
+    CHECK_EQ32(rc, 0u, "cu_clean: rp1_run rc");
+    CHECK_EQ32(s_max_inflight, 1u,
+               "cu_clean: same-CU dispatches serialized");
+    CHECK_EQ32(s_pdi_call_count, 1u, "cu_clean: PDI issued once");
+    CHECK_EQ32(control_reads, 8u,
+               "cu_clean: reused clear skipped and PDI invalidated cache");
+    for (uint32_t i = 0u; i < 4u; i++)
+        CHECK_EQ32(rp1_node_get_status(&g_nodes[i]), RP1_NODE_DONE,
+                   "cu_clean: every node completed");
     return 0;
 }
 
@@ -1503,12 +1583,18 @@ static int test_pdi_mmio_contract(void)
                "pdi_mmio: request command address");
     CHECK_EQ32(s_pdi_access[4].kind, PDI_ACCESS_BARRIER,
                "pdi_mmio: request barrier");
+    CHECK_EQ32(s_pdi_access[4].value, RP1_BARRIER_DMB_ST,
+               "pdi_mmio: request stores ordered before trigger");
     CHECK_EQ32(s_pdi_access[5].address, RP1_PDI_IPI_TRIGGER_REG,
                "pdi_mmio: generated trigger address");
     CHECK_EQ32(s_pdi_access[5].value, RP1_PDI_IPI_TARGET_MASK,
                "pdi_mmio: generated target mask");
+    CHECK_EQ32(s_pdi_access[6].value, RP1_BARRIER_DSB_ST,
+               "pdi_mmio: trigger completed before deadline starts");
     CHECK_EQ32(s_pdi_access[7].address, RP1_PDI_IPI_OBSERVATION_REG,
                "pdi_mmio: generated observation address");
+    CHECK_EQ32(s_pdi_access[8].value, RP1_BARRIER_DMB_SY,
+               "pdi_mmio: acknowledgement ordered before response");
     CHECK_EQ32(s_pdi_access[9].address, RP1_PDI_IPI_RESPONSE_BASE,
                "pdi_mmio: response status address");
     CHECK_EQ32(s_pdi_access[10].address, RP1_PDI_IPI_RESPONSE_BASE + 4u,
@@ -2049,6 +2135,7 @@ static int run(const char *name, int (*fn)(void))
 void rp1_graph_test_run(void)
 {
     run("diamond_dag",         test_diamond_dag);
+    run("cu_clean_tracking",   test_cu_clean_tracking);
     run("trace_disabled_by_default", test_trace_disabled_by_default);
     run("trace_queue",         test_trace_queue);
     run("trace_btcm_flush",    test_trace_btcm_flush);
@@ -2066,6 +2153,7 @@ void rp1_graph_test_run(void)
     run("cond_boolean",        test_cond_boolean);
     run("scalar_read",         test_scalar_read);
     run("wait_blocks",         test_wait_blocks);
+    run("barrier_variants",    test_barrier_variants);
     run("result_publication_order", test_result_publication_order);
     run("boot_sequence_baseline", test_boot_sequence_baseline);
     run("reserved_cq_config_rejected", test_reserved_cq_config_rejected);

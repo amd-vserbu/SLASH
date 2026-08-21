@@ -9,6 +9,12 @@
 #define RP1_LOOP_H
 
 /*
+ * Forget which compute units have had sticky ap_done cleared. Firmware startup
+ * and every partial-reconfiguration attempt call this before later dispatches.
+ */
+void rp1_cu_tracking_reset(void);
+
+/*
  * A scanner pass activates barrier-ready nodes, polls inflight kernels, then
  * revisits parked WAITs. It repeats while asynchronous or externally signalled
  * work can progress; fatal and HALT exits first classify all tracked work.

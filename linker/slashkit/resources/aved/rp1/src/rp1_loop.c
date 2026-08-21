@@ -36,6 +36,63 @@ static uint32_t compare(uint32_t sig, uint8_t op, uint32_t val)
  * Inflight kernel management
  * ---------------------------------------------------------------------- */
 
+/*
+ * A cached base has had sticky ap_done cleared before its latest launch.
+ * g_inflight supplies the RUNNING state; its completion read clears ap_done
+ * and makes the retained cache entry CLEAN again. The physical design exposes
+ * at most 15 CUs, so the 32-entry inflight bound also bounds this cache.
+ */
+static uint32_t
+    g_clean_cu_bases[RP1_MAX_INFLIGHT] __attribute__((section(".btcm")));
+
+/* Number of valid entries at the front of g_clean_cu_bases. */
+static uint32_t g_clean_cu_count __attribute__((section(".btcm")));
+
+/*
+ * Invalidate the persistent CU state without clearing dead entries. The count
+ * is authoritative, so startup and PDI transitions remain constant-time.
+ */
+void rp1_cu_tracking_reset(void)
+{
+    g_clean_cu_count = 0u;
+}
+
+/*
+ * Return non-zero while the named CU already has a tracked invocation.
+ * Dispatches to one physical control port must serialize even when their graph
+ * barriers are independent.
+ */
+static uint32_t cu_is_inflight(uint32_t base_addr)
+{
+    for (uint32_t i = 0u; i < g_inflight_count; i++) {
+        if (g_inflight[i].base_addr == base_addr)
+            return 1u;
+    }
+    return 0u;
+}
+
+/*
+ * Clear an unrecognized CU's sticky completion before first use. Known CUs
+ * skip both the NoC read and its ordering barrier; the completion read which
+ * removed their preceding inflight entry already performed the clear.
+ *
+ * Cache exhaustion is a safe performance fallback: leave the base untracked
+ * so every later launch repeats the clear instead of assuming clean state.
+ */
+static void prepare_cu_for_launch(uint32_t base_addr)
+{
+    for (uint32_t i = 0u; i < g_clean_cu_count; i++) {
+        if (g_clean_cu_bases[i] == base_addr)
+            return;
+    }
+
+    (void)rp1_mmio_read32(base_addr + 0x00u);
+    rp1_dmb_sy();
+
+    if (g_clean_cu_count < RP1_MAX_INFLIGHT)
+        g_clean_cu_bases[g_clean_cu_count++] = base_addr;
+}
+
 static void add_inflight(const rp1_node_t *node, uint32_t node_index)
 {
     const rp1_payload_kernel_dispatch_t *kd = &node->payload.kernel_dispatch;
@@ -89,17 +146,17 @@ static void launch_kernel(const rp1_node_t *node)
     const rp1_kernel_arg_t *args =
         (const rp1_kernel_arg_t *)(g_arg_buf + kd->arg_buffer_offset / 4);
 
-    /* HLS ap_done is sticky/clear-on-read. Clear any stale completion from a
-     * previous invocation before writing arguments and pulsing ap_start.
+    /*
+     * HLS ap_done is sticky and clear-on-read. Pay that NoC read once per CU
+     * reset epoch; normal completion polling keeps a reused CU clean.
      */
-    (void)rp1_mmio_read32(kd->kernel_base_addr + 0x00);
-    rp1_barrier();
+    prepare_cu_for_launch(kd->kernel_base_addr);
 
     for (uint16_t i = 0; i < kd->arg_count; i++)
         rp1_mmio_write32(kd->kernel_base_addr + args[i].reg_offset,
                          args[i].value);
 
-    rp1_barrier();
+    rp1_dmb_st();
     rp1_mmio_write32(kd->kernel_base_addr + 0x00, 0x01); /* ap_start */
 }
 
@@ -134,7 +191,7 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
                 break;
             rp1_mmio_write32(p->writes[w].addr, p->writes[w].value);
         }
-        rp1_barrier();
+        rp1_dsb_st();
         break;
     }
 
@@ -148,7 +205,7 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
     case RP1_OP_SCALAR_COPY: {
         const rp1_payload_scalar_copy_t *p = &node->payload.scalar_copy;
         rp1_mmio_write32(p->dest_addr, g_signals[p->source_slot].value);
-        rp1_barrier();
+        rp1_dsb_st();
         break;
     }
 
@@ -160,7 +217,7 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
         uint32_t words = rp1_dma_get_length(p->length_types) / 4u;
         for (uint32_t w = 0; w < words; w++)
             dst[w] = src[w];
-        rp1_barrier();
+        rp1_dsb_st();
         break;
     }
 
@@ -170,7 +227,7 @@ static void execute_immediate(const rp1_node_t *node, uint32_t node_index)
         uint32_t words = p->length / 4;
         for (uint32_t w = 0; w < words; w++)
             dst[w] = p->pattern;
-        rp1_barrier();
+        rp1_dsb_st();
         break;
     }
 
@@ -501,6 +558,15 @@ static int activate_nodes(uint32_t node_count)
                 != node->barrier_await_mask)
             continue;
 
+        /*
+         * Resource readiness is separate from graph barriers. Skip before
+         * publishing activation so a busy CU cannot produce duplicate trace
+         * events or receive a second ap_start.
+         */
+        if (opcode == RP1_OP_KERNEL_DISPATCH &&
+            cu_is_inflight(node->payload.kernel_dispatch.kernel_base_addr))
+            continue;
+
         g_ctrl->rp1_current_node = i;
         g_operation_started = 1u;
         rp1_trace_emit(RP1_TRACE_NODE_ACTIVATE, i,
@@ -549,6 +615,11 @@ static int activate_nodes(uint32_t node_count)
 
         case RP1_OP_PDI_LOAD: {
             const rp1_payload_pdi_load_t *p = &node->payload.pdi_load;
+            /*
+             * PLM may alter or partially alter the fabric on every attempt.
+             * Forget all control-port state before issuing the request.
+             */
+            rp1_cu_tracking_reset();
             rp1_pdi_result_t result =
                 rp1_pdi_load(p->pdi_addr_lo, p->pdi_addr_hi,
                              p->timeout_cycles);

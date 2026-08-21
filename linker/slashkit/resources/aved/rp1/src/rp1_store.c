@@ -115,7 +115,7 @@ static void snapshot_nodes(uint32_t source_lo, uint32_t source_hi,
     uint32_t words =
         node_count * (uint32_t)sizeof(rp1_node_t) / sizeof(uint32_t);
 
-    rp1_barrier();
+    rp1_dmb_sy();
     for (uint32_t i = 0u; i < words; i++)
         destination[i] = source[i];
 
@@ -125,7 +125,7 @@ static void snapshot_nodes(uint32_t source_lo, uint32_t source_hi,
      */
     for (uint32_t i = 0u; i < node_count; i++)
         rp1_node_set_status(&g_nodes[i], RP1_NODE_PENDING);
-    rp1_barrier();
+    rp1_dmb_sy();
 }
 
 /*
@@ -163,9 +163,9 @@ static void trace_flush_staged(void)
         g_trace[idx].aux0 = g_trace_staging[i].aux0;
         g_trace[idx].aux1 = g_trace_staging[i].aux1;
     }
-    rp1_barrier();
+    rp1_dmb_st();
     g_ctrl->trace_write_idx = write + count;
-    rp1_barrier();
+    rp1_dsb_st();
     g_trace_staging_count = 0u;
 }
 

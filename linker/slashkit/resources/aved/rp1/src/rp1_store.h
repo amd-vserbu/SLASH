@@ -13,6 +13,7 @@
  *   completed_barriers[32]     128 B
  *   loop_iterations[64]        256 B
  *   inflight[32]               768 B   (32 * sizeof(rp1_inflight_t) = 24)
+ *   clean CU cache              132 B   (32 addresses + count)
  *   trace staging             4096 B   (256 * sizeof(rp1_trace_entry_t))
  *   stack                     4096 B   (linker script)
  *   bookkeeping and BSS       ~6 KB

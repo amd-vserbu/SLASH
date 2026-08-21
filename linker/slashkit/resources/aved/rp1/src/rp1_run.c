@@ -141,9 +141,10 @@ int rp1_run(void)
     g_ctrl->version               = RP1_PROTOCOL_VERSION;
     g_ctrl->capabilities          = RP1_REQUIRED_CAPABILITIES;
     g_ctrl->pdi_ipi_platform_id   = RP1_PLATFORM_ID;
-    /* BTCM is NOLOAD, so establish reset-only image state explicitly. */
+    /* BTCM is NOLOAD, so establish reset-only persistent state explicitly. */
     g_active_image_id             = 0u;
     g_active_image_state          = RP1_IMAGE_STATE_NONE;
+    rp1_cu_tracking_reset();
     rp1_clear_error_latch();
     /*
      * Firmware owns the doorbell only while magic is invalid. Reset both
@@ -157,9 +158,9 @@ int rp1_run(void)
     g_ctrl->heartbeat             = 0;
     initialize_result();
     g_ctrl->rp1_state             = RP1_STATE_READY;
-    rp1_barrier();
+    rp1_dmb_st();
     g_ctrl->magic = RP1_CTRL_MAGIC;
-    rp1_barrier();
+    rp1_dsb_st();
 
     /*
      * The outer loop has three cases: terminal firmware remains quiescent,
@@ -202,12 +203,12 @@ int rp1_run(void)
          * every host-owned range before resolving or dereferencing DDR pointers.
          */
         g_ctrl->result.magic = 0u;
-        rp1_barrier();
+        rp1_dmb_st();
         rp1_clear_error_latch();
         rp1_store_reset_graph();
         g_ctrl->rp1_current_node = RP1_TERMINAL_ERROR_NODE_NONE;
         g_ctrl->rp1_state = RP1_STATE_RUNNING;
-        rp1_barrier();
+        rp1_dsb_st();
         g_graph_start_cycles = rp1_cycles();
         if (rp1_store_init(&config_detail, &config_aux) != 0) {
             rp1_latch_error(RP1_ERR_INVALID_CONFIG,
@@ -270,13 +271,13 @@ int rp1_run(void)
         populate_result(accepted_seq, result, store_ready,
                         store_ready ? g_node_count : submitted_node_count,
                         graph_elapsed);
-        rp1_barrier();
+        rp1_dmb_st();
         g_ctrl->result.magic = RP1_GRAPH_RESULT_MAGIC;
-        rp1_barrier();
+        rp1_dmb_st();
         g_ctrl->rp1_state = terminal_state;
-        rp1_barrier();
+        rp1_dmb_st();
         g_ctrl->graph_done_seq = accepted_seq;
-        rp1_barrier();
+        rp1_dsb_st();
 #ifdef QEMU_SEMIHOSTING
         terminal_result = result;
 #endif

@@ -370,9 +370,13 @@ The 20-byte payload carries:
 - PMU-tick timeout, with zero selecting the generated default; and
 - expected image id, with zero disabling the image guard.
 
-Before launch, RP1 reads the HLS control register once to clear stale
-clear-on-read `ap_done`, writes each non-contiguous argument register, orders
-those writes, and writes `ap_start`. Finite kernels remain `DISPATCHED` until
+On a CU's first launch after firmware startup or a PDI attempt, RP1 reads the
+HLS control register to clear stale clear-on-read `ap_done`, followed by
+`dmb sy`. Completion polling performs that clear for later launches, so RP1
+caches the clean CU base and skips the redundant read and barrier. It then
+writes each non-contiguous argument register, uses `dmb st` for store-to-store
+ordering, and writes `ap_start`. Dispatches to the same CU serialize even when
+graph barriers are independent. Finite kernels remain `DISPATCHED` until
 `ap_done`. A timeout is fatal; the timed-out tracker remains available to
 terminal quiescence.
 
@@ -398,8 +402,11 @@ the node's barrier-set mask becomes visible to later packets.
 ### PDI load
 
 The payload supplies a 64-bit staged-DDR PDI address, timeout, and image id.
-RP1 writes the four-word IPI request, orders it before the trigger, waits for
-the PMC observation bit to clear, then reads unsigned status and detail words.
+RP1 writes the four-word IPI request, orders it before the trigger with
+`dmb st`, completes the trigger store with `dsb st`, waits for the PMC
+observation bit to clear, then orders the response reads with `dmb sy`. Every
+attempt invalidates cached CU-clean state because the fabric may have changed
+even when PLM reports rejection or timeout.
 
 On success:
 
