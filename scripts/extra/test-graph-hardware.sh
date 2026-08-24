@@ -56,7 +56,7 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
 fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
 BDF=$1
 ROOT=${2:-${GRAPH_EXAMPLES_ROOT:-"$REPO_ROOT/examples/graph"}}
 

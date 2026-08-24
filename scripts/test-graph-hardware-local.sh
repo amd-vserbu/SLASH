@@ -24,7 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
-ACCEPTANCE="$SCRIPT_DIR/test-graph-hardware.sh"
+ACCEPTANCE="$SCRIPT_DIR/extra/test-graph-hardware.sh"
 
 git -C "$REPO_ROOT" check-ignore -q tmp ||
     {

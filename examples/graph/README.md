@@ -46,7 +46,7 @@ On a prepared V80 host, run exactly one script:
 
 ```bash
 ARTIFACT_DIR="$PWD/tmp/graph-hardware-acceptance/manual-run" \
-  ./scripts/test-graph-hardware.sh 0000:65:00.0
+  ./scripts/extra/test-graph-hardware.sh 0000:65:00.0
 ```
 
 The script deliberately performs no reset and does not restart `vrtd`. In one
@@ -79,7 +79,7 @@ input binary/vbin hashes, and final artifact hashes are written under
 controls are documented by:
 
 ```bash
-./scripts/test-graph-hardware.sh --help
+./scripts/extra/test-graph-hardware.sh --help
 ```
 
 The acceptance harness itself has a hardware-free test. It creates all fake
