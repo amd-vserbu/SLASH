@@ -29,7 +29,7 @@ option(VRT_USE_REPO "Build VRT and its dependencies from this repository" OFF)
 option(BUILD_VBIN "Build the hardware vbin (requires Vivado/Vitis)" ON)
 
 if(VRT_USE_REPO)
-  get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." REALPATH)
+  get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." REALPATH)
   set(VRT_INCLUDE_VRTD ON CACHE BOOL "Build vrtd from the repository" FORCE)
   set(VRTD_INCLUDE_LIBSLASH ON CACHE BOOL "Build libslash from the repository" FORCE)
   add_subdirectory("${REPO_ROOT}/vrt" "${CMAKE_CURRENT_BINARY_DIR}/vrt")

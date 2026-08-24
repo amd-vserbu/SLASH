@@ -769,10 +769,10 @@ cmake -S vrt -B vrt/build -G Ninja \
 cmake --build vrt/build --target unit_tests
 ctest --test-dir vrt/build/tests --output-on-failure
 
-cmake -S benchmarks/rp1_latency -B benchmarks/rp1_latency/build \
+cmake -S examples/extra/rp1_latency -B examples/extra/rp1_latency/build \
   -G Ninja -DVRT_USE_REPO=ON -DBUILD_VBIN=OFF
-cmake --build benchmarks/rp1_latency/build
-ctest --test-dir benchmarks/rp1_latency/build --output-on-failure
+cmake --build examples/extra/rp1_latency/build
+ctest --test-dir examples/extra/rp1_latency/build --output-on-failure
 
 ./scripts/test-graph-hardware-local.sh
 ```

@@ -77,20 +77,20 @@ transactions.
 Host-only build on a machine without Vivado:
 
 ```bash
-cmake -S benchmarks/rp1_latency -B benchmarks/rp1_latency/build \
+cmake -S examples/extra/rp1_latency -B examples/extra/rp1_latency/build \
   -G Ninja -DVRT_USE_REPO=ON -DBUILD_VBIN=OFF
-cmake --build benchmarks/rp1_latency/build
-ctest --test-dir benchmarks/rp1_latency/build --output-on-failure
+cmake --build examples/extra/rp1_latency/build
+ctest --test-dir examples/extra/rp1_latency/build --output-on-failure
 ```
 
 Hardware vbin build on the Vivado/Vitis build server:
 
 ```bash
-cmake -S benchmarks/rp1_latency -B benchmarks/rp1_latency/build-hw \
+cmake -S examples/extra/rp1_latency -B examples/extra/rp1_latency/build-hw \
   -G Ninja -DVRT_USE_REPO=ON
-cmake --build benchmarks/rp1_latency/build-hw --target rp1_latency
-cmake --build benchmarks/rp1_latency/build-hw --target latency_hls
-cmake --build benchmarks/rp1_latency/build-hw --target rp1_latency_hw
+cmake --build examples/extra/rp1_latency/build-hw --target rp1_latency
+cmake --build examples/extra/rp1_latency/build-hw --target latency_hls
+cmake --build examples/extra/rp1_latency/build-hw --target rp1_latency_hw
 ```
 
 The hardware artifact is `rp1_latency_hw.vbin`.
