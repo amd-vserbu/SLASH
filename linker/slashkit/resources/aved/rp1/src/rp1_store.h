@@ -14,11 +14,14 @@
  *   loop_iterations[64]        256 B
  *   inflight[32]               768 B   (32 * sizeof(rp1_inflight_t) = 24)
  *   clean CU cache              132 B   (32 addresses + count)
+ *   scheduler fixed state      ~3.5 KB  (CSR offsets/counts + bitsets)
  *   trace staging             4096 B   (256 * sizeof(rp1_trace_entry_t))
  *   stack                     4096 B   (linker script)
  *   bookkeeping and BSS       ~6 KB
  *   ─────────────────────────────
  *   Total                    <64 KB (enforced by the linker script)
+ *
+ * The sparse subscriber array uses 32 KB of otherwise free ATCM.
  */
 
 #ifndef RP1_STORE_H

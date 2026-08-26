@@ -11,6 +11,7 @@
 #include "rp1_cycles.h"
 #include "rp1_hal.h"
 #include "rp1_pdi.h"
+#include "rp1_scheduler.h"
 #include "rp1_store.h"
 #include <slash/uapi/rp1_protocol.h>
 #include <stdint.h>
@@ -121,6 +122,8 @@ static void remove_inflight(uint32_t idx)
 static void set_node_status(uint32_t node_index, uint8_t status)
 {
     rp1_node_set_status(&g_nodes[node_index], status);
+    if (status != RP1_NODE_PENDING)
+        rp1_scheduler_remove_node(node_index);
 }
 
 /*
@@ -474,7 +477,7 @@ static int check_inflight(void)
         if (ctrl & 0x2) { /* ap_done */
             if (!k->infinite) {
                 complete_node(k->node_index);
-                g_barriers[k->set_bucket] |= k->set_mask;
+                rp1_scheduler_set_barriers(k->set_bucket, k->set_mask);
             }
             rp1_trace_emit(RP1_TRACE_KERNEL_DONE, k->node_index,
                            k->base_addr, k->infinite);
@@ -512,17 +515,27 @@ static int check_inflight(void)
 static int check_waits(uint32_t node_count)
 {
     int made_progress = 0;
+    uint32_t cursor = 0u;
 
-    for (uint32_t i = 0; i < node_count; i++) {
-        if (rp1_node_get_status(&g_nodes[i]) != RP1_NODE_WAITING)
-            continue;
+    while (cursor < node_count) {
+        uint32_t i = cursor;
+        if (rp1_scheduler_enabled()) {
+            if (!rp1_scheduler_next_waiting(cursor, &i) || i >= node_count)
+                break;
+            cursor = i + 1u;
+        } else {
+            cursor++;
+            if (rp1_node_get_status(&g_nodes[i]) != RP1_NODE_WAITING)
+                continue;
+        }
 
         const rp1_node_t *node = &g_nodes[i];
         const rp1_payload_wait_t *w = &node->payload.wait;
         uint32_t sig_val = g_signals[w->condition_signal].value;
         if (compare(sig_val, w->condition_op, w->condition_value)) {
             complete_node(i);
-            g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+            rp1_scheduler_set_barriers(
+                node->barrier_set_bucket, node->barrier_set_mask);
             rp1_trace_emit(RP1_TRACE_WAIT_WAKE, i,
                            w->condition_signal, sig_val);
             made_progress = 1;
@@ -545,8 +558,18 @@ static int check_waits(uint32_t node_count)
 static int activate_nodes(uint32_t node_count)
 {
     int made_progress = 0;
+    uint32_t scan_index = 0u;
 
-    for (uint32_t i = 0; i < node_count; i++) {
+    while (1) {
+        uint32_t i;
+        if (rp1_scheduler_enabled()) {
+            if (!rp1_scheduler_pop_ready(&i))
+                break;
+        } else {
+            if (scan_index >= node_count)
+                break;
+            i = scan_index++;
+        }
         if (rp1_node_get_status(&g_nodes[i]) != RP1_NODE_PENDING)
             continue;
 
@@ -555,8 +578,10 @@ static int activate_nodes(uint32_t node_count)
         uint8_t flags = rp1_node_get_flags(node);
 
         if ((g_barriers[node->barrier_await_bucket] & node->barrier_await_mask)
-                != node->barrier_await_mask)
+                != node->barrier_await_mask) {
+            rp1_scheduler_rearm_node(i);
             continue;
+        }
 
         /*
          * Resource readiness is separate from graph barriers. Skip before
@@ -564,8 +589,10 @@ static int activate_nodes(uint32_t node_count)
          * events or receive a second ap_start.
          */
         if (opcode == RP1_OP_KERNEL_DISPATCH &&
-            cu_is_inflight(node->payload.kernel_dispatch.kernel_base_addr))
+            cu_is_inflight(node->payload.kernel_dispatch.kernel_base_addr)) {
+            rp1_scheduler_defer_ready(i);
             continue;
+        }
 
         g_ctrl->rp1_current_node = i;
         g_operation_started = 1u;
@@ -604,7 +631,8 @@ static int activate_nodes(uint32_t node_count)
                            kd->kernel_base_addr, kd->arg_count);
             if (flags & RP1_FLAG_INFINITE) {
                 complete_node(i);
-                g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+                rp1_scheduler_set_barriers(
+                    node->barrier_set_bucket, node->barrier_set_mask);
             } else {
                 set_node_status(i, RP1_NODE_DISPATCHED);
             }
@@ -633,7 +661,8 @@ static int activate_nodes(uint32_t node_count)
                                        RP1_IMAGE_STATE_KNOWN :
                                        RP1_IMAGE_STATE_NONE;
                 complete_node(i);
-                g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+                rp1_scheduler_set_barriers(
+                    node->barrier_set_bucket, node->barrier_set_mask);
             } else {
                 /*
                  * A timed-out or rejected reconfiguration can leave physical
@@ -687,13 +716,16 @@ static int activate_nodes(uint32_t node_count)
 
             if (exit_loop) {
                 complete_node(i);
-                g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+                rp1_scheduler_set_barriers(
+                    node->barrier_set_bucket, node->barrier_set_mask);
             } else {
                 for (uint8_t b = lp->bucket_clear_start;
                      b <= lp->bucket_clear_end; b++)
-                    g_barriers[b] = 0;
-                for (uint32_t n = lp->body_start; n <= lp->body_end; n++)
+                    rp1_scheduler_clear_barriers(b, UINT32_MAX);
+                for (uint32_t n = lp->body_start; n <= lp->body_end; n++) {
                     set_node_status(n, RP1_NODE_PENDING);
+                    rp1_scheduler_rearm_node(n);
+                }
                 complete_node(i);
                 /* Do NOT set barrier_set — body + RERUN must fire first. */
             }
@@ -710,17 +742,21 @@ static int activate_nodes(uint32_t node_count)
                            cd->condition_signal, cond_met);
             if (cond_met) {
                 /* Condition met — set done barriers. */
-                g_barriers[cd->done_bucket] |= cd->done_mask;
+                rp1_scheduler_set_barriers(
+                    cd->done_bucket, cd->done_mask);
             } else {
                 /* Condition not met — clear body for execution. */
                 for (uint8_t b = cd->bucket_clear_start;
                      b <= cd->bucket_clear_end; b++)
-                    g_barriers[b] = 0;
-                for (uint32_t n = cd->body_start; n <= cd->body_end; n++)
+                    rp1_scheduler_clear_barriers(b, UINT32_MAX);
+                for (uint32_t n = cd->body_start; n <= cd->body_end; n++) {
                     set_node_status(n, RP1_NODE_PENDING);
+                    rp1_scheduler_rearm_node(n);
+                }
             }
             complete_node(i);
-            g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+            rp1_scheduler_set_barriers(
+                node->barrier_set_bucket, node->barrier_set_mask);
             made_progress = 1;
             break;
         }
@@ -728,10 +764,12 @@ static int activate_nodes(uint32_t node_count)
         case RP1_OP_RERUN: {
             const rp1_payload_rerun_t *rr = &node->payload.rerun;
             set_node_status(rr->target_node, RP1_NODE_PENDING);
+            rp1_scheduler_rearm_node(rr->target_node);
             if (rr->rerun_flags & RP1_RERUN_CLEAR_STATE)
                 g_loop_iters[rr->loop_id] = 0;
             complete_node(i);
-            g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+            rp1_scheduler_set_barriers(
+                node->barrier_set_bucket, node->barrier_set_mask);
             made_progress = 1;
             break;
         }
@@ -741,11 +779,13 @@ static int activate_nodes(uint32_t node_count)
             if (compare(g_signals[w->condition_signal].value,
                         w->condition_op, w->condition_value)) {
                 complete_node(i);
-                g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+                rp1_scheduler_set_barriers(
+                    node->barrier_set_bucket, node->barrier_set_mask);
                 made_progress = 1;
             } else {
                 /* Park the node; check_waits() re-polls the slot each pass. */
                 set_node_status(i, RP1_NODE_WAITING);
+                rp1_scheduler_park_wait(i);
                 rp1_trace_emit(RP1_TRACE_WAIT_PARK, i,
                                w->condition_signal,
                                w->condition_value);
@@ -766,12 +806,14 @@ static int activate_nodes(uint32_t node_count)
         default: /* NOP, SIGNAL, SCALAR_*, DMA_* */
             execute_immediate(node, i);
             complete_node(i);
-            g_barriers[node->barrier_set_bucket] |= node->barrier_set_mask;
+            rp1_scheduler_set_barriers(
+                node->barrier_set_bucket, node->barrier_set_mask);
             made_progress = 1;
             break;
         }
     }
 
+    rp1_scheduler_restore_deferred();
     return made_progress;
 }
 
@@ -860,6 +902,13 @@ int rp1_loop(void)
         set_node_status(bad_node, RP1_NODE_ERROR);
         return -1;
     }
+
+    /*
+     * Sparse graphs use a reverse barrier index and ready bitset. Dense graphs
+     * above the local ATCM ceiling retain the scanner without changing ABI or
+     * execution semantics.
+     */
+    (void)rp1_scheduler_build(node_count);
 
     while (1) {
         /*

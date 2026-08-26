@@ -36,6 +36,21 @@ SECTIONS
         *(.rodata.*)
     } > r5_1_atcm
 
+    /*
+     * Writable scheduler adjacency storage uses otherwise idle ATCM capacity.
+     * It is initialized from the accepted BTCM node snapshot before execution.
+     */
+    .atcm_data (NOLOAD) : {
+        . = ALIGN(4);
+        __atcm_data_start = .;
+        *(.atcm_data)
+        . = ALIGN(4);
+        __atcm_data_end = .;
+    } > r5_1_atcm
+
+    ASSERT(__atcm_data_end <= ORIGIN(r5_1_atcm) + LENGTH(r5_1_atcm),
+           "RP1 code and scheduler index exceed 64 KB ATCM")
+
     .data : {
         __data_start = .;
         *(.data)

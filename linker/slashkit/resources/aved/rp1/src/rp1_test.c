@@ -21,6 +21,7 @@
 
 #include "rp1_test.h"
 #include "rp1_hal.h"
+#include "rp1_scheduler.h"
 #include "rp1_store.h"
 #include <slash/uapi/rp1_protocol.h>
 #include <stddef.h>
@@ -482,6 +483,79 @@ static int test_dma_packing(void)
     return 0;
 }
 
+/*
+ * Exercise CSR fan-out, barrier clear/republication, WAIT parking, and dense
+ * graph fallback without involving the graph execution loop.
+ */
+static int test_event_scheduler(void)
+{
+    rp1_store_reset_graph();
+    for (uint32_t i = 0u; i < 3u; i++) {
+        rp1_node_set_control(
+            &g_nodes[i],
+            rp1_node_make_control(RP1_OP_NOP, 0u, RP1_NODE_PENDING));
+        g_nodes[i].barrier_await_bucket = 0u;
+        g_nodes[i].barrier_await_mask = i == 0u ? 0u : 1u;
+        g_nodes[i].barrier_set_bucket = 0u;
+        g_nodes[i].barrier_set_mask = 1u << i;
+    }
+
+    CHECK_EQ32(rp1_scheduler_build(3u), 1u,
+               "scheduler sparse index enabled");
+    CHECK_EQ32(rp1_scheduler_subscription_count(), 2u,
+               "scheduler fanout subscriptions");
+    uint32_t node = UINT32_MAX;
+    CHECK_EQ32(rp1_scheduler_pop_ready(&node), 1u,
+               "scheduler root ready");
+    CHECK_EQ32(node, 0u, "scheduler root index");
+    rp1_node_set_status(&g_nodes[0], RP1_NODE_DONE);
+    rp1_scheduler_remove_node(0u);
+    rp1_scheduler_set_barriers(0u, 1u);
+    CHECK_EQ32(rp1_scheduler_pop_ready(&node), 1u,
+               "scheduler first fanout ready");
+    CHECK_EQ32(node, 1u, "scheduler first fanout index");
+    CHECK_EQ32(rp1_scheduler_pop_ready(&node), 1u,
+               "scheduler second fanout ready");
+    CHECK_EQ32(node, 2u, "scheduler second fanout index");
+
+    rp1_scheduler_clear_barriers(0u, 1u);
+    CHECK_EQ32(rp1_scheduler_pop_ready(&node), 0u,
+               "scheduler clear blocks subscribers");
+    rp1_scheduler_set_barriers(0u, 1u);
+    CHECK_EQ32(rp1_scheduler_pop_ready(&node), 1u,
+               "scheduler republish wakes first");
+    CHECK_EQ32(node, 1u, "scheduler republish first index");
+    CHECK_EQ32(rp1_scheduler_pop_ready(&node), 1u,
+               "scheduler republish wakes second");
+    CHECK_EQ32(node, 2u, "scheduler republish second index");
+
+    rp1_node_set_status(&g_nodes[1], RP1_NODE_WAITING);
+    rp1_scheduler_park_wait(1u);
+    node = UINT32_MAX;
+    CHECK_EQ32(rp1_scheduler_next_waiting(0u, &node), 1u,
+               "scheduler parked wait found");
+    CHECK_EQ32(node, 1u, "scheduler parked wait index");
+    rp1_scheduler_remove_node(1u);
+    CHECK_EQ32(rp1_scheduler_next_waiting(0u, &node), 0u,
+               "scheduler parked wait removed");
+
+    rp1_store_reset_graph();
+    const uint32_t dense_nodes =
+        RP1_SCHEDULER_MAX_SUBSCRIPTIONS / 32u + 1u;
+    for (uint32_t i = 0u; i < dense_nodes; i++) {
+        rp1_node_set_control(
+            &g_nodes[i],
+            rp1_node_make_control(RP1_OP_NOP, 0u, RP1_NODE_PENDING));
+        g_nodes[i].barrier_await_bucket = 0u;
+        g_nodes[i].barrier_await_mask = UINT32_MAX;
+    }
+    CHECK_EQ32(rp1_scheduler_build(dense_nodes), 0u,
+               "scheduler dense graph fallback");
+    CHECK_EQ32(rp1_scheduler_enabled(), 0u,
+               "scheduler fallback disabled index");
+    return 0;
+}
+
 /* -------------------------------------------------------------------------
  * Entry point
  * ---------------------------------------------------------------------- */
@@ -507,6 +581,7 @@ void rp1_main(void)
     run("node_header",         test_node_header);
     run("node_alignment",      test_node_alignment);
     run("dma_packing",         test_dma_packing);
+    run("event_scheduler",      test_event_scheduler);
 
     semi_puts("\n=== RP1 graph tests ===\n");
     rp1_graph_test_run();
